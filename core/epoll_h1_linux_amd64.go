@@ -279,28 +279,38 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		}
 		c.req.attachConn = w.cachedH1Attacher(c, gen)
 		promoteRequestStrings(&c.req)
-		cc := c
-		fast := srv.fastDispatch.Load()
-		reqClose := closeConn
+		c.h1DispatchGen = gen
+		c.h1DispatchClose = closeConn
+		c.h1DispatchFast = srv.fastDispatch.Load()
 		w.spawned++
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					cc.resp.resetFastH1()
-					cc.resp.Status(500).String("Internal Server Error")
-				}
-				w.postTask(func(w *epollWorker) { cc.finishH1Dispatch(w, gen, reqClose) })
-			}()
-			if fast {
-				handler := srv.Router.Lookup(cc.req.Method, cc.req.Path, &cc.req)
-				handler(&cc.req, &cc.resp)
-			} else {
-				srv.dispatch(&cc.req, &cc.resp)
-			}
-		}()
+		go c.h1AsyncRunner()()
 		return out, h1StepDispatched
 	}
 	return out, h1StepNeedInput
+}
+
+func (c *epollConn) h1AsyncRunner() func() {
+	if c.h1AsyncFn == nil {
+		c.h1AsyncFn = c.runH1Async
+	}
+	return c.h1AsyncFn
+}
+
+func (c *epollConn) runH1Async() {
+	srv := c.worker.server
+	defer func() {
+		if r := recover(); r != nil {
+			c.resp.resetFastH1()
+			c.resp.Status(500).String("Internal Server Error")
+		}
+		c.worker.pushH1Done(c)
+	}()
+	if c.h1DispatchFast {
+		handler := srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)
+		handler(&c.req, &c.resp)
+		return
+	}
+	srv.dispatch(&c.req, &c.resp)
 }
 
 func (c *epollConn) runH1Inline(srv *Server) {

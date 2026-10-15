@@ -81,6 +81,11 @@ type epollConn struct {
 	h1AttacherFn     func(*Request) net.Conn
 	h1AttacherGen    uint32
 	h1AttacherInline bool
+	h1DispatchClose  bool
+	h1DispatchFast   bool
+	h1DispatchGen    uint32
+	h1AsyncFn        func()
+	h1DoneNext       *epollConn
 
 	// proxyEx is the in-flight upstream exchange for this connection, and
 	// pausedBackend the backend socket whose reads were disarmed because this
@@ -268,6 +273,7 @@ type epollWorker struct {
 	events          []unix.EpollEvent
 	taskCh          chan func(*epollWorker)
 	taskPending     atomic.Bool
+	h1Done          atomic.Pointer[epollConn]
 	parked          atomic.Bool
 	wakeBuf         [8]byte
 	flushList       []*epollConn
@@ -471,6 +477,7 @@ func (w *epollWorker) postTask(fn func(*epollWorker)) {
 
 func (w *epollWorker) drainTasks() {
 	w.taskPending.Store(false)
+	w.drainH1Done()
 	for {
 		select {
 		case fn := <-w.taskCh:
@@ -488,6 +495,46 @@ func (w *epollWorker) runTask(fn func(*epollWorker)) {
 		}
 	}()
 	fn(w)
+}
+
+func (w *epollWorker) pushH1Done(c *epollConn) {
+	for {
+		head := w.h1Done.Load()
+		c.h1DoneNext = head
+		if w.h1Done.CompareAndSwap(head, c) {
+			break
+		}
+	}
+	w.taskPending.Store(true)
+	if w.parked.Load() {
+		var one uint64 = 1
+		_, _ = unix.Write(w.wakeFd, (*[8]byte)(unsafe.Pointer(&one))[:])
+	}
+}
+
+func (w *epollWorker) drainH1Done() {
+	var ordered *epollConn
+	for c := w.h1Done.Swap(nil); c != nil; {
+		next := c.h1DoneNext
+		c.h1DoneNext = ordered
+		ordered = c
+		c = next
+	}
+	for ordered != nil {
+		c := ordered
+		ordered = c.h1DoneNext
+		c.h1DoneNext = nil
+		w.runH1Finish(c)
+	}
+}
+
+func (w *epollWorker) runH1Finish(c *epollConn) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[EPOLL-PANIC] worker %d task recovered: %v", w.coreID, r)
+		}
+	}()
+	c.finishH1Dispatch(w, c.h1DispatchGen, c.h1DispatchClose)
 }
 
 func (w *epollWorker) serviceConn(c *epollConn, evs uint32) {
