@@ -271,9 +271,9 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 	}
 	http10 := rl[sp2+8] == '0'
 	if http10 {
-		req.Proto = "HTTP/1.0"
+		req.Proto = internedHTTP10
 	} else {
-		req.Proto = "HTTP/1.1"
+		req.Proto = internedHTTP11
 	}
 	keepAliveRequested := false
 
@@ -283,19 +283,19 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 	}
 	switch {
 	case len(methodBytes) == 3 && methodBytes[0] == 'G' && methodBytes[1] == 'E' && methodBytes[2] == 'T':
-		req.Method = "GET"
+		req.Method = internedGET
 	case len(methodBytes) == 4 && methodBytes[0] == 'P' && methodBytes[1] == 'O' && methodBytes[2] == 'S' && methodBytes[3] == 'T':
-		req.Method = "POST"
+		req.Method = internedPOST
 	case len(methodBytes) == 3 && methodBytes[0] == 'P' && methodBytes[1] == 'U' && methodBytes[2] == 'T':
-		req.Method = "PUT"
+		req.Method = internedPUT
 	case len(methodBytes) == 6 && methodBytes[0] == 'D':
-		req.Method = "DELETE"
+		req.Method = internedDELETE
 	case len(methodBytes) == 5 && methodBytes[0] == 'P' && methodBytes[1] == 'A':
-		req.Method = "PATCH"
+		req.Method = internedPATCH
 	case len(methodBytes) == 4 && methodBytes[0] == 'H':
-		req.Method = "HEAD"
+		req.Method = internedHEAD
 	case len(methodBytes) == 7 && methodBytes[0] == 'O':
-		req.Method = "OPTIONS"
+		req.Method = internedOPTIONS
 	default:
 		req.Method = string(methodBytes)
 	}
@@ -331,6 +331,7 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 				closeConn = true
 			}
 			req.aliasesReadBuf = true
+			req.aliasBlock = data[:nl+2]
 			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, false, true
 		}
 

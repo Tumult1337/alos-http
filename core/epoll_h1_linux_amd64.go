@@ -213,7 +213,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		c.req.conn = nil
 		c.req.server = srv
 		c.req.Host = c.req.cachedHost
-		c.req.RemoteAddr = c.remoteAddr
+		c.req.setOwnedRemoteAddr(c.remoteAddr)
 		c.req.IsTLS = c.tls
 		if !c.acquireIPConn(srv, &c.req) {
 			statsBlocked()

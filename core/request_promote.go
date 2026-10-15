@@ -4,6 +4,42 @@ import "unsafe"
 
 const promoteArenaChunk = 16 << 10
 
+const (
+	internedGET     = "GET"
+	internedPOST    = "POST"
+	internedPUT     = "PUT"
+	internedDELETE  = "DELETE"
+	internedPATCH   = "PATCH"
+	internedHEAD    = "HEAD"
+	internedOPTIONS = "OPTIONS"
+	internedHTTP10  = "HTTP/1.0"
+	internedHTTP11  = "HTTP/1.1"
+)
+
+var internedStrings = [...]string{
+	internedGET, internedPOST, internedPUT, internedDELETE, internedPATCH,
+	internedHEAD, internedOPTIONS, internedHTTP10, internedHTTP11,
+}
+
+func isInternedString(s string) bool {
+	data := unsafe.StringData(s)
+	for _, interned := range internedStrings {
+		if len(interned) == len(s) && unsafe.StringData(interned) == data {
+			return true
+		}
+	}
+	return false
+}
+
+func sameStringBytes(a, b string) bool {
+	return len(a) == len(b) && unsafe.StringData(a) == unsafe.StringData(b)
+}
+
+func (r *Request) setOwnedRemoteAddr(addr string) {
+	r.RemoteAddr = addr
+	r.ownedRemoteAddr = addr
+}
+
 func (r *Request) promoteAlloc(n int) []byte {
 	if r.promoteBuf == nil || r.promoteOff+n > len(r.promoteBuf) {
 		size := promoteArenaChunk
@@ -31,6 +67,10 @@ func promoteRequestStrings(r *Request) {
 		return
 	}
 	r.aliasesReadBuf = false
+	if len(r.aliasBlock) > 0 {
+		promoteAliasBlock(r)
+		return
+	}
 
 	total := len(r.Method) + len(r.Path) + len(r.RawPath) + len(r.Query) + len(r.Proto) +
 		len(r.Host) + len(r.RemoteAddr) +
@@ -69,4 +109,54 @@ func promoteRequestStrings(r *Request) {
 		r.Headers[i][0], off = promoteTake(buf, off, r.Headers[i][0])
 		r.Headers[i][1], off = promoteTake(buf, off, r.Headers[i][1])
 	}
+}
+
+func promoteAliasBlock(r *Request) {
+	block := r.aliasBlock
+	r.aliasBlock = nil
+	buf := r.promoteAlloc(len(block))
+	copy(buf, block)
+	base := uintptr(unsafe.Pointer(unsafe.SliceData(block)))
+	if !isInternedString(r.Method) {
+		r.Method = r.rebaseAliased(r.Method, base, len(block), buf)
+	}
+	r.Path = r.rebaseAliased(r.Path, base, len(block), buf)
+	r.RawPath = r.rebaseAliased(r.RawPath, base, len(block), buf)
+	r.Query = r.rebaseAliased(r.Query, base, len(block), buf)
+	if !isInternedString(r.Proto) {
+		r.Proto = r.rebaseAliased(r.Proto, base, len(block), buf)
+	}
+	r.Host = r.rebaseAliased(r.Host, base, len(block), buf)
+	if !sameStringBytes(r.RemoteAddr, r.ownedRemoteAddr) {
+		r.RemoteAddr = r.rebaseAliased(r.RemoteAddr, base, len(block), buf)
+	}
+	r.cachedCL = r.rebaseAliased(r.cachedCL, base, len(block), buf)
+	r.cachedConn = r.rebaseAliased(r.cachedConn, base, len(block), buf)
+	r.cachedTE = r.rebaseAliased(r.cachedTE, base, len(block), buf)
+	r.cachedHost = r.rebaseAliased(r.cachedHost, base, len(block), buf)
+	r.cachedAE = r.rebaseAliased(r.cachedAE, base, len(block), buf)
+	r.cachedOrigin = r.rebaseAliased(r.cachedOrigin, base, len(block), buf)
+	r.cachedXFF = r.rebaseAliased(r.cachedXFF, base, len(block), buf)
+	r.cachedXRI = r.rebaseAliased(r.cachedXRI, base, len(block), buf)
+	r.cachedAuth = r.rebaseAliased(r.cachedAuth, base, len(block), buf)
+	r.cachedUpgrade = r.rebaseAliased(r.cachedUpgrade, base, len(block), buf)
+	r.cachedWSKey = r.rebaseAliased(r.cachedWSKey, base, len(block), buf)
+	r.cachedWSVer = r.rebaseAliased(r.cachedWSVer, base, len(block), buf)
+	for i := range r.Headers {
+		r.Headers[i][0] = r.rebaseAliased(r.Headers[i][0], base, len(block), buf)
+		r.Headers[i][1] = r.rebaseAliased(r.Headers[i][1], base, len(block), buf)
+	}
+}
+
+func (r *Request) rebaseAliased(s string, base uintptr, blockLen int, buf []byte) string {
+	if len(s) == 0 {
+		return s
+	}
+	off := uintptr(unsafe.Pointer(unsafe.StringData(s))) - base
+	if off < uintptr(blockLen) && off+uintptr(len(s)) <= uintptr(blockLen) {
+		return unsafe.String(&buf[off], len(s))
+	}
+	own := r.promoteAlloc(len(s))
+	copy(own, s)
+	return unsafe.String(&own[0], len(s))
 }

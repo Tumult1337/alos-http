@@ -68,9 +68,11 @@ type Request struct {
 	hijackReadBuf []byte
 	cookiesCache  []Cookie
 
-	promoteBuf     []byte
-	promoteOff     int
-	aliasesReadBuf bool
+	promoteBuf      []byte
+	aliasBlock      []byte
+	ownedRemoteAddr string
+	promoteOff      int
+	aliasesReadBuf  bool
 
 	store      map[string]any
 	queryCache map[string][]string
@@ -150,6 +152,7 @@ func (r *Request) Reset() {
 	r.Proto = ""
 	r.Host = ""
 	r.RemoteAddr = ""
+	r.ownedRemoteAddr = ""
 	clear(r.Headers)
 	if cap(r.Headers) > 128 {
 		r.Headers = make([][2]string, 0, 16)
@@ -170,6 +173,7 @@ func (r *Request) Reset() {
 	r.tlsWriter = nil
 	r.hdrBuf = nil
 	r.aliasesReadBuf = false
+	r.aliasBlock = nil
 	r.promoteBuf = nil
 	r.promoteOff = 0
 	r.hijacked = false
@@ -205,6 +209,7 @@ func (r *Request) Reset() {
 
 func (r *Request) resetFastH1() {
 	r.aliasesReadBuf = false
+	r.aliasBlock = nil
 	clear(r.Headers)
 	r.Headers = r.Headers[:0]
 	r.Body = shrinkBuffer(r.Body, 1024)
