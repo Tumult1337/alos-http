@@ -19,7 +19,6 @@ import (
 	"math/big"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/ericlagergren/aegis"
@@ -129,21 +128,12 @@ type TrafficAEAD struct {
 	seq       uint64
 	nonceSize int
 	staticLen int
+	scratch   trafficAEADScratch
 }
 
 type trafficAEADScratch struct {
 	nonce [16]byte
 	ad    [5]byte
-}
-
-var trafficAEADScratchPool = sync.Pool{
-	New: func() any {
-		s := &trafficAEADScratch{}
-		s.ad[0] = 0x17
-		s.ad[1] = 0x03
-		s.ad[2] = 0x03
-		return s
-	},
 }
 
 // NewTrafficAEAD derives the traffic key and IV from secret using cs's HKDF label
@@ -169,6 +159,9 @@ func (t *TrafficAEAD) prepareRecord(sp *trafficAEADScratch, recordLen uint16) {
 	sl := t.staticLen
 	copy(sp.nonce[:sl], t.iv[:sl])
 	binary.BigEndian.PutUint64(sp.nonce[sl:], t.ivLow^t.seq)
+	sp.ad[0] = 0x17
+	sp.ad[1] = 0x03
+	sp.ad[2] = 0x03
 	sp.ad[3] = byte(recordLen >> 8)
 	sp.ad[4] = byte(recordLen)
 }
@@ -186,11 +179,10 @@ func (t *TrafficAEAD) Encrypt(plaintext []byte) []byte {
 		ciphertextLen = 0xFFFF
 	}
 	recordLen := uint16(ciphertextLen)
-	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
+	sp := &t.scratch
 	t.prepareRecord(sp, recordLen)
 	ct := t.aead.Seal(plaintext[:0], sp.nonce[:t.nonceSize], plaintext, sp.ad[:])
 	t.seq++
-	trafficAEADScratchPool.Put(sp)
 	return ct
 }
 
@@ -203,11 +195,10 @@ func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 		ciphertextLen = 0xFFFF
 	}
 	recordLen := uint16(ciphertextLen)
-	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
+	sp := &t.scratch
 	t.prepareRecord(sp, recordLen)
 	dst = t.aead.Seal(dst, sp.nonce[:t.nonceSize], plaintext, sp.ad[:])
 	t.seq++
-	trafficAEADScratchPool.Put(sp)
 	return dst
 }
 
@@ -215,15 +206,13 @@ func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 // record nonce, returning the plaintext and advancing the internal sequence number on success.
 func (t *TrafficAEAD) Decrypt(ciphertext []byte) ([]byte, error) {
 	recordLen := uint16(len(ciphertext))
-	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
+	sp := &t.scratch
 	t.prepareRecord(sp, recordLen)
 	pt, err := t.aead.Open(ciphertext[:0], sp.nonce[:t.nonceSize], ciphertext, sp.ad[:])
 	if err != nil {
-		trafficAEADScratchPool.Put(sp)
 		return nil, err
 	}
 	t.seq++
-	trafficAEADScratchPool.Put(sp)
 	return pt, nil
 }
 
