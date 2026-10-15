@@ -100,7 +100,7 @@ func TestShardedOriginStillReusesConnections(t *testing.T) {
 // share connections instead of each opening their own.
 func TestOriginPoolIsSharedAcrossConcurrentVisitors(t *testing.T) {
 	srv, accepted := countingOrigin(t)
-	client, err := NewUpstreamClient(UpstreamConfig{})
+	client, err := NewUpstreamClient(UpstreamConfig{LoopsPerOrigin: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,10 +144,7 @@ func TestOriginPoolIsSharedAcrossConcurrentVisitors(t *testing.T) {
 	t.Logf("%d requests from %d concurrent visitors opened %d TCP connections (%.1f reqs/conn)",
 		total, visitors, conns, reqsPerConn)
 
-	// A connection can only serve one request at a time, so the floor is the
-	// number of simultaneous visitors; sharding and churn allow some headroom
-	// above that. What must never happen is a dial per request.
-	if conns > int64(visitors)*3 {
+	if conns > int64(visitors) {
 		t.Errorf("opened %d connections for %d concurrent visitors; pool is not bounded", conns, visitors)
 	}
 	if reqsPerConn < 5 {
