@@ -57,10 +57,27 @@ func (c *epollConn) h1Reject(out []byte, status int, msg string) []byte {
 	return appendPlainResponseClose(&c.resp, out)
 }
 
+const tlsDirectSealMinBody = 16 << 10
+
+func (c *epollConn) h1AppendResponse(out []byte, keepAlive bool) []byte {
+	if !c.tls || c.tls12 != nil || c.resp.BodyLen() < tlsDirectSealMinBody {
+		return appendPlainResponseMode(&c.resp, out, keepAlive, true)
+	}
+	head, suppressBody := appendPlainResponseHead(&c.resp, out, keepAlive)
+	var body []byte
+	if !suppressBody {
+		body = c.resp.bodyBytesUnsafe()
+	}
+	c.writeBuf = buildTLSAppDataRecordsParts(c.writeBuf, c.appWriter, head, body)
+	return head[:0]
+}
+
 func (c *epollConn) h1WriteResponse(keepAlive bool) {
 	if c.tls {
-		plain := appendPlainResponseMode(&c.resp, c.plainBuf[:0], keepAlive, true)
-		c.writeBuf = c.sealTLSAppData(c.writeBuf, plain)
+		plain := c.h1AppendResponse(c.plainBuf[:0], keepAlive)
+		if len(plain) > 0 {
+			c.writeBuf = c.sealTLSAppData(c.writeBuf, plain)
+		}
 		c.plainBuf = plain[:0]
 		return
 	}
@@ -271,7 +288,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 				c.resp.Status(500).String("Streaming/Hijack unavailable")
 				return appendPlainResponseClose(&c.resp, out), h1StepClose
 			}
-			out = appendPlainResponseMode(&c.resp, out, !closeConn, true)
+			out = c.h1AppendResponse(out, !closeConn)
 			if closeConn {
 				return out, h1StepClose
 			}

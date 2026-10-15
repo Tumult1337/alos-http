@@ -47,28 +47,32 @@ func appendTLSInnerRecord(dst []byte, writer *TrafficAEAD, innerPayload []byte) 
 }
 
 func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte) []byte {
+	return buildTLSAppDataRecordsParts(dst, writer, payload, nil)
+}
+
+func buildTLSAppDataRecordsParts(dst []byte, writer *TrafficAEAD, head, body []byte) []byte {
 	if writer == nil {
 		return dst
 	}
 	const maxContent = MaxRecordPayload - 1
-	if len(payload) == 0 {
+	total := len(head) + len(body)
+	if total == 0 {
 		return dst
 	}
-	records := (len(payload) + maxContent - 1) / maxContent
-	dst = ensureTailCap(dst, len(payload)+records*(tlsRecordHeaderLen+1+writer.Overhead()))
+	records := (total + maxContent - 1) / maxContent
+	dst = ensureTailCap(dst, total+records*(tlsRecordHeaderLen+1+writer.Overhead()))
 	scratch := acquirePooledBuf(&tlsScratchPool)
 	if cap(scratch) < MaxRecordPayload {
 		scratch = make([]byte, 0, MaxRecordPayload)
 	}
-	for len(payload) > 0 {
-		chunk := payload
-		if len(chunk) > maxContent {
-			chunk = chunk[:maxContent]
-		}
-		payload = payload[len(chunk):]
-		inner := scratch[:len(chunk)+1]
-		copy(inner, chunk)
-		inner[len(chunk)] = 0x17
+	for len(head)+len(body) > 0 {
+		n := min(len(head), maxContent)
+		inner := append(scratch[:0], head[:n]...)
+		head = head[n:]
+		m := min(len(body), maxContent-n)
+		inner = append(inner, body[:m]...)
+		body = body[m:]
+		inner = append(inner, 0x17)
 		dst = appendTLSInnerRecord(dst, writer, inner)
 	}
 	releasePooledBuf(&tlsScratchPool, scratch, MaxRecordSize)

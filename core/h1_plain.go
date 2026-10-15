@@ -11,6 +11,14 @@ import (
 )
 
 func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
+	dst, suppressBody := appendPlainResponseHead(resp, dst, keepAlive)
+	if includeBody && !suppressBody {
+		dst = resp.appendBody(dst)
+	}
+	return dst
+}
+
+func appendPlainResponseHead(resp *Response, dst []byte, keepAlive bool) ([]byte, bool) {
 	dst = appendStatusLine(dst, resp.StatusCode)
 
 	if resp.ContentType != "" {
@@ -60,10 +68,7 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 		dst = append(dst, cl...)
 	}
 	dst = append(dst, '\r', '\n')
-	if includeBody && !suppressBody {
-		dst = resp.appendBody(dst)
-	}
-	return dst
+	return dst, suppressBody
 }
 
 func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
