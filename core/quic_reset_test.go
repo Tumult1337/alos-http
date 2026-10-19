@@ -105,6 +105,7 @@ func newQUICTestPeer(t *testing.T, routes func(*Router)) *quicTestPeer {
 	if qc.maxDataRemote >= qc.peerUniStreamWindow {
 		t.Fatalf("fixture uni credit %d must exceed connection credit %d", qc.peerUniStreamWindow, qc.maxDataRemote)
 	}
+	qc.peerStreamWindow = 1 << 20
 	qc.handshakeDone.Store(true)
 	newH3Conn(qc)
 	t.Cleanup(qc.close)
