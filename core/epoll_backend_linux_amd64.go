@@ -1339,7 +1339,11 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		c.reqBodyCopy = shrinkEpollBuf(c.reqBodyCopy)
 		c.req.Body = nil
 		c.resp.resetFastH1()
-		c.deadline = deadlineFrom(w.idleTO)
+		if c.speaksH2() {
+			c.restoreH2Deadline(w)
+		} else {
+			c.deadline = deadlineFrom(w.idleTO)
+		}
 	}
 }
 
@@ -1441,6 +1445,7 @@ drain:
 		w.closeAfterResponse(c)
 		return false
 	}
+	c.restoreH2Deadline(w)
 	return true
 }
 
@@ -1460,6 +1465,8 @@ func (w *epollWorker) disarmOut(c *epollConn) {
 	c.outArmed = false
 	if c.inFlight > 0 || c.dispatching {
 		c.deadline = 0
+	} else if c.speaksH2() {
+		c.restoreH2Deadline(w)
 	} else if w.idleTO > 0 {
 		c.deadline = deadlineFrom(w.idleTO)
 	}
