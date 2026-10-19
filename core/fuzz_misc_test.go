@@ -31,6 +31,8 @@ func FuzzParseQueryString(f *testing.F) {
 }
 
 func FuzzParseMultipart(f *testing.F) {
+	f.Add(buildMultipart("B", multipartFixturePart{disposition: `form-data; name="field"`, body: "first\r\n--Bnot-a-delimiter\r\nlast"}, multipartFixturePart{disposition: `form-data; name="upload"; filename="a.bin"`, body: "first\r\n--B-junk\r\nlast"}), "B")
+	f.Add(buildMultipart("B", multipartFixturePart{disposition: `form-data; name="field"`, body: "first\r\n--B--junk\r\nlast"}), "B")
 	f.Add([]byte("--B--x\r\n--B\r\nContent-Disposition: form-data; name=\"0\"\r\n\r\n\r\n--B--\r\n"), "B")
 	f.Add([]byte("--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\nContent-Type: text/plain\r\n\r\nfile\r\n--B--\r\n"), "B")
 	f.Add([]byte("--B\r\nContent-Disposition: form-data; filename=\"../../x\"; name=\"f\"\r\n\r\n--B--"), "B")
