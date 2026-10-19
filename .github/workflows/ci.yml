@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -24,21 +24,104 @@ jobs:
       - name: staticcheck
         run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./core/
 
-      - name: test
-        run: go test -race -count=1 -timeout 40m ./core/ ./tests/...
-
-      - name: h3 interop
-        working-directory: tests/h3interop
-        run: go test -count=1 -timeout 10m ./...
-
-      - name: fuzz
-        run: |
-          for f in $(go test -list '^Fuzz' ./core/ | grep '^Fuzz'); do
-            go test -run '^$' -fuzz "^${f}\$" -fuzztime 30s ./core/
-          done
-
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: benchmark smoke
         run: go test -run '^$' -bench . -benchtime 1x ./core/
+
+  race:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: test
+        run: go test -json -race -count=1 -timeout 40m ./core/ ./tests/...
+
+  h3interop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: tests/h3interop/go.sum
+
+      - name: h3 interop
+        working-directory: tests/h3interop
+        run: go test -count=1 -timeout 10m ./...
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: fuzz
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARD_COUNT: ${{ strategy.job-total }}
+        run: |
+          target_listing=$(go test -list '^Fuzz' ./core/)
+          targets=()
+          while IFS= read -r target; do
+            if [[ "$target" == Fuzz* ]]; then
+              targets+=("$target")
+            fi
+          done <<< "$target_listing"
+          if (( ${#targets[@]} == 0 )); then
+            echo 'No fuzz targets discovered' >&2
+            exit 1
+          fi
+
+          shard_targets=()
+          for index in "${!targets[@]}"; do
+            if (( index % SHARD_COUNT == SHARD )); then
+              shard_targets+=("${targets[index]}")
+            fi
+          done
+          if (( ${#shard_targets[@]} == 0 )); then
+            echo 'No fuzz targets assigned to this shard' >&2
+            exit 1
+          fi
+
+          printf 'Fuzz shard %s/%s: %s of %s targets\n' \
+            "$((SHARD + 1))" "$SHARD_COUNT" "${#shard_targets[@]}" "${#targets[@]}"
+          for target in "${shard_targets[@]}"; do
+            go test -run '^$' -fuzz "^${target}\$" -fuzztime 30s ./core/
+          done
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 1
+    needs: [quality, race, h3interop, fuzz]
+    if: always()
+    steps:
+      - name: require all checks
+        env:
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          RACE_RESULT: ${{ needs.race.result }}
+          H3INTEROP_RESULT: ${{ needs.h3interop.result }}
+          FUZZ_RESULT: ${{ needs.fuzz.result }}
+        run: |
+          for result in "$QUALITY_RESULT" "$RACE_RESULT" "$H3INTEROP_RESULT" "$FUZZ_RESULT"; do
+            if [[ "$result" != success ]]; then
+              echo 'One or more CI checks did not succeed' >&2
+              exit 1
+            fi
+          done
