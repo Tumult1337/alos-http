@@ -230,6 +230,9 @@ func (c *epollConn) epollH2Headers(srv *Server, streamID uint32, frameFlags byte
 
 func (c *epollConn) epollH2Continuation(srv *Server, streamID uint32, frameFlags byte, payload []byte) bool {
 	st := &c.h2
+	if len(payload) == 0 && c.h2ChargeLimiter(st.countCtrl()) {
+		return true
+	}
 	st.headerAccum = append(st.headerAccum, payload...)
 	if len(st.headerAccum) > st.decoder.maxHeaderListSize*4 {
 		st.expectContinuation = 0
