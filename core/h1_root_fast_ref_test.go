@@ -2,7 +2,13 @@
 
 package core
 
-func parsePlainFastRootRequestRef(buf []byte, lineLen int, maxHeaderBytes int) (consumed int, keepAlive bool, ok bool, needRead bool) {
+func parsePlainFastRootRequestRef(buf []byte, lineLen int, maxHeaderBytes, maxHeaderCount int) (consumed int, keepAlive bool, ok bool, needRead bool) {
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = 8192
+	}
+	if maxHeaderCount <= 0 {
+		maxHeaderCount = 128
+	}
 	headerEnd := findHeaderTerminatorBytes(buf, lineLen)
 	if headerEnd < 0 {
 		if len(buf) > maxHeaderBytes {
@@ -10,8 +16,12 @@ func parsePlainFastRootRequestRef(buf []byte, lineLen int, maxHeaderBytes int) (
 		}
 		return 0, false, false, true
 	}
+	if headerEnd-2 > maxHeaderBytes {
+		return 0, false, false, false
+	}
 	keepAlive = true
 	hosts := 0
+	headerCount := 0
 	for offset := lineLen; offset < headerEnd-2; {
 		rest := buf[offset:headerEnd]
 		special, nameEnd := h1HeaderLineSpecials(rest)
@@ -21,6 +31,10 @@ func parsePlainFastRootRequestRef(buf []byte, lineLen int, maxHeaderBytes int) (
 		}
 		line := rest[:n]
 		if !validH1Colon(line, nameEnd) {
+			return 0, false, false, false
+		}
+		headerCount++
+		if headerCount > maxHeaderCount {
 			return 0, false, false, false
 		}
 		colon := nameEnd

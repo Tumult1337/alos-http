@@ -102,7 +102,7 @@ func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, 
 	if maxHeaderBytes <= 0 {
 		maxHeaderBytes = 8192
 	}
-	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes)
+	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes, s.config.MaxHeaderCount)
 	if needRead {
 		return nil, 0, false, false
 	}
@@ -114,14 +114,20 @@ func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, 
 
 const rootScalarScanMaxBytes = 96
 
-func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (consumed int, keepAlive bool, ok bool, needRead bool) {
+func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes, maxHeaderCount int) (consumed int, keepAlive bool, ok bool, needRead bool) {
+	if maxHeaderBytes <= 0 {
+		maxHeaderBytes = 8192
+	}
+	if maxHeaderCount <= 0 {
+		maxHeaderCount = 128
+	}
 	if len(buf) <= rootScalarScanMaxBytes {
-		st := rootFastState{keepAlive: true}
-		if headerEnd, ok := st.scanFields(buf, lineLen); ok && st.hosts == 1 {
+		st := rootFastState{keepAlive: true, maxHeaderCount: maxHeaderCount}
+		if headerEnd, ok := st.scanFields(buf, lineLen); ok && st.hosts == 1 && headerEnd-2 <= maxHeaderBytes {
 			return headerEnd, st.keepAlive, true, false
 		}
-	} else if endsWithHeaderTerminator(buf, lineLen) {
-		if keepAlive, ok := rootFastHeaders(buf[lineLen : len(buf)-2]); ok {
+	} else if len(buf)-2 <= maxHeaderBytes && endsWithHeaderTerminator(buf, lineLen) {
+		if keepAlive, ok := rootFastHeaders(buf[lineLen:len(buf)-2], maxHeaderCount); ok {
 			return len(buf), keepAlive, true, false
 		}
 	}
@@ -132,7 +138,10 @@ func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (con
 		}
 		return 0, false, false, true
 	}
-	keepAlive, ok = rootFastHeaders(buf[lineLen : headerEnd-2])
+	if headerEnd-2 > maxHeaderBytes {
+		return 0, false, false, false
+	}
+	keepAlive, ok = rootFastHeaders(buf[lineLen:headerEnd-2], maxHeaderCount)
 	if !ok {
 		return 0, false, false, false
 	}
@@ -144,8 +153,8 @@ func endsWithHeaderTerminator(buf []byte, lineLen int) bool {
 	return n-2 >= lineLen && n >= 4 && string(buf[n-4:]) == "\r\n\r\n"
 }
 
-func rootFastHeaders(block []byte) (keepAlive, ok bool) {
-	st := rootFastState{keepAlive: true}
+func rootFastHeaders(block []byte, maxHeaderCount int) (keepAlive, ok bool) {
+	st := rootFastState{keepAlive: true, maxHeaderCount: maxHeaderCount}
 	if !st.fields(block) || st.hosts != 1 {
 		return false, false
 	}
@@ -153,8 +162,10 @@ func rootFastHeaders(block []byte) (keepAlive, ok bool) {
 }
 
 type rootFastState struct {
-	hosts     int
-	keepAlive bool
+	hosts          int
+	headerCount    int
+	maxHeaderCount int
+	keepAlive      bool
 }
 
 func (st *rootFastState) scanFields(buf []byte, i int) (headerEnd int, ok bool) {
@@ -163,7 +174,7 @@ func (st *rootFastState) scanFields(buf []byte, i int) (headerEnd int, ok bool) 
 			return i + 2, buf[i+1] == '\n'
 		}
 		name, value, next, hostSafe, ok := rootFieldScalar(buf, i)
-		if !ok || !st.field(name, value, hostSafe) {
+		if !ok || !st.addFields(1) || !st.field(name, value, hostSafe) {
 			return 0, false
 		}
 		i = next
@@ -187,6 +198,9 @@ func (st *rootFastState) indexedFields(block []byte) (ok, indexed bool) {
 	}
 	chunks := (len(block) + 63) >> 6
 	for ci := 0; ci < chunks; ci++ {
+		if !st.addFields(bits.OnesCount64(idx.starts[ci])) {
+			return false, true
+		}
 		for c := idx.cands[ci]; c != 0; c &= c - 1 {
 			start := ci<<6 | bits.TrailingZeros64(c)
 			colon := h1NextBit(&idx.ends, start, chunks)
@@ -211,11 +225,16 @@ func (st *rootFastState) lineFields(block []byte) bool {
 		} else {
 			name, value, i, hostSafe, ok = rootFieldScalar(block, i)
 		}
-		if !ok || !st.field(name, value, hostSafe) {
+		if !ok || !st.addFields(1) || !st.field(name, value, hostSafe) {
 			return false
 		}
 	}
 	return true
+}
+
+func (st *rootFastState) addFields(count int) bool {
+	st.headerCount += count
+	return st.headerCount <= st.maxHeaderCount
 }
 
 func (st *rootFastState) field(name, value []byte, hostSafe bool) bool {
