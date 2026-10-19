@@ -121,14 +121,14 @@ func (c *epollConn) sendSessionTicket(srv *Server) {
 	if msg == nil {
 		return
 	}
-	c.writeBuf = appendTLSInnerRecord(c.writeBuf, c.appWriter, append(msg, tlsRecHandshake))
+	c.writeBuf = buildTLSInnerRecordsParts(c.writeBuf, c.appWriter, tlsRecHandshake, msg, nil)
 }
 
 func (c *epollConn) appendTLS12ServerFinish(srv *Server, dst []byte) []byte {
 	st := c.tls12
 	if st.issueTicket {
 		if nst := srv.tls12NewSessionTicket(st, c.selectedALPN); nst != nil {
-			dst = AppendRecord(dst, tlsRecHandshake, nst)
+			dst = appendTLS12HandshakeRecords(dst, nst)
 			st.transcript.Write(nst)
 		}
 	}
