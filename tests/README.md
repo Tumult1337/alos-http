@@ -29,6 +29,12 @@ Set `ALOS_RUN_PROTOCOLS=1` to require the Docker protocol suite and fail if Dock
 
 The live integration stage reuses the maintained `testallnow` servers and clients. That stage provides real socket coverage for plain HTTP, TLS H1, H2, H3, and WebSockets; the portable proxy suite covers the proxy configuration lifecycle. The repository's extended Linux `fulltest.sh` remains the load, RSS, race, and live reverse-proxy stress harness for dedicated benchmark hosts.
 
+## GitHub Actions
+
+CI runs quality checks, the full race suite, HTTP/3 interoperability, and four fuzz shards independently. Every fuzz target still receives 30 seconds; shards partition the discovered targets without duplication. The final `test` check requires every job to succeed.
+
+The race suite emits Go JSON events so test progress and durations appear in the logs. Large-body protocol tests retain their 1 GiB cases. Their shared data generator copies an exact repeating pattern, with separate tests checking it against the original scalar formula.
+
 ## Memory results
 
 The benchmark stage reports bytes and allocations per operation five times. Treat these numbers as measurements tied to the current machine and Go toolchain. The correctness checks ensure high-cardinality routing remains available and that oversized reusable request buffers are released at lifecycle boundaries; they do not substitute a global cardinality cap for memory optimization.
