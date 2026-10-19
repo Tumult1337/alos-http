@@ -438,6 +438,17 @@ func (c *epollConn) h2Quiescent() bool {
 	return c.inFlight == 0 && len(st.streams) == 0 && len(st.sending) == 0 && len(c.h2Streaming) == 0 && len(c.h2BodyIn) == 0
 }
 
+func (c *epollConn) restoreH2Deadline(w *epollWorker) {
+	if c.fd < 0 || !c.speaksH2() || c.lingering || c.closeAfter || c.deadline != 0 || c.inFlight > 0 || c.dispatching || c.outArmed || c.writeSent != len(c.writeBuf) {
+		return
+	}
+	if c.h2Quiescent() && c.h2.expectContinuation == 0 && !c.unparsedInput() {
+		c.deadline = deadlineFrom(w.idleTO)
+	} else if c.h2.expectContinuation != 0 || c.unparsedInput() || len(c.h2.streams) != 0 || len(c.h2BodyIn) != 0 {
+		c.deadline = deadlineFrom(w.readTO)
+	}
+}
+
 func (c *epollConn) h2PeerLeft() bool {
 	return c.h2.peerGoingAway && c.speaksH2() && c.h2Quiescent()
 }
@@ -793,6 +804,7 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		}
 		return
 	}
+	defer c.restoreH2Deadline(w)
 	stream.asyncBusy = false
 	c.h2UncountAbandoned(stream)
 	bodyOpen := c.h2AbortBodyIn(streamID)
