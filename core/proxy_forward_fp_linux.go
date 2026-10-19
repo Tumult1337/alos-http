@@ -90,17 +90,18 @@ func fpResponseContentType(headers [][2]string) string {
 }
 
 func fpResponseContentLength(headers [][2]string) int64 {
-	for _, h := range headers {
-		if EqualFoldASCII(h[0], "content-length") {
-			var n int64
-			for i := 0; i < len(h[1]); i++ {
-				c := h[1][i]
-				if c < '0' || c > '9' {
-					return -1
-				}
-				n = n*10 + int64(c-'0')
+	for _, header := range headers {
+		if EqualFoldASCII(header[0], "transfer-encoding") {
+			return -1
+		}
+	}
+	for _, header := range headers {
+		if EqualFoldASCII(header[0], "content-length") {
+			length, err := strconv.ParseUint(header[1], 10, 63)
+			if err != nil {
+				return -1
 			}
-			return n
+			return int64(length)
 		}
 	}
 	return -1
@@ -166,6 +167,9 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 		OnBody: func(chunk []byte) error {
 			if streaming {
 				return sw.WriteChunk(chunk)
+			}
+			if len(chunk) > client.cfg.MaxResponseBody-len(buffered) {
+				return errFPBodyTooLarge
 			}
 			buffered = append(buffered, chunk...)
 			return nil
