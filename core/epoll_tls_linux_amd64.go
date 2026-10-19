@@ -231,7 +231,6 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	inner = appendFinished(inner, srvVerifyData)
 	fin := inner[finStart:]
 	transcript.Write(fin)
-	inner = append(inner, 0x16)
 	c.plainBuf = inner
 
 	flight := c.writeBuf
@@ -239,7 +238,7 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	if c.tlsRetry == nil {
 		flight = AppendRecord(flight, 0x14, tlsCompatCCS[:])
 	}
-	flight = appendTLSInnerRecord(flight, serverHSWriter, inner)
+	flight = buildTLSInnerRecordsParts(flight, serverHSWriter, tlsRecHandshake, inner, nil)
 
 	var derivedFromHSBuf [64]byte
 	derivedFromHS := cs.DeriveSecretTo(&cs.labelDerived, handshakeSecret, cs.emptyTranscriptHash, derivedFromHSBuf[:0])
@@ -570,20 +569,20 @@ func (c *epollConn) epollTLS12ClientHello(srv *Server, payload []byte, totalLen 
 	st.record(shMsg)
 	st.record(certMsg)
 	flight := c.writeBuf
-	flight = AppendRecord(flight, 0x16, shMsg)
-	flight = AppendRecord(flight, 0x16, certMsg)
+	flight = appendTLS12HandshakeRecords(flight, shMsg)
+	flight = appendTLS12HandshakeRecords(flight, certMsg)
 	if staple != nil {
 		st.record(staple.status12)
-		flight = AppendRecord(flight, 0x16, staple.status12)
+		flight = appendTLS12HandshakeRecords(flight, staple.status12)
 	}
 	st.record(skeMsg)
-	flight = AppendRecord(flight, 0x16, skeMsg)
+	flight = appendTLS12HandshakeRecords(flight, skeMsg)
 	if st.expectCert {
 		st.record(certificateRequest12)
-		flight = AppendRecord(flight, 0x16, certificateRequest12)
+		flight = appendTLS12HandshakeRecords(flight, certificateRequest12)
 	}
 	st.record(shdMsg)
-	flight = AppendRecord(flight, 0x16, shdMsg)
+	flight = appendTLS12HandshakeRecords(flight, shdMsg)
 	c.writeBuf = flight
 
 	c.tls12 = st
