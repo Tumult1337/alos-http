@@ -259,14 +259,14 @@ func (p *epollConnPool) recycle(c *epollConn) {
 	}
 }
 
-func (c *epollConn) reserveH1BodyBudget(srv *Server, n int) bool {
-	if n <= 0 || c.h1BodyAccounted > 0 {
+func (c *epollConn) reserveH1BodyBudget(srv *Server, target int) bool {
+	if int64(target) <= c.h1BodyAccounted {
 		return true
 	}
-	if !srv.tryReserveBodyBytes(n) {
+	if !srv.tryReserveBodyBytes(target - int(c.h1BodyAccounted)) {
 		return false
 	}
-	c.h1BodyAccounted = int64(n)
+	c.h1BodyAccounted = int64(target)
 	return true
 }
 
@@ -278,14 +278,6 @@ func (c *epollConn) releaseH1BodyBudget() {
 		c.worker.server.releaseBodyBytes(c.h1BodyAccounted)
 	}
 	c.h1BodyAccounted = 0
-}
-
-func h1ChunkedBodyReservation(srv *Server) int {
-	limit := srv.effectiveReadCap()
-	if maxBody := srv.limits.Load().MaxBodySize; maxBody > 0 && (limit == readCapUnlimited || maxBody < int64(limit)) {
-		limit = int(maxBody)
-	}
-	return limit
 }
 
 func (p *epollConnPool) shrinkOne() {
@@ -1479,7 +1471,9 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	}
 	c.fd = -1
 	c.generation++
-	c.releaseH1BodyBudget()
+	if handlerOwnsBody := c.dispatching && c.inFlight > 0 && c.proxyEx == nil && c.tunnelBE == nil; !handlerOwnsBody {
+		c.releaseH1BodyBudget()
+	}
 	w.abortProxyExchange(c)
 	if c.tunnelBE != nil {
 		w.closeTunnelFromClient(c)
