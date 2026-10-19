@@ -45,9 +45,10 @@ const (
 //	Example: KeyFile: "/etc/ssl/example.com-key.pem".
 //
 // Source selects how the certificate is obtained: CertManual reads CertFile
-// and KeyFile, CertSelfSigned generates a self-signed certificate for Domain
-// (CertFile and KeyFile are ignored), and CertACME provisions the certificate
-// through ACME.
+// and KeyFile, and CertACME provisions the certificate through ACME.
+// The zero value, CertSelfSigned, reads a manual pair when either file path is
+// supplied (both are required), or generates a self-signed certificate for Domain
+// when neither path is supplied.
 //
 //	Example: Source: core.CertManual.
 //	Example: Source: core.CertSelfSigned.
