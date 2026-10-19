@@ -172,7 +172,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	s.sendFin = false
 	s.sendClosed = false
 	s.maxSend = 1 << 20
-	if conn.peerStreamWindow > 0 {
+	if conn.peerStreamWindow > 0 || (quicStreamIsBidi(id) && !quicStreamIsLocal(id, true)) {
 		s.maxSend = conn.peerStreamWindow
 	}
 	s.blockedSent = 0
