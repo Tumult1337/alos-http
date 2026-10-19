@@ -29,6 +29,7 @@ func proxyFixStartTLS(t testing.TB, cfg Config, tune func(*Server)) (srv *Server
 	if tune != nil {
 		tune(srv)
 	}
+	srv.ensureTLSRuntime()
 	go func() { _ = srv.ListenAndServeTLS() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), proxyFixShutdownTO)
