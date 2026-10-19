@@ -131,12 +131,13 @@ func testHandshakeWithKey(t *testing.T, name string, key crypto.Signer, version 
 		t.Fatalf("AddCert: %v", err)
 	}
 	srv.Router.GET("/ok", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
-	go func() { _ = srv.ListenAndServeTLS() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 	})
+	srv.ensureTLSRuntime()
+	go func() { _ = srv.ListenAndServeTLS() }()
 	var conn *tls.Conn
 	var err error
 	deadline := time.Now().Add(5 * time.Second)
