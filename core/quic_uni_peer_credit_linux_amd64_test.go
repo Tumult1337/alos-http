@@ -131,7 +131,7 @@ func TestQUICUniPeerCreditStartupAndResume(t *testing.T) {
 	} {
 		t.Run(fixture.name, func(t *testing.T) {
 			conn := uniCreditConn(t)
-			params := uniCreditParam(5, 23)
+			params := append(uniCreditParam(4, 1<<20), uniCreditParam(5, 23)...)
 			if fixture.present {
 				params = append(params, uniCreditParam(7, fixture.credit)...)
 			}
@@ -213,8 +213,8 @@ func TestQUICUniPeerCreditConstructorsAndLegacyFallbacks(t *testing.T) {
 		}
 		conn.peerStreamWindow = 0
 		pooled := getPooledStream(0, conn)
-		if pooled.maxSend != 1<<20 {
-			t.Errorf("zero bidi legacy fallback=%d", pooled.maxSend)
+		if pooled.maxSend != 0 {
+			t.Errorf("zero bidi grant=%d", pooled.maxSend)
 		}
 		pooled.refCount.Store(1)
 		conn.releaseStream(pooled)
