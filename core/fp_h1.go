@@ -79,12 +79,13 @@ func colonAfterWhitespace(rest []byte) int {
 }
 
 type h1Parser struct {
-	phase     int8
-	status    int
-	keepAlive bool
-	noBody    bool
-	stream    bool
-	remaining int64
+	phase        int8
+	status       int
+	keepAlive    bool
+	noBody       bool
+	stream       bool
+	remaining    int64
+	trailerBytes int
 	// hdrBuf is a private copy of the response header block. Refs cannot point
 	// into the connection's read buffer: that buffer is consumed and refilled
 	// while the body arrives, so by the time a buffered response is written to
@@ -106,6 +107,7 @@ func (p *h1Parser) reset() {
 	p.noBody = false
 	p.stream = false
 	p.remaining = 0
+	p.trailerBytes = 0
 	p.hdr = p.hdr[:0]
 	p.strs = p.strs[:0]
 	// The body buffer is kept and refilled. completeH1 hands ownership away
@@ -235,6 +237,9 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				}
 				return false, nil
 			}
+			if idx+len(fpCrlfcrlf) > cfg.MaxHeaderBytes {
+				return false, errFPHeaderTooLarge
+			}
 			chunked, contentLen, err := p.parseHeaderBlock(data[:idx], c.cur.req.Method)
 			if err != nil {
 				return false, err
@@ -296,10 +301,14 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 		case h1PhaseChunkSize:
 			data := c.rbuf.unread()
 			idx := bytes.IndexByte(data, '\n')
+			lineBytes := idx + 1
 			if idx < 0 {
-				if len(data) > 4096 {
-					return false, errFPBadResponse
-				}
+				lineBytes = len(data)
+			}
+			if lineBytes > 4096 {
+				return false, errFPBadResponse
+			}
+			if idx < 0 {
 				return false, nil
 			}
 			line := data[:idx]
@@ -356,12 +365,17 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 		case h1PhaseTrailers:
 			data := c.rbuf.unread()
 			idx := bytes.IndexByte(data, '\n')
+			lineBytes := idx + 1
 			if idx < 0 {
-				if len(data) > cfg.MaxHeaderBytes {
-					return false, errFPHeaderTooLarge
-				}
+				lineBytes = len(data)
+			}
+			if lineBytes > cfg.MaxHeaderBytes-p.trailerBytes {
+				return false, errFPHeaderTooLarge
+			}
+			if idx < 0 {
 				return false, nil
 			}
+			p.trailerBytes += lineBytes
 			line := data[:idx]
 			if len(line) > 0 && line[len(line)-1] == '\r' {
 				line = line[:len(line)-1]
