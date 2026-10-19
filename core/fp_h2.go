@@ -388,6 +388,9 @@ func (h *h2Proto) resumeBodies(c *backendConn) {
 
 func (h *h2Proto) onHeaders(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
+	if streamID&1 == 0 || hc.streams[streamID] == nil && streamID >= hc.nextID {
+		return errFPBadResponse
+	}
 	if flags&h2FlagPadded != 0 {
 		if len(payload) < 1 {
 			return errFPBadResponse
@@ -421,7 +424,7 @@ const (
 
 func (h *h2Proto) onContinuation(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
-	if hc.continuation != streamID {
+	if streamID == 0 || hc.continuation != streamID {
 		return errFPBadResponse
 	}
 	if len(hc.headerAssembly)+len(payload) > fpMaxHeaderAssembly {
@@ -465,6 +468,10 @@ func (h *h2Proto) completeHeaders(c *backendConn, streamID uint32, endStream boo
 
 func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, payload []byte) error {
 	hc := c.h2
+	st := hc.streams[streamID]
+	if streamID&1 == 0 || st == nil && streamID >= hc.nextID {
+		return errFPBadResponse
+	}
 	consumed := len(payload)
 	if flags&h2FlagPadded != 0 {
 		if len(payload) < 1 {
@@ -477,7 +484,6 @@ func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, paylo
 		}
 		payload = payload[:len(payload)-pad]
 	}
-	st := hc.streams[streamID]
 	if st != nil && len(payload) > 0 {
 		if len(st.body)+len(payload) > c.be.cfg.MaxResponseBody {
 			return errFPBodyTooLarge
