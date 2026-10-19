@@ -1008,8 +1008,11 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 		return headers, meta, false, nil
 	}
 	path, n := d.decodeString(data[2:])
-	if n <= 0 || 2+n+1 != len(data) {
+	if n <= 0 {
 		return nil, meta, true, ErrH2BadHeader
+	}
+	if 2+n+1 != len(data) {
+		return headers, meta, false, nil
 	}
 	if headers == nil {
 		headers = make([][2]string, 0, 3)
