@@ -7,11 +7,14 @@ import (
 	"compress/gzip"
 	"hash/maphash"
 	"io"
+	"math"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/andybalholm/brotli"
 	"github.com/guno1928/alosmap"
@@ -67,8 +70,10 @@ type CacheRule struct {
 //
 //	Example: DefaultMaxAge: 10 * time.Minute.
 //
-// MaxTotalBytes caps the cache's aggregate stored bytes; 0 defaults to 256 MiB.
-// Exceeding it triggers eviction of the oldest entries down to 90% of the cap.
+// MaxTotalBytes is a soft limit on owned live entry, key, header and body bytes;
+// 0 defaults to 256 MiB in NewProxyCache. UpdateConfig preserves 0 as disabled.
+// Map tables, node bookkeeping, allocator overhead and in-flight transformations are excluded.
+// Exceeding it asynchronously evicts the oldest entries down to 90% of the limit.
 //
 //	Example: MaxTotalBytes: 512 << 20.
 //
@@ -135,23 +140,53 @@ type cacheEntry struct {
 	maxHits     uint64
 	bodyLen     int32
 	gzipLen     int32
+	cost        int64
 	deleted     atomic.Bool
 }
 
-func (pc *ProxyCache) removeEntry(key string, entry *cacheEntry) {
-	if !pc.retireEntry(entry) {
-		return
+func proxyCacheEntryCost(key string, entry *cacheEntry) (int64, bool) {
+	cost := int64(unsafe.Sizeof(cacheEntry{})) + int64(unsafe.Sizeof(key))
+	add := func(size int64) bool {
+		if size < 0 || size > math.MaxInt64-cost {
+			return false
+		}
+		cost += size
+		return true
 	}
-	pc.entries.CompareAndDelete(key, entry)
+	fieldSize := int64(unsafe.Sizeof([2]string{}))
+	if int64(cap(entry.headers)) > math.MaxInt64/fieldSize ||
+		!add(int64(len(key))) || !add(int64(cap(entry.headers))*fieldSize) ||
+		!add(int64(len(entry.contentType))) || !add(int64(cap(entry.body))) || !add(int64(cap(entry.gzipBody))) {
+		return 0, false
+	}
+	for _, field := range entry.headers {
+		if !add(int64(len(field[0]))) || !add(int64(len(field[1]))) {
+			return 0, false
+		}
+	}
+	return cost, true
 }
 
-func (pc *ProxyCache) retireEntry(entry *cacheEntry) bool {
-	if !entry.deleted.CompareAndSwap(false, true) {
+func (pc *ProxyCache) removeEntry(key string, entry *cacheEntry) bool {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
+	return pc.removeEntryLocked(key, entry)
+}
+
+func (pc *ProxyCache) removeEntryLocked(key string, entry *cacheEntry) bool {
+	if !pc.entries.CompareAndDelete(key, entry) {
 		return false
 	}
-	pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
-	pc.totalEntries.Add(-1)
+	pc.retireEntryLocked(entry)
 	return true
+}
+
+func (pc *ProxyCache) retireEntryLocked(entry *cacheEntry) {
+	if !entry.deleted.CompareAndSwap(false, true) {
+		return
+	}
+	pc.totalBytes.Add(-entry.cost)
+	pc.totalEntries.Add(-1)
 }
 
 // ProxyCache stores and serves cached upstream responses keyed by method, host, and
@@ -161,6 +196,7 @@ func (pc *ProxyCache) retireEntry(entry *cacheEntry) bool {
 // Create one with NewProxyCache, or let the server provision one automatically via
 // Server.SetProxyCache.
 type ProxyCache struct {
+	mu           sync.Mutex
 	entries      *alosmap.TypedMap[string, *cacheEntry]
 	config       atomic.Pointer[ProxyCacheConfig]
 	totalBytes   atomic.Int64
@@ -226,12 +262,16 @@ func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	if cfg.DefaultMaxAge <= 0 {
 		cfg.DefaultMaxAge = 5 * time.Minute
 	}
+	pc.mu.Lock()
 	pc.config.Store(&cfg)
+	pc.mu.Unlock()
 }
 
 // Stop signals the cache's background eviction goroutine to exit. Safe to call
 // multiple times; only the first call takes effect.
 func (pc *ProxyCache) Stop() {
+	pc.mu.Lock()
+	defer pc.mu.Unlock()
 	select {
 	case <-pc.stopCh:
 	default:
@@ -580,8 +620,13 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 		return
 	}
 
-	if cfg.MaxEntries > 0 && pc.totalEntries.Load() >= cfg.MaxEntries {
-		go pc.evictOldest()
+	pc.mu.Lock()
+	current := pc.config.Load()
+	_, replacing := pc.entries.Load(key)
+	full := !replacing && current.MaxEntries > 0 && pc.totalEntries.Load() >= current.MaxEntries
+	pc.mu.Unlock()
+	if full {
+		pc.requestEviction()
 		return
 	}
 
@@ -600,11 +645,16 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 
 	headersCopy := make([][2]string, len(headers))
 	copy(headersCopy, headers)
+	headersCopy = stripCacheUnsafeHeaders(headersCopy)
+	for i := range headersCopy {
+		headersCopy[i][0] = strings.Clone(headersCopy[i][0])
+		headersCopy[i][1] = strings.Clone(headersCopy[i][1])
+	}
 
 	entry := &cacheEntry{
 		statusCode:  statusCode,
-		headers:     stripCacheUnsafeHeaders(headersCopy),
-		contentType: contentType,
+		headers:     headersCopy,
+		contentType: strings.Clone(contentType),
 		body:        bodyCopy,
 		createdAt:   now,
 		expiresAt:   now + int64(ttl),
@@ -635,16 +685,20 @@ func (pc *ProxyCache) transformAndStore(cfg *ProxyCacheConfig, key string, entry
 		return
 	}
 
-	bodyLen := int64(entry.bodyLen)
+	bodyLen := int64(len(entry.body))
 	if compress && bodyLen >= int64(minLen) {
 		gz := pc.compressGzip(entry.body)
 		if len(gz) > 0 && len(gz) < len(entry.body) {
 			entry.gzipBody = gz
 			entry.gzipLen = int32(len(gz))
-			bodyLen += int64(len(gz))
 		}
 	}
-	pc.storeEntry(cfg, key, entry, bodyLen, generation)
+	cost, ok := proxyCacheEntryCost(key, entry)
+	if !ok {
+		return
+	}
+	entry.cost = cost
+	pc.storeEntry(key, entry, generation)
 }
 
 func inflateCacheEntry(entry *cacheEntry, encoding string, limit int64) error {
@@ -658,19 +712,40 @@ func inflateCacheEntry(entry *cacheEntry, encoding string, limit int64) error {
 	return nil
 }
 
-func (pc *ProxyCache) storeEntry(cfg *ProxyCacheConfig, key string, entry *cacheEntry, bodyLen int64, generation uint64) {
-	pc.totalEntries.Add(1)
-	pc.totalBytes.Add(bodyLen)
-	if prev, loaded := pc.entries.Swap(key, entry); loaded {
-		pc.retireEntry(prev)
-	}
-	if pc.purgedSince(key, generation) {
-		pc.removeEntry(key, entry)
+func (pc *ProxyCache) storeEntry(key string, entry *cacheEntry, generation uint64) {
+	pc.mu.Lock()
+	cfg := pc.config.Load()
+	if pc.purgedSince(key, generation) || cfg.MaxEntrySize > 0 && int64(len(entry.body)) > cfg.MaxEntrySize {
+		pc.mu.Unlock()
 		return
 	}
-
-	if cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes {
-		go pc.evictOldest()
+	prev, replacing := pc.entries.Load(key)
+	if !replacing && cfg.MaxEntries > 0 && pc.totalEntries.Load() >= cfg.MaxEntries {
+		pc.mu.Unlock()
+		pc.requestEviction()
+		return
+	}
+	retainedBytes := pc.totalBytes.Load()
+	if replacing {
+		retainedBytes -= prev.cost
+	}
+	if entry.cost > math.MaxInt64-retainedBytes {
+		pc.mu.Unlock()
+		return
+	}
+	pc.entries.Swap(key, entry)
+	if replacing {
+		pc.retireEntryLocked(prev)
+	}
+	pc.totalEntries.Add(1)
+	pc.totalBytes.Add(entry.cost)
+	if pc.purgedSince(key, generation) {
+		pc.removeEntryLocked(key, entry)
+	}
+	pressure := cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes
+	pc.mu.Unlock()
+	if pressure {
+		pc.requestEviction()
 	}
 }
 
@@ -680,8 +755,7 @@ func (pc *ProxyCache) Purge(method, host, path string) bool {
 	key := pc.buildKey(method, host, path)
 	pc.markPurged(pc.keyPurgeStripe(key))
 	if entry, ok := pc.entries.Load(key); ok {
-		pc.removeEntry(key, entry)
-		return true
+		return pc.removeEntry(key, entry)
 	}
 	return false
 }
@@ -705,8 +779,9 @@ func (pc *ProxyCache) PurgeDomain(domain string) int64 {
 	var purged int64
 	pc.entries.Range(func(key string, entry *cacheEntry) bool {
 		if hasPrefix(key, prefix1) || hasPrefix(key, prefix2) {
-			pc.removeEntry(key, entry)
-			purged++
+			if pc.removeEntry(key, entry) {
+				purged++
+			}
 		}
 		return true
 	})
@@ -792,52 +867,69 @@ func (pc *ProxyCache) evictExpired() {
 	})
 }
 
-func (pc *ProxyCache) evictOldest() {
-	if !pc.evicting.CompareAndSwap(false, true) {
+func (pc *ProxyCache) requestEviction() {
+	pc.mu.Lock()
+	cfg := pc.config.Load()
+	pressure := cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes ||
+		cfg.MaxEntries > 0 && pc.totalEntries.Load() >= cfg.MaxEntries
+	if !pressure || !pc.evicting.CompareAndSwap(false, true) {
+		pc.mu.Unlock()
 		return
 	}
-	defer pc.evicting.Store(false)
+	pc.mu.Unlock()
+	go pc.evictOldest()
+}
 
-	cfg := pc.config.Load()
-	byteTarget := int64(-1)
-	if cfg.MaxTotalBytes > 0 {
-		byteTarget = cfg.MaxTotalBytes * 90 / 100
-	}
-	entryTarget := int64(-1)
-	if cfg.MaxEntries > 0 {
-		headroom := cfg.MaxEntries / 10
-		if headroom < 1 {
-			headroom = 1
-		}
-		entryTarget = cfg.MaxEntries - headroom
-	}
+type cacheEvictionCandidate struct {
+	key   string
+	entry *cacheEntry
+}
 
-	type candidate struct {
-		key       string
-		createdAt int64
-	}
-	candidates := make([]candidate, 0, 64)
+func (pc *ProxyCache) evictionCandidates() []cacheEvictionCandidate {
+	candidates := make([]cacheEvictionCandidate, 0, 64)
 	pc.entries.Range(func(key string, entry *cacheEntry) bool {
-		candidates = append(candidates, candidate{
-			key:       key,
-			createdAt: entry.createdAt,
-		})
+		candidates = append(candidates, cacheEvictionCandidate{key: key, entry: entry})
 		return true
 	})
-
 	sort.Slice(candidates, func(i, j int) bool {
-		return candidates[i].createdAt < candidates[j].createdAt
+		return candidates[i].entry.createdAt < candidates[j].entry.createdAt
 	})
+	return candidates
+}
 
-	for _, c := range candidates {
-		overBytes := byteTarget >= 0 && pc.totalBytes.Load() > byteTarget
-		overEntries := entryTarget >= 0 && pc.totalEntries.Load() > entryTarget
-		if !overBytes && !overEntries {
-			break
+func (pc *ProxyCache) aboveEvictionTargetLocked() bool {
+	cfg := pc.config.Load()
+	if cfg.MaxTotalBytes > 0 {
+		byteTarget := cfg.MaxTotalBytes/100*90 + cfg.MaxTotalBytes%100*90/100
+		if pc.totalBytes.Load() > byteTarget {
+			return true
 		}
-		if entry, ok := pc.entries.Load(c.key); ok {
-			pc.removeEntry(c.key, entry)
+	}
+	return cfg.MaxEntries > 0 && pc.totalEntries.Load() > cfg.MaxEntries-max(int64(1), cfg.MaxEntries/10)
+}
+
+func (pc *ProxyCache) evictCandidates(candidates []cacheEvictionCandidate) {
+	for _, candidate := range candidates {
+		pc.mu.Lock()
+		if !pc.aboveEvictionTargetLocked() {
+			pc.mu.Unlock()
+			return
 		}
+		pc.removeEntryLocked(candidate.key, candidate.entry)
+		pc.mu.Unlock()
+	}
+}
+
+func (pc *ProxyCache) evictOldest() {
+	for {
+		pc.evictCandidates(pc.evictionCandidates())
+		pc.mu.Lock()
+		if !pc.aboveEvictionTargetLocked() || pc.totalEntries.Load() == 0 {
+			pc.evicting.Store(false)
+			pc.mu.Unlock()
+			return
+		}
+		pc.mu.Unlock()
 	}
 }
 
@@ -914,6 +1006,7 @@ func removeContentEncoding(headers [][2]string) [][2]string {
 			n++
 		}
 	}
+	clear(headers[n:])
 	return headers[:n]
 }
 
@@ -928,6 +1021,7 @@ func stripCacheUnsafeHeaders(headers [][2]string) [][2]string {
 		headers[n] = headers[i]
 		n++
 	}
+	clear(headers[n:])
 	return headers[:n]
 }
 
