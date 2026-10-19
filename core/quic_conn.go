@@ -1508,12 +1508,8 @@ func (qc *QUICConn) applyPeerTransportParams(ch *ParsedClientHello) {
 		qc.peerAckDelayExponent = ch.quicTP.ackDelayExponent
 		qc.loss.setPeerMaxAckDelay(time.Duration(ch.quicTP.maxAckDelayMs) * time.Millisecond)
 	}
-	if ch.InitialMaxData > 0 {
-		qc.maxDataRemote = ch.InitialMaxData
-	}
-	if ch.InitialMaxStreamDataBidiLocal > 0 {
-		qc.peerStreamWindow = ch.InitialMaxStreamDataBidiLocal
-	}
+	qc.maxDataRemote = ch.InitialMaxData
+	qc.peerStreamWindow = ch.InitialMaxStreamDataBidiLocal
 	qc.peerUniStreamWindow = ch.InitialMaxStreamDataUni
 	qc.cidMu.Lock()
 	qc.peerCIDLimit = ch.ActiveConnIDLimit
