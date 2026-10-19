@@ -111,13 +111,39 @@ func (h *h2Proto) attach(c *backendConn) error {
 
 func (h *h2Proto) flushPending(c *backendConn) {
 	hc := c.h2
-	for len(hc.pending) > 0 {
-		if uint32(len(hc.streams)) >= hc.maxConcurrent || hc.goAway {
+	for c.state != connClosed {
+		if hc.nextID > 0x7fffffff {
+			h.retireExhausted(c)
+			return
+		}
+		if len(hc.pending) == 0 || uint32(len(hc.streams)) >= hc.maxConcurrent || hc.goAway {
 			return
 		}
 		ex := hc.pending[0]
+		hc.pending[0] = nil
 		hc.pending = hc.pending[1:]
 		h.openStream(c, ex)
+	}
+}
+
+func (h *h2Proto) retireExhausted(c *backendConn) {
+	pending := c.h2.pending
+	c.h2.pending = nil
+	if c.be.h2conns[c.key] == c {
+		delete(c.be.h2conns, c.key)
+	}
+	h.closeExhausted(c)
+	for index, ex := range pending {
+		pending[index] = nil
+		if !ex.finished {
+			c.be.startExchange(ex)
+		}
+	}
+}
+
+func (h *h2Proto) closeExhausted(c *backendConn) {
+	if c.h2.nextID > 0x7fffffff && len(c.h2.streams) == 0 && len(c.h2.pending) == 0 && c.be.h2conns[c.key] != c {
+		c.be.closeConn(c, nil)
 	}
 }
 
@@ -544,6 +570,7 @@ func (h *h2Proto) closeStream(c *backendConn, streamID uint32, err error) {
 		st.ended = true
 		c.be.failOrRetry(st.ex, err, c)
 	}
+	h.closeExhausted(c)
 }
 
 func (h *h2Proto) onPeerClose(c *backendConn) {
