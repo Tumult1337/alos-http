@@ -1476,7 +1476,7 @@ func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot boo
 // the start of data, returning the decoded value and the number of bytes
 // consumed, or (0, 0) if data is truncated or the integer is malformed.
 func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
-	if len(data) == 0 {
+	if prefixBits < 1 || prefixBits > 8 || len(data) == 0 {
 		return 0, 0
 	}
 	mask := byte((1 << prefixBits) - 1)
@@ -1489,7 +1489,7 @@ func HpackDecodeInt(data []byte, prefixBits uint8) (uint64, int) {
 	for i < len(data) {
 		b := data[i]
 		i++
-		if m > 63 {
+		if m > 63 || uint64(b&0x7f) > (^uint64(0)-val)>>m {
 			return 0, 0
 		}
 		val += uint64(b&0x7f) << m
