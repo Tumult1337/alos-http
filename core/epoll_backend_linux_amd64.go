@@ -389,7 +389,14 @@ func (s *Server) serveEpoll(addr string, tlsMode bool) error {
 		}
 		return err
 	}
-	return <-s.startEpollWorkers(workers)
+	results, err := s.startEpollWorkers(workers)
+	if err != nil {
+		if err == ErrServerShutdown {
+			return nil
+		}
+		return err
+	}
+	return <-results
 }
 
 func (s *Server) prepareEpollWorkers(addr string, tlsMode bool) ([]*epollWorker, error) {
@@ -407,7 +414,12 @@ func (s *Server) prepareEpollWorkers(addr string, tlsMode bool) ([]*epollWorker,
 			closeUnstartedEpollWorkers(workers)
 			return nil, ErrServerShutdown
 		}
-		worker, err := newEpollWorker(s, addr, minPerWorker)
+		listenerFD, err := epollBind(addr)
+		if err != nil {
+			closeUnstartedEpollWorkers(workers)
+			return nil, fmt.Errorf("epoll bind %s: %w", addr, err)
+		}
+		worker, err := newEpollWorkerFromFD(s, listenerFD, minPerWorker)
 		if err != nil {
 			closeUnstartedEpollWorkers(workers)
 			return nil, err
@@ -435,13 +447,27 @@ func closeUnstartedEpollWorkers(workers []*epollWorker) {
 	}
 }
 
-func (s *Server) startEpollWorkers(workers []*epollWorker) <-chan error {
+func (s *Server) startEpollWorkers(workers []*epollWorker) (<-chan error, error) {
+	for _, worker := range workers {
+		if s.shuttingDown.Load() {
+			closeUnstartedEpollWorkers(workers)
+			return nil, ErrServerShutdown
+		}
+		if err := unix.Listen(worker.listenerFD, epollListenBacklog); err != nil {
+			closeUnstartedEpollWorkers(workers)
+			return nil, fmt.Errorf("epoll listen worker %d: %w", worker.coreID, err)
+		}
+	}
+	if s.shuttingDown.Load() {
+		closeUnstartedEpollWorkers(workers)
+		return nil, ErrServerShutdown
+	}
 	go s.epollScavenger()
 	errCh := make(chan error, len(workers))
 	for _, worker := range workers {
 		go func() { errCh <- worker.run() }()
 	}
-	return errCh
+	return errCh, nil
 }
 
 func (s *Server) epollScavenger() {
@@ -501,10 +527,14 @@ func (s *Server) epollScavenger() {
 }
 
 func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, error) {
-	lfd, err := epollListen(addr)
+	listenerFD, err := epollListen(addr)
 	if err != nil {
 		return nil, fmt.Errorf("epoll listen %s: %w", addr, err)
 	}
+	return newEpollWorkerFromFD(s, listenerFD, minPrealloc)
+}
+
+func newEpollWorkerFromFD(s *Server, lfd int, minPrealloc int) (*epollWorker, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		_ = unix.Close(lfd)
@@ -685,7 +715,7 @@ func (w *epollWorker) serviceConn(c *epollConn, evs uint32) {
 	}
 }
 
-func epollListen(addr string) (int, error) {
+func epollBind(addr string) (int, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", addr)
 	if err != nil {
 		return -1, err
@@ -702,6 +732,14 @@ func epollListen(addr string) (int, error) {
 	}
 	if err := unix.Bind(fd, sa); err != nil {
 		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
+}
+
+func epollListen(addr string) (int, error) {
+	fd, err := epollBind(addr)
+	if err != nil {
 		return -1, err
 	}
 	if err := unix.Listen(fd, epollListenBacklog); err != nil {
