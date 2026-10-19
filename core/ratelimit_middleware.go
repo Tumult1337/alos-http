@@ -5,7 +5,6 @@ package core
 import (
 	"net/netip"
 	"strconv"
-	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/alosmap"
@@ -64,10 +63,55 @@ func rateLimitKeyForIP(ip string) string {
 	return prefix.String()
 }
 
-type rateLimitMWEntry struct {
-	state        atomic.Uint64
-	resetAt      atomic.Int64
-	blockedUntil atomic.Int64
+type rateLimitMWEntry struct{ rateLimitCounter }
+
+type rateLimitMiddlewareState struct {
+	entries *alosmap.TypedMap[string, *rateLimitMWEntry]
+	now     func() int64
+}
+
+func (s *rateLimitMiddlewareState) entryFor(key string) *rateLimitMWEntry {
+	entry, ok := s.entries.Load(key)
+	if !ok {
+		entry, _ = s.entries.LoadOrStore(key, &rateLimitMWEntry{})
+	}
+	return entry
+}
+
+func (s *rateLimitMiddlewareState) admitEntry(key string, entry *rateLimitMWEntry, windowNanos, maxReqs, blockNanos int64) (bool, time.Duration) {
+	for {
+		allowed, retryAfter, live := entry.admit(s.now, windowNanos, maxReqs, blockNanos, nil)
+		if live {
+			return allowed, retryAfter
+		}
+		entry = s.entryFor(key)
+	}
+}
+
+func (s *rateLimitMiddlewareState) cleanupStale(now int64) {
+	s.entries.Range(func(key string, entry *rateLimitMWEntry) bool {
+		if entry.reset.Load() < now && entry.blocked.Load() < now {
+			s.retireEntry(key, entry, now)
+		}
+		return true
+	})
+}
+
+func (s *rateLimitMiddlewareState) retireEntry(key string, entry *rateLimitMWEntry, now int64) bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.retired {
+		return false
+	}
+	now = min(now, s.now())
+	if entry.reset.Load() >= now || entry.blocked.Load() >= now {
+		return false
+	}
+	if !s.entries.CompareAndDelete(key, entry) {
+		return false
+	}
+	entry.retired = true
+	return true
 }
 
 func extractClientIP(remoteAddr string) string {
@@ -107,6 +151,11 @@ func extractClientIP(remoteAddr string) string {
 // Example: app.Use(RateLimitMiddleware(RateLimitMiddlewareConfig{MaxRequests: 10, Window: time.Second}))
 // Example: app.Use(RateLimitMiddleware(RateLimitMiddlewareConfig{KeyFunc: func(r *Request) string { return r.Header("X-API-Key") }}))
 func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
+	middleware, _ := newRateLimitMiddlewareWithClock(cfg, CoarseNanotime)
+	return middleware
+}
+
+func newRateLimitMiddlewareWithClock(cfg RateLimitMiddlewareConfig, now func() int64) (MiddlewareFunc, *rateLimitMiddlewareState) {
 	if cfg.MaxRequests <= 0 {
 		cfg.MaxRequests = 100
 	}
@@ -126,8 +175,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 
 	windowNanos := cfg.Window.Nanoseconds()
 	blockNanos := rateLimitBlockFor.Nanoseconds()
-	blockSecs := int64(rateLimitBlockFor / time.Second)
-	entries := alosmap.NewTypedSized[string, *rateLimitMWEntry](1024, 0).Prealloc(256)
+	state := &rateLimitMiddlewareState{entries: alosmap.NewTypedSized[string, *rateLimitMWEntry](1024, 0).Prealloc(256), now: now}
 
 	stopCh := cfg.StopCh
 	go func() {
@@ -145,13 +193,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 						Dbg("[ratelimit cleanup] recovered panic: %v", r)
 					}
 				}()
-				now := CoarseNanotime()
-				entries.Range(func(key string, entry *rateLimitMWEntry) bool {
-					if entry.resetAt.Load() < now && entry.blockedUntil.Load() < now {
-						entries.Delete(key)
-					}
-					return true
-				})
+				state.cleanupStale(state.now())
 			}()
 		}
 	}()
@@ -178,43 +220,18 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 			String("Too Many Requests")
 	}
 
-	return func(next HandlerFunc) HandlerFunc {
+	middleware := func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
 			key := keyFunc(req)
-			now := CoarseNanotime()
-
-			entry, ok := entries.Load(key)
-			if !ok {
-				entry, _ = entries.LoadOrStore(key, &rateLimitMWEntry{})
-			}
-
-			blockedUntil := entry.blockedUntil.Load()
-			if blockedUntil != 0 {
-				if now < blockedUntil {
-					retryAfterSecs := (blockedUntil - now) / 1_000_000_000
-					if retryAfterSecs < 1 {
-						retryAfterSecs = 1
-					}
-					reject(req, resp, retryAfterSecs)
-					return
-				}
-				if entry.blockedUntil.CompareAndSwap(blockedUntil, 0) {
-					entry.state.Store(rlEpochOf(now, windowNanos))
-					entry.resetAt.Store(now + windowNanos)
-				}
-			}
-
-			count := rlBumpCount(&entry.state, now, windowNanos)
-			if count == 1 {
-				entry.resetAt.Store(now + windowNanos)
-			}
-			if count > cfg.MaxRequests {
-				entry.blockedUntil.Store(now + blockNanos)
-				reject(req, resp, blockSecs)
+			entry := state.entryFor(key)
+			allowed, retryAfter := state.admitEntry(key, entry, windowNanos, cfg.MaxRequests, blockNanos)
+			if !allowed {
+				reject(req, resp, max(int64(retryAfter/time.Second), 1))
 				return
 			}
 
 			next(req, resp)
 		}
 	}
+	return middleware, state
 }
