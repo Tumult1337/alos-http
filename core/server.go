@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -917,8 +918,14 @@ func (s *Server) ListenAndServeTLS() error {
 	if s.shuttingDown.Load() {
 		return nil
 	}
-	results := s.startEpollWorkers(epollWorkers)
 	transferred = true
+	results, err := s.startEpollWorkers(epollWorkers)
+	if err != nil {
+		if err == ErrServerShutdown {
+			return nil
+		}
+		return errors.Join(err, s.Shutdown(context.Background()))
+	}
 	protocols := "HTTP/1.1 + HTTP/2"
 	if !s.http2Enabled() {
 		protocols = "HTTP/1.1"
