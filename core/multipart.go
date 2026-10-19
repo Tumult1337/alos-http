@@ -44,9 +44,22 @@ func parseMultipartInMem(body []byte, boundary string) (map[string][]string, map
 			block = body[pos : pos+end]
 			pos += end + 4
 		}
-		next := bytes.Index(body[pos:], delim)
-		if next < 0 {
-			return values, files, errMultipartMalformed
+		next := 0
+		for search := pos; ; {
+			found := bytes.Index(body[search:], delim)
+			if found < 0 {
+				return values, files, errMultipartMalformed
+			}
+			next = search + found - pos
+			candidate := body[pos+next+2:]
+			if _, _, valid := multipartBoundaryLine(candidate, dash); valid {
+				break
+			}
+			suffix := candidate[len(dash):]
+			if len(suffix) == 0 || suffix[0] == ' ' || suffix[0] == '\t' || suffix[0] == '\r' || suffix[0] == '\n' || bytes.HasPrefix(suffix, []byte("--")) {
+				return values, files, errMultipartMalformed
+			}
+			search = pos + next + 2
 		}
 		content := body[pos : pos+next]
 		header, ok := parseMultipartHeaderLines(block)
