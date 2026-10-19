@@ -2,8 +2,6 @@
 
 package core
 
-import ()
-
 // H3Conn represents an HTTP/3 connection layered on a QUICConn. It manages
 // the control and QPACK streams and dispatches incoming request streams to
 // the server's handlers.
@@ -44,7 +42,7 @@ func (h3 *H3Conn) sendControlStream() {
 	h3.controlID = s.id
 	var buf []byte
 	buf = h3AppendStreamType(buf, h3StreamControl)
-	buf = h3AppendSettingsFrame(buf)
+	buf = h3AppendSettingsFrame(buf, h3.server.h3FieldSectionLimit())
 	s.Write(buf)
 	h3.qconn.sendStreamData(s)
 }
@@ -113,6 +111,11 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	for {
 		frameType, payload, ok := reader.next()
 		if !ok {
+			if reader.off != len(data) {
+				releaseRequestToPool(req)
+				h3.qconn.closeWithAppError(h3ErrFrame, "truncated request frame")
+				return
+			}
 			break
 		}
 		switch frameType {
