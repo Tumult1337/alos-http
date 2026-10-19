@@ -558,7 +558,7 @@ func (s *QUICStream) Write(data []byte) error {
 
 func (s *QUICStream) setSendBuf(data []byte) {
 	s.mu.Lock()
-	if !s.sendReset {
+	if !s.sendClosed {
 		s.sendBuf = data
 	}
 	s.sendFin = true
@@ -586,6 +586,8 @@ func (s *QUICStream) Close() {
 	s.mu.Lock()
 	s.recvClosed = true
 	s.sendClosed = true
+	s.sendBuf = nil
+	s.releaseStalledLocked(s.stalledSend)
 	if s.recvReady != nil {
 		select {
 		case s.recvReady <- struct{}{}:
