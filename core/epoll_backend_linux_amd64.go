@@ -382,30 +382,66 @@ func (s *Server) epollListenerCount() int {
 }
 
 func (s *Server) serveEpoll(addr string, tlsMode bool) error {
+	workers, err := s.prepareEpollWorkers(addr, tlsMode)
+	if err != nil {
+		if err == ErrServerShutdown {
+			return nil
+		}
+		return err
+	}
+	return <-s.startEpollWorkers(workers)
+}
+
+func (s *Server) prepareEpollWorkers(addr string, tlsMode bool) ([]*epollWorker, error) {
 	s.adoptAssignedEngines()
 	s.Router.Build()
 	s.computeFastDispatch()
-	workers := s.epollListenerCount()
+	workerCount := s.epollListenerCount()
 	minPerWorker := 0
 	if s.config.MinPrealloc > 0 {
-		minPerWorker = (s.config.MinPrealloc + workers - 1) / workers
+		minPerWorker = (s.config.MinPrealloc + workerCount - 1) / workerCount
 	}
-	go s.epollScavenger()
-	errCh := make(chan error, workers)
-	for i := 0; i < workers; i++ {
-		coreID := i % runtime.NumCPU()
-		go func() {
-			w, err := newEpollWorker(s, addr, minPerWorker)
-			if err != nil {
-				errCh <- err
-				return
+	workers := make([]*epollWorker, 0, workerCount)
+	for i := 0; i < workerCount; i++ {
+		if s.shuttingDown.Load() {
+			closeUnstartedEpollWorkers(workers)
+			return nil, ErrServerShutdown
+		}
+		worker, err := newEpollWorker(s, addr, minPerWorker)
+		if err != nil {
+			closeUnstartedEpollWorkers(workers)
+			return nil, err
+		}
+		worker.coreID = i % runtime.NumCPU()
+		worker.tlsMode = tlsMode
+		workers = append(workers, worker)
+	}
+	if s.shuttingDown.Load() {
+		closeUnstartedEpollWorkers(workers)
+		return nil, ErrServerShutdown
+	}
+	return workers, nil
+}
+
+func closeUnstartedEpollWorkers(workers []*epollWorker) {
+	for _, worker := range workers {
+		worker.server.removeShutdownWaker(worker)
+		for _, fd := range []int{worker.listenerFD, worker.epfd, worker.wakeFd} {
+			if err := unix.Close(fd); err != nil {
+				worker.server.logger().Warn("epoll startup descriptor close failed", "err", err)
 			}
-			w.coreID = coreID
-			w.tlsMode = tlsMode
-			errCh <- w.run()
-		}()
+		}
+		worker.handlers.close()
 	}
-	return <-errCh
+}
+
+func (s *Server) startEpollWorkers(workers []*epollWorker) <-chan error {
+	go s.epollScavenger()
+	errCh := make(chan error, len(workers))
+	for _, worker := range workers {
+		go func() { errCh <- worker.run() }()
+	}
+	return errCh
 }
 
 func (s *Server) epollScavenger() {
