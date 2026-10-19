@@ -893,22 +893,40 @@ func (s *Server) ListenAndServeTLS() error {
 		return err
 	}
 
-	numListeners := s.config.Listeners
-	if numListeners <= 0 {
-		numListeners = 1
-	}
-	numListeners = clampListenerCount(numListeners)
-
-	listeners, err := createListeners(s.config.Addr, numListeners)
+	epollWorkers, err := s.prepareEpollWorkers(s.config.Addr, true)
 	if err != nil {
+		if err == ErrServerShutdown {
+			return nil
+		}
 		return err
 	}
-
+	transferred := false
+	defer func() {
+		if !transferred {
+			closeUnstartedEpollWorkers(epollWorkers)
+		}
+	}()
+	if s.shuttingDown.Load() {
+		return nil
+	}
+	if err := s.startHTTPRedirect(); err != nil {
+		return err
+	}
+	s.primeTLSCertificates()
+	if ai := s.acme.Load(); ai != nil {
+		ai.Start()
+	}
+	s.ensureTLSRuntime()
+	if s.shuttingDown.Load() {
+		return nil
+	}
+	results := s.startEpollWorkers(epollWorkers)
+	transferred = true
 	protocols := "HTTP/1.1 + HTTP/2"
 	if !s.http2Enabled() {
 		protocols = "HTTP/1.1"
 	}
-	s.logger().Info("HTTPS listening", "addr", s.config.Addr, "listeners", len(listeners), "protocols", protocols)
+	s.logger().Info("HTTPS listening", "addr", s.config.Addr, "listeners", len(epollWorkers), "protocols", protocols)
 	certs := s.certStore.ListCerts()
 	for _, ci := range certs {
 		label := "self-signed"
@@ -923,20 +941,8 @@ func (s *Server) ListenAndServeTLS() error {
 	if len(certs) == 0 {
 		s.logger().Warn("no TLS certificates are loaded; HTTPS handshakes will fail until a certificate becomes available")
 	}
-	for _, ln := range listeners {
-		_ = ln.Close()
-	}
-	if err := s.startHTTPRedirect(); err != nil {
-		return err
-	}
-	s.primeTLSCertificates()
-
-	if ai := s.acme.Load(); ai != nil {
-		ai.Start()
-	}
-	s.ensureTLSRuntime()
 	s.logger().Info("epoll TLS workers active", "listeners", s.config.Listeners)
-	return s.ListenAndServeEpollTLS(s.config.Addr)
+	return <-results
 }
 
 // Capabilities reports the runtime capabilities detected at startup, such as
