@@ -142,7 +142,7 @@ func TestAltSvcH2Serializer(t *testing.T) {
 		{"handler-set", altSvcResponse(enabled, true, [2]string{"Alt-Svc", "clear"}), []string{"clear"}},
 		{"disabled", altSvcResponse(altSvcServer(t, Config{DisableAltSvc: true}), true), nil},
 	} {
-		frame := appendH2ResponseHeadersFrame(nil, 1, tc.resp, true)
+		frame := appendH2ResponseHeadersFrame(nil, 1, tc.resp, true, H2DefaultMaxFrameSize)
 		if got := hpackAltSvcValues(t, frame[9:]); strings.Join(got, "|") != strings.Join(tc.want, "|") {
 			t.Fatalf("%s: alt-svc %q, want %q", tc.name, got, tc.want)
 		}

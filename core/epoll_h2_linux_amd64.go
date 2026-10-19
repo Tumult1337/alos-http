@@ -379,7 +379,7 @@ func (c *epollConn) h2ChargeLimiter(tripped bool) bool {
 }
 
 func (c *epollConn) answerH2HeaderListTooLarge(srv *Server, streamID uint32, endStream bool) bool {
-	c.writeBuf = appendH2StatusOnlyResponse(c.writeBuf, streamID, h2StatusHeaderListTooLarge, srv.config.ServerName)
+	c.writeBuf = appendH2StatusOnlyResponse(c.writeBuf, streamID, h2StatusHeaderListTooLarge, srv.config.ServerName, int(c.h2.maxFrameSize))
 	if !endStream {
 		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrNoError)
 	}
@@ -890,7 +890,7 @@ func (c *epollConn) h2AppendWindowed(dst []byte, stream *H2Stream, streamID uint
 		if c.tls {
 			addAltSvcHeader(resp, c.worker.server)
 		}
-		dst = appendH2ResponseHeadersFrame(dst, streamID, resp, len(body) == 0)
+		dst = appendH2ResponseHeadersFrame(dst, streamID, resp, len(body) == 0, int(st.maxFrameSize))
 		stream.respHeadersSent = true
 	}
 	frameLimit := int(st.maxFrameSize)

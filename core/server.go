@@ -1535,7 +1535,7 @@ func newH2RootFastResponse(headerPayload, body []byte) *h2RootFastResponse {
 		headerPayload: headerPayload,
 		body:          body,
 	}
-	if len(body) <= int(H2DefaultMaxFrameSize) {
+	if len(headerPayload) <= H2DefaultMaxFrameSize && len(body) <= int(H2DefaultMaxFrameSize) {
 		framed := make([]byte, 0, len(fastResp.headerPayload)+len(body)+18)
 		if len(body) == 0 {
 			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 0, fastResp.headerPayload)
