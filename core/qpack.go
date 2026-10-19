@@ -15,8 +15,9 @@ const (
 )
 
 type qpackCachedSection struct {
-	regular [][2]string
-	meta    hpackRequestMeta
+	regular          [][2]string
+	meta             hpackRequestMeta
+	fieldSectionSize int
 }
 
 type qpackBlockCache struct {
@@ -47,17 +48,19 @@ func (c *qpackBlockCache) put(block []byte, headers [][2]string) {
 	}
 	cp := make([][2]string, len(headers))
 	total := len(block)
+	fieldSectionSize := len(headers) * h3FieldLineOverhead
 	for i, h := range headers {
 		n := strings.Clone(h[0])
 		v := strings.Clone(h[1])
 		cp[i] = [2]string{n, v}
 		total += len(n) + len(v)
+		fieldSectionSize += len(n) + len(v)
 	}
-	meta, err := h3ValidateRequestSection(cp)
+	meta, err := h3ValidateRequestSection(cp, h3MaxFieldSectionSize)
 	if err != nil {
 		return
 	}
-	section := &qpackCachedSection{regular: cp[h3PseudoFieldCount(&meta):], meta: meta}
+	section := &qpackCachedSection{regular: cp[h3PseudoFieldCount(&meta):], meta: meta, fieldSectionSize: fieldSectionSize}
 	c.mu.Lock()
 	if c.hasRoomLocked(total) {
 		if _, exists := c.m[string(block)]; !exists {
