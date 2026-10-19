@@ -2,8 +2,6 @@
 
 package core
 
-import ()
-
 // H3Conn represents an HTTP/3 connection layered on a QUICConn. It manages
 // the control and QPACK streams and dispatches incoming request streams to
 // the server's handlers.
@@ -41,6 +39,10 @@ func (h3 *H3Conn) start() {
 
 func (h3 *H3Conn) sendControlStream() {
 	s := h3.qconn.openLocalUniStream()
+	if s == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(s)
 	h3.controlID = s.id
 	var buf []byte
 	buf = h3AppendStreamType(buf, h3StreamControl)
@@ -62,12 +64,20 @@ func (h3 *H3Conn) sendGoAway(id uint64) {
 
 func (h3 *H3Conn) sendQPACKStreams() {
 	enc := h3.qconn.openLocalUniStream()
+	if enc == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(enc)
 	var encBuf []byte
 	encBuf = h3AppendStreamType(encBuf, h3StreamQPACKEnc)
 	enc.Write(encBuf)
 	h3.qconn.sendStreamData(enc)
 
 	dec := h3.qconn.openLocalUniStream()
+	if dec == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(dec)
 	var decBuf []byte
 	decBuf = h3AppendStreamType(decBuf, h3StreamQPACKDec)
 	dec.Write(decBuf)
