@@ -53,6 +53,10 @@ func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte) []b
 }
 
 func buildTLSAppDataRecordsParts(dst []byte, writer *TrafficAEAD, head, body []byte) []byte {
+	return buildTLSInnerRecordsParts(dst, writer, tlsRecAppData, head, body)
+}
+
+func buildTLSInnerRecordsParts(dst []byte, writer *TrafficAEAD, innerType byte, head, body []byte) []byte {
 	if writer == nil {
 		return dst
 	}
@@ -73,9 +77,18 @@ func buildTLSAppDataRecordsParts(dst []byte, writer *TrafficAEAD, head, body []b
 		head = head[n:]
 		m := copy(record[n:maxContent], body)
 		body = body[m:]
-		record[n+m] = 0x17
+		record[n+m] = innerType
 		dst = appendTLSInnerRecord(dst, writer, record[:n+m+1])
 	}
 	releasePooledBuf(&tlsScratchPool, scratch, MaxRecordSize)
+	return dst
+}
+
+func appendTLS12HandshakeRecords(dst, payload []byte) []byte {
+	for len(payload) > 0 {
+		size := min(len(payload), MaxRecordPayload)
+		dst = AppendRecord(dst, tlsRecHandshake, payload[:size])
+		payload = payload[size:]
+	}
 	return dst
 }
