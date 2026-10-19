@@ -293,7 +293,7 @@ func (c *epollConn) h2PumpFrames(dst []byte, sw *epollH2StreamWriter, backlog in
 		if end {
 			flags |= H2FlagEndStream
 		}
-		dst = appendH2Frame(dst, H2FrameHeaders, flags, sw.streamID, sw.header)
+		dst = appendH2ResponseHeaderBlock(dst, sw.streamID, flags, sw.header, int(st.maxFrameSize))
 		sw.headersOut = true
 		if end {
 			sw.finished = true
