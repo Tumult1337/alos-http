@@ -58,6 +58,52 @@ func TestBasicAuthPrecompute(t *testing.T) {
 	check("alice", "pw2", 401, false)
 }
 
+func TestBasicAuthEmptyCredentials(t *testing.T) {
+	cases := []struct {
+		name       string
+		users      map[string]string
+		user       string
+		password   string
+		wantStatus int
+	}{
+		{"empty configured username", map[string]string{"": "test-password"}, "", "test-password", 200},
+		{"empty configured password", map[string]string{"test-user": ""}, "test-user", "", 200},
+		{"both configured empty", map[string]string{"": ""}, "", "", 200},
+		{"wrong empty password", map[string]string{"test-user": "test-password"}, "test-user", "", 401},
+		{"unknown empty username", map[string]string{"test-user": "test-password"}, "", "test-password", 401},
+		{"unknown empty password", map[string]string{"test-user": ""}, "unknown", "", 401},
+		{"empty user map", nil, "", "", 401},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			called := false
+			handler := BasicAuth(BasicAuthConfig{Users: tc.users})(func(_ *Request, resp *Response) {
+				called = true
+				resp.Status(200)
+			})
+			req := newTestReq()
+			authorization := base64.StdEncoding.EncodeToString([]byte(tc.user + ":" + tc.password))
+			req.Headers = append(req.Headers, [2]string{"authorization", "Basic " + authorization})
+			resp := newTestResp()
+			handler(req, resp)
+			if resp.StatusCode != tc.wantStatus || called != (tc.wantStatus == 200) {
+				t.Fatalf("status=%d called=%v, want status=%d called=%v", resp.StatusCode, called, tc.wantStatus, tc.wantStatus == 200)
+			}
+			if tc.wantStatus == 401 {
+				challenge := ""
+				for _, header := range resp.Headers {
+					if EqualFoldASCII(header[0], "www-authenticate") {
+						challenge = header[1]
+					}
+				}
+				if challenge != `Basic realm="Restricted"` || string(resp.GetBody()) != "Unauthorized" {
+					t.Fatalf("unexpected rejection: challenge=%q body=%q", challenge, resp.GetBody())
+				}
+			}
+		})
+	}
+}
+
 func TestCORSWildcard(t *testing.T) {
 	ce := NewCORSEngine(CORSConfig{AllowOrigins: []string{"*"}})
 	snap := ce.snapshot.Load()
