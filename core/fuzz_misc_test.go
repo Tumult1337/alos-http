@@ -31,6 +31,7 @@ func FuzzParseQueryString(f *testing.F) {
 }
 
 func FuzzParseMultipart(f *testing.F) {
+	f.Add([]byte("--B--x\r\n--B\r\nContent-Disposition: form-data; name=\"0\"\r\n\r\n\r\n--B--\r\n"), "B")
 	f.Add([]byte("--B\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--B\r\nContent-Disposition: form-data; name=\"f\"; filename=\"x.txt\"\r\nContent-Type: text/plain\r\n\r\nfile\r\n--B--\r\n"), "B")
 	f.Add([]byte("--B\r\nContent-Disposition: form-data; filename=\"../../x\"; name=\"f\"\r\n\r\n--B--"), "B")
 	f.Fuzz(func(t *testing.T, body []byte, boundary string) {
