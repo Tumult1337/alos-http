@@ -98,8 +98,15 @@ func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
 		maxRecv:     quicStreamRecvCap(conn, window),
 		recvWindow:  window,
 		recvGranted: window,
-		maxSend:     1 << 20,
+		maxSend:     quicInitialStreamSendLimit(id, conn, 1<<20),
 	}
+}
+
+func quicInitialStreamSendLimit(id uint64, conn *QUICConn, fallback uint64) uint64 {
+	if conn != nil && id&3 == 3 {
+		return conn.peerUniStreamWindow
+	}
+	return fallback
 }
 
 func quicStreamRecvLimit(conn *QUICConn) uint64 {
@@ -175,6 +182,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	if conn.peerStreamWindow > 0 {
 		s.maxSend = conn.peerStreamWindow
 	}
+	s.maxSend = quicInitialStreamSendLimit(id, conn, s.maxSend)
 	s.blockedSent = 0
 	s.stalledSend = 0
 	s.stallSince = 0
