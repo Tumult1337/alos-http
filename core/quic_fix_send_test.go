@@ -46,6 +46,7 @@ func newQUICTestPeerFor(t *testing.T, srv *Server) *quicTestPeer {
 	qc.sendKeys[quicSpaceAppData] = keys
 	qc.addressValidated.Store(true)
 	qc.peerStreamWindow = 1 << 20
+	qc.peerUniStreamWindow = 1 << 20
 	qc.handshakeDone.Store(true)
 	newH3Conn(qc)
 	t.Cleanup(qc.close)
