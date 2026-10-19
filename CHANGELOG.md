@@ -110,6 +110,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- The cached HTTP/1 `GET /` fast path now enforces the configured header byte and field-count limits, including for pipelined requests.
+- Dispatched proxy responses use transfer encoding when deciding whether to stream and enforce the upstream response-body limit when buffering. Declined-upgrade responses also enforce the buffered-body limit; oversized responses are rejected before their contents are exposed.
 - HTTP/1 methods are matched exactly. Previously any 4-byte method starting with `H` was treated as `HEAD`, any 6-byte method starting with `D` as `DELETE`, any 5-byte method starting with `PA` as `PATCH`, and any 7-byte method starting with `O` as `OPTIONS`.
 - An HTTP/1 request line without spaces is rejected with 400 instead of leaving the connection waiting for more input.
 - Empty lines (CRLF) sent before an HTTP/1 request line are ignored (RFC 9112 §2.2).
