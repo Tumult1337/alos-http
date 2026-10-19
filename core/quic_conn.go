@@ -303,6 +303,7 @@ type QUICConn struct {
 	handshakeDeadline int64
 
 	peerAckDelayExponent uint64
+	peerUniStreamWindow  uint64
 
 	server     *Server
 	remoteAddr net.Addr
@@ -1496,6 +1497,7 @@ func (qc *QUICConn) applyPeerTransportParams(ch *ParsedClientHello) {
 	if ch.InitialMaxStreamDataBidiLocal > 0 {
 		qc.peerStreamWindow = ch.InitialMaxStreamDataBidiLocal
 	}
+	qc.peerUniStreamWindow = ch.InitialMaxStreamDataUni
 	qc.cidMu.Lock()
 	qc.peerCIDLimit = ch.ActiveConnIDLimit
 	qc.cidMu.Unlock()

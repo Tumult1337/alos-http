@@ -101,6 +101,10 @@ func newQUICTestPeer(t *testing.T, routes func(*Router)) *quicTestPeer {
 	qc.keys[quicSpaceAppData] = serverKeys
 	qc.sendKeys[quicSpaceAppData] = serverKeys
 	qc.addressValidated.Store(true)
+	qc.peerUniStreamWindow = 16 << 20
+	if qc.maxDataRemote >= qc.peerUniStreamWindow {
+		t.Fatalf("fixture uni credit %d must exceed connection credit %d", qc.peerUniStreamWindow, qc.maxDataRemote)
+	}
 	qc.handshakeDone.Store(true)
 	newH3Conn(qc)
 	t.Cleanup(qc.close)
