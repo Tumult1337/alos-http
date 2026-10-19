@@ -4,6 +4,7 @@ package core
 
 import (
 	"regexp"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -78,11 +79,55 @@ type compiledRule struct {
 	keyBase string
 }
 
-type rlEntry struct {
+type rateLimitTransitionHooks struct {
+	afterBlockedRead func()
+	afterUnblock     func()
+}
+
+type rateLimitCounter struct {
+	mu      sync.Mutex
 	state   atomic.Uint64
 	reset   atomic.Int64
 	blocked atomic.Int64
-	_       [CacheLineSize - 24]byte
+	retired bool
+}
+
+func (c *rateLimitCounter) admit(nowFn func() int64, windowNanos, maxReqs, blockNanos int64, hooks *rateLimitTransitionHooks) (allowed bool, retryAfter time.Duration, live bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.retired {
+		return false, 0, false
+	}
+	blockedUntil := c.blocked.Load()
+	now := nowFn()
+	if blockedUntil > 0 {
+		if hooks != nil && hooks.afterBlockedRead != nil {
+			hooks.afterBlockedRead()
+		}
+		if now < blockedUntil {
+			return false, time.Duration(blockedUntil - now), true
+		}
+		c.blocked.Store(0)
+		if hooks != nil && hooks.afterUnblock != nil {
+			hooks.afterUnblock()
+		}
+		c.state.Store(rlEpochOf(now, windowNanos))
+		c.reset.Store(now + windowNanos)
+	}
+	count := rlBumpCount(&c.state, now, windowNanos)
+	if count == 1 {
+		c.reset.Store(now + windowNanos)
+	}
+	if count > maxReqs {
+		c.blocked.Store(now + blockNanos)
+		return false, time.Duration(blockNanos), true
+	}
+	return true, 0, true
+}
+
+type rlEntry struct {
+	rateLimitCounter
+	_ [CacheLineSize - 40]byte
 }
 
 const rlEpochShift = 40
@@ -117,14 +162,16 @@ func rlBumpCount(state *atomic.Uint64, now, windowNanos int64) int64 {
 }
 
 // RateLimitEngine tracks per-client request counts against configured rules.
-// It uses lock-free atomics for counters and a sharded map for client state.
+// It uses a lock per client entry for counters and a sharded map for client state.
 // The engine runs a background goroutine that cleans up stale entries every
 // 30 seconds.
 type RateLimitEngine struct {
-	rules   atomic.Pointer[[]compiledRule]
-	clients *alosmap.TypedMap[string, *rlEntry]
-	stopCh  chan struct{}
-	OnLimit RateLimitFunc
+	rules    atomic.Pointer[[]compiledRule]
+	clients  *alosmap.TypedMap[string, *rlEntry]
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	now      func() int64
+	OnLimit  RateLimitFunc
 
 	liveOnLimit atomic.Pointer[RateLimitFunc]
 }
@@ -149,10 +196,13 @@ func (r rateLimitRefusal) runsHook(rle *RateLimitEngine) bool {
 
 // NewRateLimitEngine creates a new rate limiter with an empty rule set and starts
 // the background cleanup goroutine. Call Stop when the engine is no longer needed.
-func NewRateLimitEngine() *RateLimitEngine {
+func NewRateLimitEngine() *RateLimitEngine { return newRateLimitEngineWithClock(CoarseNanotime) }
+
+func newRateLimitEngineWithClock(now func() int64) *RateLimitEngine {
 	rle := &RateLimitEngine{
 		clients: alosmap.NewTypedSized[string, *rlEntry](10000, 0).Prealloc(256),
 		stopCh:  make(chan struct{}),
+		now:     now,
 	}
 	empty := make([]compiledRule, 0)
 	rle.rules.Store(&empty)
@@ -296,51 +346,37 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 	} else {
 		key = ip + "|" + cr.keyBase
 	}
-	now := CoarseNanotime()
+	entry := rle.entryFor(key)
+	allowed, retryAfter := rle.admitEntry(key, entry, cr)
+	return allowed, cr, retryAfter
+}
 
+func (rle *RateLimitEngine) entryFor(key string) *rlEntry {
 	entry, ok := rle.clients.Load(key)
 	if !ok {
-		newEntry := &rlEntry{}
-		newEntry.reset.Store(now + cr.rule.Window.Nanoseconds())
-		entry, _ = rle.clients.LoadOrStore(key, newEntry)
+		entry, _ = rle.clients.LoadOrStore(key, &rlEntry{})
 	}
+	return entry
+}
 
-	blockedUntil := entry.blocked.Load()
-	if blockedUntil > 0 && now < blockedUntil {
-		remaining := time.Duration(blockedUntil - now)
-		return false, cr, remaining
+func (rle *RateLimitEngine) admitEntry(key string, entry *rlEntry, cr *compiledRule) (bool, time.Duration) {
+	blockFor := cr.rule.BlockFor
+	if blockFor <= 0 {
+		blockFor = cr.rule.Window
 	}
-	windowNanos := cr.rule.Window.Nanoseconds()
-	if blockedUntil > 0 && now >= blockedUntil {
-		entry.blocked.Store(0)
-		entry.state.Store(rlEpochOf(now, windowNanos))
-		entry.reset.Store(now + windowNanos)
-	}
-
-	count := rlBumpCount(&entry.state, now, windowNanos)
-	if count == 1 {
-		entry.reset.Store(now + windowNanos)
-	}
-	if count > cr.rule.MaxReqs {
-		blockDur := cr.rule.BlockFor
-		if blockDur <= 0 {
-			blockDur = cr.rule.Window
+	for {
+		allowed, retryAfter, live := entry.admit(rle.now, cr.rule.Window.Nanoseconds(), cr.rule.MaxReqs, blockFor.Nanoseconds(), nil)
+		if live {
+			return allowed, retryAfter
 		}
-		entry.blocked.Store(now + blockDur.Nanoseconds())
-		return false, cr, blockDur
+		entry = rle.entryFor(key)
 	}
-
-	return true, cr, 0
 }
 
 // Stop halts the engine's background cleanup goroutine. It is safe to call
 // multiple times.
 func (rle *RateLimitEngine) Stop() {
-	select {
-	case <-rle.stopCh:
-	default:
-		close(rle.stopCh)
-	}
+	rle.stopOnce.Do(func() { close(rle.stopCh) })
 }
 
 func (rle *RateLimitEngine) cleanupLoop() {
@@ -357,20 +393,36 @@ func (rle *RateLimitEngine) cleanupLoop() {
 						Dbg("[ratelimit cleanup] recovered panic: %v", r)
 					}
 				}()
-				now := CoarseNanotime()
-				var stale []string
-				rle.clients.Range(func(key string, entry *rlEntry) bool {
-					resetAt := entry.reset.Load()
-					blockedUntil := entry.blocked.Load()
-					if now > resetAt+int64(60*time.Second) && (blockedUntil == 0 || now > blockedUntil) {
-						stale = append(stale, key)
-					}
-					return true
-				})
-				for _, key := range stale {
-					rle.clients.Delete(key)
-				}
+				rle.cleanupStale(rle.now())
 			}()
 		}
 	}
+}
+
+func (rle *RateLimitEngine) cleanupStale(now int64) {
+	rle.clients.Range(func(key string, entry *rlEntry) bool {
+		resetAt, blockedUntil := entry.reset.Load(), entry.blocked.Load()
+		if now > resetAt+int64(60*time.Second) && (blockedUntil == 0 || now > blockedUntil) {
+			rle.retireEntry(key, entry, now)
+		}
+		return true
+	})
+}
+
+func (rle *RateLimitEngine) retireEntry(key string, entry *rlEntry, now int64) bool {
+	entry.mu.Lock()
+	defer entry.mu.Unlock()
+	if entry.retired {
+		return false
+	}
+	now = min(now, rle.now())
+	resetAt, blockedUntil := entry.reset.Load(), entry.blocked.Load()
+	if now <= resetAt+int64(60*time.Second) || blockedUntil != 0 && now <= blockedUntil {
+		return false
+	}
+	if !rle.clients.CompareAndDelete(key, entry) {
+		return false
+	}
+	entry.retired = true
+	return true
 }
