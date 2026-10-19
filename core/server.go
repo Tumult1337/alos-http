@@ -1,13 +1,17 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"io"
-	"log"
+	"log/slog"
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -156,11 +160,11 @@ var timeNow = time.Now
 //
 // ConnBandwidth rate-limits each connection.
 //
-//	Example: ConnBandwidth: BandwidthConfig{MaxUploadRate: 1 << 20, MaxDownloadRate: 1 << 20}.
+//	Example: ConnBandwidth: BandwidthConfig{MaxUploadRate: 100, MaxDownloadRate: 200} (Mbps).
 //
 // GlobalBandwidth rate-limits all connections in aggregate.
 //
-//	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 100 << 20}.
+//	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 1000} (Mbps).
 //
 // Listeners is the number of SO_REUSEPORT epoll listeners. On the epoll
 // backend each listener runs its own event-loop worker goroutine (not pinned
@@ -197,7 +201,7 @@ var timeNow = time.Now
 //
 //	Example: TrustedProxies: []string{"10.0.0.0/8", "192.168.1.1"}.
 //
-// EnableCompress turns on automatic gzip/deflate response compression.
+// EnableCompress turns on automatic brotli/gzip/deflate response compression.
 //
 //	Example: EnableCompress: true.
 //
@@ -263,6 +267,7 @@ type Config struct {
 	HandshakeTimeout  time.Duration
 
 	MaxBodySize          int64
+	StreamBodyAbove      int64
 	MaxReadSize          int64
 	MaxWriteSize         int64
 	MaxInFlightBodyBytes int64
@@ -279,16 +284,26 @@ type Config struct {
 	H2MaxFrameSize         uint32
 	H2HeaderTableSize      uint32
 
-	QUICMaxData       int64
-	QUICMaxStreamData int64
-	QUICMaxUDPPayload int
+	QUICMaxData           int64
+	QUICMaxStreamData     int64
+	QUICMaxUDPPayload     int
+	QUICStatelessResetKey []byte
+	DisableAltSvc         bool
 
-	TLSCertFile   string
-	TLSKeyFile    string
-	Certs         []CertConfig
-	DefaultDomain string
-	ACME          *ACMEConfig
-	WorkerCount   int
+	TLSCertFile            string
+	TLSKeyFile             string
+	Certs                  []CertConfig
+	DefaultDomain          string
+	TLSPreferPostQuantum   bool
+	SessionTicketsDisabled bool
+	TLSClientAuth          ClientAuthType
+	TLSClientCAs           *x509.CertPool
+	DisableOCSPStapling    bool
+	Logger                 *slog.Logger
+	OnPanic                func(req *Request, recovered any, stack []byte)
+	SessionTicketLifetime  time.Duration
+	ACME                   *ACMEConfig
+	WorkerCount            int
 
 	ConnBandwidth   BandwidthConfig
 	GlobalBandwidth BandwidthConfig
@@ -296,11 +311,12 @@ type Config struct {
 	MinPrealloc     int
 	PreallocBatch   int
 
-	ServerName      string
-	TrustedProxies  []string
-	EnableCompress  bool
-	CompressLevel   int
-	CompressMinSize int
+	ServerName          string
+	TrustedProxies      []string
+	EnableCompress      bool
+	CompressLevel       int
+	CompressMinSize     int
+	CompressBrotliLevel int
 
 	Debug           bool
 	LogRequests     bool
@@ -337,6 +353,7 @@ func DefaultConfig() Config {
 		ServerName:           "ALOS",
 		CompressLevel:        6,
 		CompressMinSize:      256,
+		CompressBrotliLevel:  defaultBrotliLevel,
 		WorkerCount:          0,
 		Listeners:            0,
 		Debug:                false,
@@ -380,7 +397,7 @@ func (s *Server) requestBodyTooLarge(n int) bool {
 	if n < 0 {
 		return true
 	}
-	if s.config.MaxBodySize > 0 && int64(n) > s.config.MaxBodySize {
+	if s.limits.Load().bodyTooLarge(int64(n)) {
 		return true
 	}
 	readCap := s.effectiveReadCap()
@@ -422,7 +439,7 @@ func optionalDuration(value, fallback time.Duration) time.Duration {
 }
 
 func (s *Server) readHeaderTimeout() time.Duration {
-	return optionalDuration(s.config.ReadHeaderTimeout, optionalDuration(s.config.ReadTimeout, 30*time.Second))
+	return s.limits.Load().headerTimeout()
 }
 
 func respServerName(resp *Response) string {
@@ -508,13 +525,18 @@ func (l *perIPLimiter) Stop() {
 }
 
 func (l *perIPLimiter) acquire(ip string, limit int64) bool {
+	_, ok := l.hold(ip, limit)
+	return ok
+}
+
+func (l *perIPLimiter) hold(ip string, limit int64) (*ipReqCounter, bool) {
 	if l == nil || ip == "" || limit <= 0 {
-		return true
+		return nil, true
 	}
 	for {
 		c, ok := l.m.Load(ip)
 		if !ok {
-			c, _ = l.m.LoadOrStore(ip, &ipReqCounter{})
+			c, _ = l.m.LoadOrStore(strings.Clone(ip), &ipReqCounter{})
 		}
 		for {
 			cur := c.n.Load()
@@ -523,12 +545,18 @@ func (l *perIPLimiter) acquire(ip string, limit int64) bool {
 				break
 			}
 			if cur >= limit {
-				return false
+				return nil, false
 			}
 			if c.n.CompareAndSwap(cur, cur+1) {
-				return true
+				return c, true
 			}
 		}
+	}
+}
+
+func (c *ipReqCounter) release() {
+	if c.n.Add(-1) < 0 {
+		c.n.Add(1)
 	}
 }
 
@@ -537,9 +565,7 @@ func (l *perIPLimiter) release(ip string) {
 		return
 	}
 	if c, ok := l.m.Load(ip); ok {
-		if c.n.Add(-1) < 0 {
-			c.n.Add(1)
-		}
+		c.release()
 	}
 }
 
@@ -565,9 +591,16 @@ type Server struct {
 	fallbackTLS       atomic.Pointer[tls.Config]
 	proxy             atomic.Pointer[ProxyEngine]
 	proxyDomains      []DomainConfig
-	httpRouter        *HTTPRouter
+	httpRouter        atomic.Pointer[HTTPRouter]
+	corsEngine        atomic.Pointer[CORSEngine]
+	rateLimitEngine   atomic.Pointer[RateLimitEngine]
+	runtimeSetupMu    sync.Mutex
 	acme              atomic.Pointer[acmeIntegration]
 	quicTimers        quicTimerHub
+	quicResets        *quicStatelessResetter
+	quicTokens        *quicTokenCodec
+	tickets           *ticketCodec
+	clientAuthByHost  map[string]clientAuthOverride
 	listeners         []net.Listener
 	done              chan struct{}
 	tlsRuntimeOnce    sync.Once
@@ -582,18 +615,20 @@ type Server struct {
 	shutdownOnce      sync.Once
 	wakersMu          sync.Mutex
 	wakers            map[shutdownWaker]struct{}
-	connLimiter       *ConnectionLimiter
+	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
 	fastDispatch      atomic.Bool
 	plainRootFast     atomic.Pointer[plainRootFastResponse]
 	h2RootFast        atomic.Pointer[h2RootFastResponse]
+	rootFastMu        sync.Mutex
+	altSvc            atomic.Pointer[altSvcHeader]
 	trustedProxies    trustedProxyMatcher
 	perIPLimiter      *perIPRequestLimiter
-	perIPConnLimiter  *perIPConnLimiter
-	maxConnsPerIP     int64
-	perIPInFlight     int64
+	perIPConnLimiter  atomic.Pointer[perIPConnLimiter]
+	limits            atomic.Pointer[Limits]
+	limitsGen         atomic.Uint64
 	trackedConnMu     sync.Mutex
 	trackedConns      map[*trackedHandoffConn]struct{}
 	hookMu            sync.Mutex
@@ -609,6 +644,7 @@ type trackedHandoffConn struct {
 	ipKey        string
 	ipFromInFlig bool
 	closeOnce    sync.Once
+	onClose      func()
 }
 
 type ipReqCounter struct {
@@ -620,6 +656,9 @@ type plainRootFastResponse struct {
 	getClose        []byte
 	getKeepAliveTLS []byte
 	getCloseTLS     []byte
+	handlerAltSvc   bool
+	tlsKeepAlive    []byte
+	tlsClose        []byte
 }
 
 type h2RootFastResponse struct {
@@ -630,6 +669,8 @@ type h2RootFastResponse struct {
 	tlsInner      []byte
 	headerIDOff   int
 	dataIDOff     int
+	handlerAltSvc bool
+	withAltSvc    *h2RootFastResponse
 }
 
 // New creates a Server from the given Config, applying defaults to zero-valued fields; called with no arguments it uses DefaultConfig. The returned server is ready for route registration.
@@ -647,32 +688,16 @@ func New(configs ...Config) *Server {
 	if cfg.Addr == "" {
 		cfg.Addr = ":8443"
 	}
-	if cfg.ReadTimeout == 0 {
-		cfg.ReadTimeout = 30 * time.Second
-	}
-	if cfg.WriteTimeout == 0 {
-		cfg.WriteTimeout = 30 * time.Second
-	}
-	if cfg.IdleTimeout == 0 {
-		cfg.IdleTimeout = 120 * time.Second
-	}
-	if cfg.HandshakeTimeout == 0 {
-		cfg.HandshakeTimeout = 30 * time.Second
-	}
+	limits := limitsFromConfig(&cfg).withDefaults()
+	limits.writeTo(&cfg)
 	if cfg.ShutdownTimeout == 0 {
 		cfg.ShutdownTimeout = 30 * time.Second
-	}
-	if cfg.MaxHeaderSize == 0 {
-		cfg.MaxHeaderSize = 8192
-	}
-	if cfg.MaxBodySize == 0 {
-		cfg.MaxBodySize = 4 << 20
 	}
 	if cfg.MaxInFlightBodyBytes == 0 {
 		cfg.MaxInFlightBodyBytes = 64 << 20
 	}
-	if cfg.MaxConns == 0 {
-		cfg.MaxConns = 8192
+	if cfg.SessionTicketLifetime <= 0 {
+		cfg.SessionTicketLifetime = defaultTicketLifetime
 	}
 	cfg.ServerName = sanitizeHeaderValue(cfg.ServerName)
 	if cfg.ServerName == "" {
@@ -684,6 +709,7 @@ func New(configs ...Config) *Server {
 	if cfg.CompressMinSize == 0 {
 		cfg.CompressMinSize = 256
 	}
+	cfg.CompressBrotliLevel = normalizeBrotliLevel(cfg.CompressBrotliLevel)
 	if cfg.WorkerCount <= 0 {
 		cfg.WorkerCount = autoWorkerCount()
 	}
@@ -697,13 +723,23 @@ func New(configs ...Config) *Server {
 		cfg.MinPrealloc = int(cfg.MaxConns)
 	}
 
+	useLogger(cfg.Logger)
 	s := &Server{
-		config:    cfg,
-		caps:      DetectCapabilities(),
-		Router:    NewRouter(),
-		certStore: NewCertStore(),
-		done:      make(chan struct{}),
-		drainDone: make(chan struct{}),
+		config:     cfg,
+		caps:       DetectCapabilities(),
+		Router:     NewRouter(),
+		certStore:  NewCertStore(),
+		done:       make(chan struct{}),
+		drainDone:  make(chan struct{}),
+		quicResets: newQUICStatelessResetter(cfg.QUICStatelessResetKey),
+		quicTokens: newQUICTokenCodec(nil),
+	}
+	if !cfg.SessionTicketsDisabled {
+		s.tickets = newTicketCodec(cfg.SessionTicketLifetime, nil)
+	}
+	s.clientAuthByHost = clientAuthOverrides(cfg.Certs)
+	if !cfg.DisableOCSPStapling {
+		s.certStore.onAdd = newOCSPStapler(s.certStore, s.done).track
 	}
 	s.Router.server = s
 	if cfg.ServerName == "ALOS" {
@@ -721,19 +757,14 @@ func New(configs ...Config) *Server {
 	if cfg.MaxRequestsPerIP > 0 {
 		s.perIPLimiter = newPerIPRequestLimiter()
 	}
-	maxConnsPerIP := cfg.MaxConnsPerIP
-	if maxConnsPerIP == 0 {
-		maxConnsPerIP = 20
-	}
-	if maxConnsPerIP > 0 {
-		s.maxConnsPerIP = maxConnsPerIP
+	s.limits.Store(&limits)
+	if limits.MaxConnsPerIP > 0 {
 		if s.trustedProxies.active {
-			s.perIPInFlight = maxConnsPerIP
 			if s.perIPLimiter == nil {
 				s.perIPLimiter = newPerIPRequestLimiter()
 			}
 		} else {
-			s.perIPConnLimiter = newPerIPConnLimiter()
+			s.perIPConnLimiter.Store(newPerIPConnLimiter())
 		}
 	}
 
@@ -741,9 +772,7 @@ func New(configs ...Config) *Server {
 	s.logRequests.Store(cfg.LogRequests)
 	SetDebugFlag(cfg.Debug)
 
-	if cfg.ConnBandwidth.MaxUploadRate > 0 || cfg.ConnBandwidth.MaxDownloadRate > 0 {
-		s.connLimiter = NewConnectionLimiter(cfg.ConnBandwidth)
-	}
+	s.connBandwidthOn = cfg.ConnBandwidth.MaxUploadRate > 0 || cfg.ConnBandwidth.MaxDownloadRate > 0
 	if cfg.GlobalBandwidth.MaxUploadRate > 0 || cfg.GlobalBandwidth.MaxDownloadRate > 0 {
 		s.globalLimiter = NewGlobalLimiter(cfg.GlobalBandwidth)
 	}
@@ -765,9 +794,6 @@ func autoWorkerCount() int {
 }
 
 func autoListenerCount() int {
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return 1
-	}
 	return autoWorkerCount()
 }
 
@@ -824,6 +850,7 @@ func (s *Server) IsDebug() bool {
 
 func (s *Server) ensureRouterInit() {
 	s.routerInitOnce.Do(func() {
+		s.adoptAssignedEngines()
 		s.Router.Build()
 		s.computeFastDispatch()
 	})
@@ -873,19 +900,12 @@ func (s *Server) ListenAndServeTLS() error {
 	if err != nil {
 		return err
 	}
-	s.listeners = listeners
-	defer func() {
-		for _, ln := range s.listeners {
-			ln.Close()
-		}
-	}()
 
 	protocols := "HTTP/1.1 + HTTP/2"
 	if !s.http2Enabled() {
 		protocols = "HTTP/1.1"
 	}
-	log.Printf("=== ALOS TLS Server (TLS 1.3 + 1.2 | %s) ===", protocols)
-	log.Printf("Listening on https://%s (%d listener(s))", s.config.Addr, len(listeners))
+	s.logger().Info("HTTPS listening", "addr", s.config.Addr, "listeners", len(listeners), "protocols", protocols)
 	certs := s.certStore.ListCerts()
 	for _, ci := range certs {
 		label := "self-signed"
@@ -895,15 +915,14 @@ func (s *Server) ListenAndServeTLS() error {
 		case CertACME:
 			label = "acme"
 		}
-		log.Printf("  cert: %s (%s)", ci.Domain, label)
+		s.logger().Info("certificate loaded", "domain", ci.Domain, "source", label)
 	}
 	if len(certs) == 0 {
-		log.Printf("[WARN] no TLS certificates are loaded; incoming HTTPS handshakes will fail until a certificate becomes available")
+		s.logger().Warn("no TLS certificates are loaded; HTTPS handshakes will fail until a certificate becomes available")
 	}
 	for _, ln := range listeners {
 		_ = ln.Close()
 	}
-	s.listeners = nil
 	if err := s.startHTTPRedirect(); err != nil {
 		return err
 	}
@@ -913,7 +932,7 @@ func (s *Server) ListenAndServeTLS() error {
 		ai.Start()
 	}
 	s.ensureTLSRuntime()
-	log.Printf("[INFO] epoll TLS worker mode active on Linux amd64: listeners=%d", s.config.Listeners)
+	s.logger().Info("epoll TLS workers active", "listeners", s.config.Listeners)
 	return s.ListenAndServeEpollTLS(s.config.Addr)
 }
 
@@ -924,8 +943,8 @@ func (s *Server) Capabilities() Capabilities { return s.caps }
 func (s *Server) logCapabilities() {
 	s.capsLogOnce.Do(func() {
 		c := s.caps
-		log.Printf("[INFO] capabilities: %s/%s cpu=%d gomaxprocs=%d workers=%d aes-ni=%t ktls-ulp=%t nic=%s ktls-hw-offload=%t => use-ktls=%t",
-			c.OS, c.Arch, c.NumCPU, c.GOMAXPROCS, s.config.WorkerCount, c.CPUHasAES, c.KTLSAvailable, c.NICIface, c.NICOffloadTX, c.UseKTLS())
+		s.logger().Info("capabilities", "os", c.OS, "arch", c.Arch, "cpu", c.NumCPU, "gomaxprocs", c.GOMAXPROCS, "workers", s.config.WorkerCount,
+			"aes_ni", c.CPUHasAES, "ktls_ulp", c.KTLSAvailable, "nic", c.NICIface, "ktls_hw_offload", c.NICOffloadTX, "use_ktls", c.UseKTLS())
 	})
 }
 
@@ -955,8 +974,7 @@ func (s *Server) ListenAndServe() error {
 	if !s.http2Enabled() {
 		protocols = "HTTP/1.1"
 	}
-	log.Printf("=== ALOS HTTP Server (Plain %s | epoll) ===", protocols)
-	log.Printf("Listening on http://%s (epoll listeners=%d)", addr, s.config.Listeners)
+	s.logger().Info("HTTP listening", "addr", addr, "listeners", s.config.Listeners, "protocols", protocols)
 	return s.ListenAndServeEpollH2(addr)
 }
 
@@ -969,7 +987,7 @@ func (s *Server) tryTrackConn() bool {
 		s.releaseTrackedConn()
 		return false
 	}
-	if limit := s.config.MaxConns; limit > 0 && n > limit {
+	if limit := s.limits.Load().MaxConns; limit > 0 && n > limit {
 		s.releaseTrackedConn()
 		return false
 	}
@@ -982,7 +1000,7 @@ func (s *Server) releaseTrackedConn() {
 	}
 }
 
-func (s *Server) trackHandoffConn(conn net.Conn, ipKey string, fromInFlight bool) net.Conn {
+func (s *Server) trackHandoffConn(conn net.Conn, ipKey string, fromInFlight bool, onClose func()) *trackedHandoffConn {
 	if conn == nil {
 		return nil
 	}
@@ -990,7 +1008,7 @@ func (s *Server) trackHandoffConn(conn net.Conn, ipKey string, fromInFlight bool
 		_ = conn.Close()
 		return nil
 	}
-	tc := &trackedHandoffConn{Conn: conn, server: s, ipKey: ipKey, ipFromInFlig: fromInFlight}
+	tc := &trackedHandoffConn{Conn: conn, server: s, ipKey: ipKey, ipFromInFlig: fromInFlight, onClose: onClose}
 	s.trackedConnMu.Lock()
 	if s.trackedConns == nil {
 		s.trackedConns = make(map[*trackedHandoffConn]struct{})
@@ -1012,8 +1030,8 @@ func (s *Server) untrackHandoffConn(conn *trackedHandoffConn) {
 	if conn.ipKey != "" {
 		if conn.ipFromInFlig {
 			s.perIPLimiter.release(conn.ipKey)
-		} else if s.perIPConnLimiter != nil {
-			s.perIPConnLimiter.release(conn.ipKey)
+		} else {
+			s.perIPConnLimiter.Load().release(conn.ipKey)
 		}
 	}
 	s.releaseTrackedConn()
@@ -1040,6 +1058,9 @@ func (c *trackedHandoffConn) Close() error {
 		err = c.Conn.Close()
 		if c.server != nil {
 			c.server.untrackHandoffConn(c)
+		}
+		if c.onClose != nil {
+			c.onClose()
 		}
 	})
 	return err
@@ -1070,6 +1091,9 @@ func (s *Server) loadCerts() error {
 				if err != nil {
 					return err
 				}
+				if err := entry.loadOCSPStapleFile(cc.OCSPStapleFile); err != nil {
+					return err
+				}
 				s.certStore.AddCert(entry)
 			case CertACME:
 				acmeDomains = append(acmeDomains, cc.Domain)
@@ -1091,13 +1115,13 @@ func (s *Server) loadCerts() error {
 		}
 		if ai := newACMEIntegration(cfg, s); ai != nil {
 			s.replaceACME(ai)
-			log.Printf("[ACME] enabled for domains: %v", cfg.Domains)
+			s.logger().Info("ACME enabled", "domains", cfg.Domains)
 		}
 	} else if len(acmeDomains) > 0 {
 		cfg := ACMEConfig{Domains: acmeDomains}
 		if ai := newACMEIntegration(cfg, s); ai != nil {
 			s.replaceACME(ai)
-			log.Printf("[ACME] enabled for domains: %v", acmeDomains)
+			s.logger().Info("ACME enabled", "domains", acmeDomains)
 		}
 	}
 
@@ -1123,21 +1147,21 @@ func (s *Server) primeTLSCertificates() {
 	}
 	before := len(s.certStore.ListCerts())
 	if before == 0 {
-		log.Printf("[ACME] priming initial TLS certificates before opening HTTPS listeners")
+		s.logger().Info("ACME obtaining initial certificates before opening HTTPS listeners")
 	}
 	ai.primeInitial()
 	after := len(s.certStore.ListCerts())
 	if after == 0 {
 		domains := ai.domainsSnapshot()
 		if len(domains) == 0 {
-			log.Printf("[WARN] ACME is enabled but no TLS certificates are loaded yet")
+			s.logger().Warn("ACME is enabled but no TLS certificates are loaded yet")
 			return
 		}
-		log.Printf("[WARN] ACME has no usable certificate yet for %v; HTTPS handshakes will fail until one is obtained", domains)
+		s.logger().Warn("ACME has no usable certificate yet; HTTPS handshakes will fail until one is obtained", "domains", domains)
 		return
 	}
 	if before == 0 {
-		log.Printf("[ACME] %d certificate(s) ready for HTTPS startup", after)
+		s.logger().Info("ACME certificates ready", "count", after)
 	}
 }
 
@@ -1168,24 +1192,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		defer cancel()
 	}
 	s.shutdownOnce.Do(func() {
+		s.tlsRuntimeOnce.Do(func() {})
 		s.shuttingDown.Store(true)
 		close(s.done)
 		s.wakeAllForShutdown()
+		s.quicTimers.goAwayAll()
 		if ai := s.acme.Load(); ai != nil {
 			ai.Stop()
 		}
 		if pe := s.proxy.Load(); pe != nil {
 			pe.Stop()
 		}
-		if s.RateLimit != nil {
-			s.RateLimit.Stop()
+		if rl := s.rateLimitEngine.Load(); rl != nil {
+			rl.Stop()
 		}
 		if s.perIPLimiter != nil {
 			s.perIPLimiter.Stop()
 		}
-		if s.perIPConnLimiter != nil {
-			s.perIPConnLimiter.Stop()
-		}
+		s.perIPConnLimiter.Load().Stop()
 		for _, ln := range s.listeners {
 			ln.Close()
 		}
@@ -1196,12 +1220,13 @@ func (s *Server) Shutdown(ctx context.Context) error {
 
 	select {
 	case <-s.drainDone:
-		if s.x25519Pool != nil {
-			s.x25519Pool.Close()
-		}
+		s.x25519Pool.Close()
 		return nil
 	case <-ctx.Done():
+		s.cancelInFlightForShutdown()
+		s.quicTimers.closeAll(ErrServerShutdown)
 		s.closeTrackedHandoffConns()
+		s.x25519Pool.Close()
 		return ctx.Err()
 	}
 }
@@ -1225,6 +1250,20 @@ func (s *Server) removeShutdownWaker(w shutdownWaker) {
 	s.wakersMu.Unlock()
 }
 
+type inFlightCanceller interface {
+	cancelInFlight(cause error)
+}
+
+func (s *Server) cancelInFlightForShutdown() {
+	s.wakersMu.Lock()
+	defer s.wakersMu.Unlock()
+	for w := range s.wakers {
+		if c, ok := w.(inFlightCanceller); ok {
+			c.cancelInFlight(ErrServerShutdown)
+		}
+	}
+}
+
 func (s *Server) wakeAllForShutdown() {
 	s.wakersMu.Lock()
 	defer s.wakersMu.Unlock()
@@ -1242,32 +1281,6 @@ func (c *prefixConn) Read(b []byte) (int, error) {
 	return c.reader.Read(b)
 }
 
-// NewH2StreamWriter returns a pooled H2StreamWriter initialized for the given
-// HTTP/2 stream: it wires up the stream ID, the connection's write channel
-// and flow-control windows, and the server's configured bandwidth limiter
-// and Server header.
-//
-// Example: w := s.NewH2StreamWriter(streamID, hc, &streamWindow)
-func (s *Server) NewH2StreamWriter(streamID uint32, hc *H2Conn, streamWindow *atomic.Int64) *H2StreamWriter {
-	w := H2StreamWriterPool.Get().(*H2StreamWriter)
-	w.streamID = streamID
-	w.writeCh = hc.writeCh
-	w.done = hc.done
-	w.window = streamWindow
-	w.connWindow = &hc.connWindow
-	w.maxFrame = &hc.maxFrameSize
-	w.limiter = s.connLimiter
-	w.global = s.globalLimiter
-	w.serverName = s.config.ServerName
-	w.maxWrite = s.config.MaxWriteSize
-	w.written = 0
-	w.method = ""
-	w.headersSent = false
-	w.suppressBody = false
-	w.flowCond = hc.flowCond
-	return w
-}
-
 // NewH1StreamWriter returns a pooled H1StreamWriter initialized for the given
 // TLS connection and AEAD writer, wired to the server's configured
 // bandwidth limiter and Server header.
@@ -1277,9 +1290,10 @@ func (s *Server) NewH1StreamWriter(conn net.Conn, writer *TrafficAEAD) *H1Stream
 	w := H1StreamWriterPool.Get().(*H1StreamWriter)
 	w.conn = conn
 	w.writer = writer
-	w.limiter = s.connLimiter
+	w.limiter = s.newConnLimiter()
 	w.global = s.globalLimiter
 	w.serverName = s.config.ServerName
+	w.altSvc = s.altSvcFor(true)
 	w.maxWrite = s.config.MaxWriteSize
 	w.written = 0
 	w.method = ""
@@ -1287,6 +1301,7 @@ func (s *Server) NewH1StreamWriter(conn net.Conn, writer *TrafficAEAD) *H1Stream
 	w.chunked = true
 	w.suppressBody = false
 	w.closeAfter = false
+	w.cors.reset()
 	return w
 }
 
@@ -1298,7 +1313,7 @@ func (s *Server) NewH1StreamWriter(conn net.Conn, writer *TrafficAEAD) *H1Stream
 func (s *Server) NewPlainH1StreamWriter(conn net.Conn) *PlainH1StreamWriter {
 	w := PlainH1StreamWriterPool.Get().(*PlainH1StreamWriter)
 	w.conn = conn
-	w.limiter = s.connLimiter
+	w.limiter = s.newConnLimiter()
 	w.global = s.globalLimiter
 	w.serverName = s.config.ServerName
 	w.maxWrite = s.config.MaxWriteSize
@@ -1308,12 +1323,13 @@ func (s *Server) NewPlainH1StreamWriter(conn net.Conn) *PlainH1StreamWriter {
 	w.chunked = true
 	w.suppressBody = false
 	w.closeAfter = false
+	w.cors.reset()
 	return w
 }
 
 func (s *Server) rootFastEligible() bool {
-	if s.RateLimit != nil ||
-		s.CORS != nil ||
+	if s.rateLimitEngine.Load() != nil ||
+		s.corsEngine.Load() != nil ||
 		s.config.EnableCompress ||
 		s.perIPLimiter != nil ||
 		s.trustedProxies.active ||
@@ -1370,6 +1386,49 @@ func (s *Server) releaseBodyBytes(n int64) {
 	}
 }
 
+const (
+	bodyBudgetConnShareDivisor = 8
+	bodyBudgetPressureDivisor  = 2
+)
+
+func (s *Server) connBodyShare() int64 {
+	limit := s.config.MaxInFlightBodyBytes
+	maxBody := s.limits.Load().MaxBodySize
+	if maxBody < 0 {
+		return limit
+	}
+	return min(max(limit/bodyBudgetConnShareDivisor, maxBody), limit)
+}
+
+func (s *Server) bodyBudgetUnderPressure(n int) bool {
+	return s.inFlightBodyBytes.Load()+int64(n) > s.config.MaxInFlightBodyBytes/bodyBudgetPressureDivisor
+}
+
+func (s *Server) tryReserveConnBodyBytes(connReserved *atomic.Int64, n int) bool {
+	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
+		return true
+	}
+	if connReserved.Add(int64(n)) > s.connBodyShare() && s.bodyBudgetUnderPressure(n) {
+		connReserved.Add(-int64(n))
+		return false
+	}
+	if !s.tryReserveBodyBytes(n) {
+		connReserved.Add(-int64(n))
+		return false
+	}
+	return true
+}
+
+func (s *Server) releaseConnBodyBytes(connReserved *atomic.Int64, n int64) {
+	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
+		return
+	}
+	if connReserved != nil {
+		connReserved.Add(-n)
+	}
+	s.releaseBodyBytes(n)
+}
+
 func (s *Server) computeFastDispatch() {
 	if !s.Router.built.Load() {
 		s.fastDispatch.Store(false)
@@ -1380,12 +1439,15 @@ func (s *Server) computeFastDispatch() {
 	rootFast := s.rootFastEligible()
 	fast := rootFast && s.config.MaxConcurrentReqs <= 0
 	s.fastDispatch.Store(fast)
-	s.computePlainRootFastResponse(rootFast)
-	s.computeH2RootFastResponse(rootFast)
+	memoizeRoot := rootFast && !s.clientAuthConfigured()
+	s.computePlainRootFastResponse(memoizeRoot)
+	s.computeH2RootFastResponse(memoizeRoot)
 }
 
 func (s *Server) computePlainRootFastResponse(fast bool) {
-	s.plainRootFast.Store(s.buildPlainRootFastResponse(fast))
+	s.rootFastMu.Lock()
+	s.plainRootFast.Store(s.attachPlainAltSvc(s.buildPlainRootFastResponse(fast)))
+	s.rootFastMu.Unlock()
 }
 
 func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
@@ -1426,11 +1488,14 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 		getClose:        closeResp,
 		getKeepAliveTLS: keepAliveTLS,
 		getCloseTLS:     closeTLS,
+		handlerAltSvc:   headersHaveFold(resp.Headers, altSvcHeaderName),
 	}
 }
 
 func (s *Server) computeH2RootFastResponse(fast bool) {
-	s.h2RootFast.Store(s.buildH2RootFastResponse(fast))
+	s.rootFastMu.Lock()
+	s.h2RootFast.Store(s.attachAltSvc(s.buildH2RootFastResponse(fast)))
+	s.rootFastMu.Unlock()
 }
 
 func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
@@ -1460,9 +1525,14 @@ func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
 	enc.Reset(headerPayload)
 	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName)
 
-	body := append([]byte(nil), resp.transmittedBodyBytes()...)
+	fastResp := newH2RootFastResponse(append([]byte(nil), enc.Buf...), append([]byte(nil), resp.transmittedBodyBytes()...))
+	fastResp.handlerAltSvc = headersHaveFold(resp.Headers, altSvcHeaderName)
+	return fastResp
+}
+
+func newH2RootFastResponse(headerPayload, body []byte) *h2RootFastResponse {
 	fastResp := &h2RootFastResponse{
-		headerPayload: append([]byte(nil), enc.Buf...),
+		headerPayload: headerPayload,
 		body:          body,
 	}
 	if len(body) <= int(H2DefaultMaxFrameSize) {
@@ -1531,14 +1601,19 @@ func (s *Server) Proxy() *ProxyEngine {
 // Example: s.AddProxyDomain(DomainConfig{Domain: "api.example.com", Backends: []BackendConfig{{Addr: "10.0.0.1:8080"}}})
 // Example: s.AddProxyDomain(DomainConfig{Domain: "api.example.com", Backends: []BackendConfig{{Addr: "10.0.0.1:8080", Weight: 3}, {Addr: "10.0.0.2:8080", Weight: 1}}, Balancer: LBWeightedRR, MaxRetries: 2, HealthCheck: HealthCheckConfig{Path: "/health", Interval: 10 * time.Second, Timeout: 2 * time.Second}})
 func (s *Server) AddProxyDomain(cfg DomainConfig) {
-	pe := s.proxy.Load()
-	if pe == nil {
-		pe = NewProxyEngine()
-		s.proxy.Store(pe)
-	}
-	pe.AddDomain(cfg)
+	s.ensureProxyEngine().AddDomain(cfg)
+	s.runtimeSetupMu.Lock()
 	s.proxyDomains = append(s.proxyDomains, cfg)
+	s.runtimeSetupMu.Unlock()
 	s.computeFastDispatch()
+}
+
+func (s *Server) ensureProxyEngine() *ProxyEngine {
+	if pe := s.proxy.Load(); pe != nil {
+		return pe
+	}
+	s.proxy.CompareAndSwap(nil, NewProxyEngine())
+	return s.proxy.Load()
 }
 
 // RemoveProxyDomain removes a domain and cleans up health checkers and connection pools for all its backends.
@@ -1558,12 +1633,7 @@ func (s *Server) RemoveProxyDomain(domain string) {
 // Example: s.OnProxyError(func(pe ProxyError) { log.Printf("proxy error: domain=%s backend=%s err=%v", pe.Domain, pe.Backend, pe.Err) })
 // Example: s.OnProxyError(func(pe ProxyError) { metrics.Inc("proxy_errors") })
 func (s *Server) OnProxyError(fn ProxyErrorFunc) {
-	pe := s.proxy.Load()
-	if pe == nil {
-		pe = NewProxyEngine()
-		s.proxy.Store(pe)
-	}
-	pe.OnError = fn
+	s.ensureProxyEngine().liveOnError.Store(&fn)
 	s.computeFastDispatch()
 }
 
@@ -1572,12 +1642,7 @@ func (s *Server) OnProxyError(fn ProxyErrorFunc) {
 // Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { pr.Headers = append(pr.Headers, [2]string{"X-Forwarded-For", pr.ClientAddr}); return true })
 // Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { return pr.Host != "blocked.example.com" })
 func (s *Server) OnProxyRequest(fn ProxyInterceptFunc) {
-	pe := s.proxy.Load()
-	if pe == nil {
-		pe = NewProxyEngine()
-		s.proxy.Store(pe)
-	}
-	pe.OnRequest = fn
+	s.ensureProxyEngine().liveOnRequest.Store(&fn)
 	s.computeFastDispatch()
 }
 
@@ -1586,12 +1651,7 @@ func (s *Server) OnProxyRequest(fn ProxyInterceptFunc) {
 // Example: s.OnProxyResponse(func(pr *ProxyResponse) { pr.Headers = append(pr.Headers, [2]string{"X-Proxy-By", "ALOS"}) })
 // Example: s.OnProxyResponse(func(pr *ProxyResponse) { if pr.StatusCode == 200 { pr.CacheThis() } })
 func (s *Server) OnProxyResponse(fn ProxyResponseFunc) {
-	pe := s.proxy.Load()
-	if pe == nil {
-		pe = NewProxyEngine()
-		s.proxy.Store(pe)
-	}
-	pe.OnResponse = fn
+	s.ensureProxyEngine().liveOnResponse.Store(&fn)
 	s.computeFastDispatch()
 }
 
@@ -1600,25 +1660,24 @@ func (s *Server) OnProxyResponse(fn ProxyResponseFunc) {
 // Example: s.SetProxyCache(ProxyCacheConfig{MaxEntrySize: 4 << 20, MaxTotalBytes: 256 << 20, DefaultMaxAge: 5 * time.Minute})
 // Example: s.SetProxyCache(ProxyCacheConfig{PreCompress: true, CompressLevel: 6, CompressMinLen: 512, Rules: []CacheRule{{PathPrefix: "/api/", MaxAge: 30 * time.Second}, {PathPrefix: "/static/", MaxAge: 24 * time.Hour}}})
 func (s *Server) SetProxyCache(cfg ProxyCacheConfig) {
-	pe := s.proxy.Load()
-	if pe == nil {
-		pe = NewProxyEngine()
-		s.proxy.Store(pe)
-	}
-	if pe.Cache != nil {
-		pe.Cache.Stop()
-	}
-	pe.Cache = NewProxyCache(cfg)
+	s.ensureProxyEngine().replaceCache(cfg)
 	s.computeFastDispatch()
+}
+
+func (s *Server) activeProxyCache() *ProxyCache {
+	if pe := s.proxy.Load(); pe != nil {
+		return pe.activeCache()
+	}
+	return nil
 }
 
 // ProxyCacheStats returns current cache metrics: number of entries, total bytes used, cumulative hits, and cumulative misses.
 func (s *Server) ProxyCacheStats() (entries int64, totalBytes int64, hits uint64, misses uint64) {
-	pe := s.proxy.Load()
-	if pe == nil || pe.Cache == nil {
+	cache := s.activeProxyCache()
+	if cache == nil {
 		return 0, 0, 0, 0
 	}
-	return pe.Cache.Stats()
+	return cache.Stats()
 }
 
 // PurgeProxyCache removes a single cached response by method, host, and path, reporting whether an entry was found and removed.
@@ -1626,20 +1685,20 @@ func (s *Server) ProxyCacheStats() (entries int64, totalBytes int64, hits uint64
 // Example: s.PurgeProxyCache("GET", "example.com", "/index.html")
 // Example: s.PurgeProxyCache("GET", "api.example.com", "/v1/users")
 func (s *Server) PurgeProxyCache(method, host, path string) bool {
-	pe := s.proxy.Load()
-	if pe == nil || pe.Cache == nil {
+	cache := s.activeProxyCache()
+	if cache == nil {
 		return false
 	}
-	return pe.Cache.Purge(method, host, path)
+	return cache.Purge(method, host, path)
 }
 
 // PurgeAllProxyCache drops every entry in the response cache.
 func (s *Server) PurgeAllProxyCache() {
-	pe := s.proxy.Load()
-	if pe == nil || pe.Cache == nil {
+	cache := s.activeProxyCache()
+	if cache == nil {
 		return
 	}
-	pe.Cache.PurgeAll()
+	cache.PurgeAll()
 }
 
 // PurgeDomainCache removes all cached responses for the given domain and returns the number of entries purged.
@@ -1647,11 +1706,11 @@ func (s *Server) PurgeAllProxyCache() {
 // Example: s.PurgeDomainCache("example.com")
 // Example: s.PurgeDomainCache("api.example.com")
 func (s *Server) PurgeDomainCache(domain string) int64 {
-	pe := s.proxy.Load()
-	if pe == nil || pe.Cache == nil {
+	cache := s.activeProxyCache()
+	if cache == nil {
 		return 0
 	}
-	return pe.Cache.PurgeDomain(domain)
+	return cache.PurgeDomain(domain)
 }
 
 // OnRequest registers a hook run before routing each request; returning false stops further processing of that request. Multiple hooks run in registration order.
@@ -1687,6 +1746,7 @@ func (s *Server) OnResponse(fn func(*Request, *Response)) {
 }
 
 func (s *Server) dispatch(req *Request, resp *Response) {
+	loopRefusal := req.takeLoopRateLimitRefusal()
 	if !s.tryAcquireRequestSlot() {
 		statsBlocked()
 		resp.Status(503).String("Service Unavailable")
@@ -1700,11 +1760,7 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 
 	clientIP := extractIP(req.RemoteAddr)
 	if s.perIPLimiter != nil {
-		limit := s.config.MaxRequestsPerIP
-		if limit <= 0 {
-			limit = s.perIPInFlight
-		}
-		if !s.perIPLimiter.acquire(clientIP, limit) {
+		if !s.perIPLimiter.acquire(clientIP, s.perIPRequestLimit()) {
 			statsBlocked()
 			resp.Status(429).String("Too Many Requests")
 			return
@@ -1717,20 +1773,19 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		}()
 	}
 
-	if hooks := s.onRequestHooks.Load(); hooks != nil {
-		for _, hook := range *hooks {
-			if !hook(req, resp) {
-				return
-			}
-		}
+	if !s.runRequestHooks(req, resp) {
+		return
 	}
 
-	cors := s.CORS
+	cors := s.corsEngine.Load()
 	var corsSnap *corsSnapshot
 	if cors != nil {
 		corsSnap = cors.snapshot.Load()
 	}
 	defer func() {
+		if corsSnap != nil {
+			req.streamCORS = streamCORSPolicy{}
+		}
 		if hooks := s.onResponseHooks.Load(); hooks != nil {
 			for _, hook := range *hooks {
 				hook(req, resp)
@@ -1738,8 +1793,9 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		}
 		if s.config.EnableCompress && !req.hijacked {
 			applyConfiguredCompression(req, resp, CompressConfig{
-				Level:   s.config.CompressLevel,
-				MinSize: s.config.CompressMinSize,
+				Level:       s.config.CompressLevel,
+				MinSize:     s.config.CompressMinSize,
+				BrotliLevel: s.config.CompressBrotliLevel,
 			})
 		}
 		if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
@@ -1751,44 +1807,20 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		}
 	}()
 
-	if corsSnap != nil && req.Method == "OPTIONS" {
-		resp.Status(204)
-		return
+	if corsSnap != nil {
+		if req.Method == "OPTIONS" {
+			resp.Status(204)
+			return
+		}
+		req.streamCORS = streamCORSPolicy{engine: cors, snap: corsSnap}
 	}
 
-	if s.RateLimit != nil {
-		if clientIP != "" {
-			allowed, cr, retryAfter := s.RateLimit.Check(clientIP, req.Path)
-			if !allowed {
-				statsBlocked()
-				event := RateLimitEvent{
-					IP:         clientIP,
-					Path:       req.Path,
-					RetryAfter: retryAfter,
-				}
-				if cr != nil {
-					event.Rule = cr.rule
-				}
-
-				if cr != nil && cr.rule.OnLimit != nil {
-					if cr.rule.OnLimit(event, req, resp) {
-						return
-					}
-				}
-				if s.RateLimit.OnLimit != nil {
-					if s.RateLimit.OnLimit(event, req, resp) {
-						return
-					}
-				}
-
-				var buf [20]byte
-				secs := appendUint(buf[:0], int64(retryAfter.Seconds())+1)
-				resp.Status(429).
-					SetHeaderUnsafe("retry-after", string(secs)).
-					String("Too Many Requests")
-				return
-			}
-		}
+	if loopRefusal.refused() {
+		answerRateLimited(s.rateLimitEngine.Load(), loopRefusal.rule, loopRefusal.retryAfter, req, resp)
+		return
+	}
+	if s.rateLimitRefused(clientIP, req, resp) {
+		return
 	}
 
 	if pe := s.proxy.Load(); pe != nil && req.Host != "" {
@@ -1796,9 +1828,75 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 			return
 		}
 	}
+	if ds := s.matchHTTPRoute(req); ds != nil {
+		preferRawRoutePath(req)
+		httpRouteEngine.serveDomain(ds, stripPort(req.Host), req, resp)
+		return
+	}
 	promoteRequestStrings(req)
 	handler := s.Router.Lookup(req.Method, req.Path, req)
 	handler(req, resp)
+}
+
+func (s *Server) perIPRequestLimit() int64 {
+	if limit := s.config.MaxRequestsPerIP; limit > 0 {
+		return limit
+	}
+	return s.perIPInFlightLimit()
+}
+
+func (s *Server) runRequestHooks(req *Request, resp *Response) bool {
+	hooks := s.onRequestHooks.Load()
+	if hooks == nil {
+		return true
+	}
+	for _, hook := range *hooks {
+		if !hook(req, resp) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Server) rateLimitRefused(clientIP string, req *Request, resp *Response) bool {
+	rl := s.rateLimitEngine.Load()
+	if rl == nil || clientIP == "" {
+		return false
+	}
+	allowed, cr, retryAfter := rl.Check(clientIP, req.Path)
+	if allowed {
+		return false
+	}
+	answerRateLimited(rl, cr, retryAfter, req, resp)
+	return true
+}
+
+func answerRateLimited(rl *RateLimitEngine, cr *compiledRule, retryAfter time.Duration, req *Request, resp *Response) {
+	statsBlocked()
+	promoteRequestStrings(req)
+	event := RateLimitEvent{
+		IP:         extractIP(req.RemoteAddr),
+		Path:       req.Path,
+		RetryAfter: retryAfter,
+	}
+	if cr != nil {
+		event.Rule = cr.rule
+	}
+	if cr != nil && cr.rule.OnLimit != nil && cr.rule.OnLimit(event, req, resp) {
+		return
+	}
+	if onLimit := rl.limitHook(); onLimit != nil && onLimit(event, req, resp) {
+		return
+	}
+	answerTooManyRequests(resp, retryAfter)
+}
+
+func answerTooManyRequests(resp *Response, retryAfter time.Duration) {
+	var buf [20]byte
+	secs := appendUint(buf[:0], int64(retryAfter.Seconds())+1)
+	resp.Status(429).
+		SetHeaderUnsafe("retry-after", string(secs)).
+		String("Too Many Requests")
 }
 
 // SetHTTPRoutes configures port-80 HTTP routes that proxy plain HTTP traffic to backend servers instead of redirecting to HTTPS, replacing any existing HTTP routes.
@@ -1806,12 +1904,9 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 // Example: s.SetHTTPRoutes([]HTTPRoute{{PathPrefix: "/api/", Backend: "10.0.0.5:3000"}})
 // Example: s.SetHTTPRoutes([]HTTPRoute{{PathPrefix: "/", Backend: "10.0.0.6:8080", HostHeader: "backend.local"}})
 func (s *Server) SetHTTPRoutes(routes []HTTPRoute) {
-	if s.httpRouter == nil {
-		s.httpRouter = newHTTPRouter()
-	}
-	s.httpRouter.SetRoutes(routes)
+	s.ensureHTTPRouter().SetRoutes(routes)
 	if debugFlag.Load() {
-		log.Printf("[HTTP-ROUTE] %d route(s) configured", len(routes))
+		Dbg("[HTTP-ROUTE] %d route(s) configured", len(routes))
 	}
 }
 
@@ -1820,12 +1915,9 @@ func (s *Server) SetHTTPRoutes(routes []HTTPRoute) {
 // Example: s.AddHTTPRoute(HTTPRoute{PathPrefix: "/api/", Backend: "10.0.0.5:3000"})
 // Example: s.AddHTTPRoute(HTTPRoute{PathPrefix: "/", Backend: "10.0.0.6:8080", HostHeader: "backend.local"})
 func (s *Server) AddHTTPRoute(route HTTPRoute) {
-	if s.httpRouter == nil {
-		s.httpRouter = newHTTPRouter()
-	}
-	s.httpRouter.AddRoute(route)
+	s.ensureHTTPRouter().AddRoute(route)
 	if debugFlag.Load() {
-		log.Printf("[HTTP-ROUTE] added: %s -> %s", route.PathPrefix, route.Backend)
+		Dbg("[HTTP-ROUTE] added: %s -> %s", route.PathPrefix, route.Backend)
 	}
 }
 
@@ -1834,10 +1926,10 @@ func (s *Server) AddHTTPRoute(route HTTPRoute) {
 // Example: s.RemoveHTTPRoute("/api/")
 // Example: s.RemoveHTTPRoute("/")
 func (s *Server) RemoveHTTPRoute(pathPrefix string) {
-	if s.httpRouter != nil {
-		s.httpRouter.RemoveRoute(pathPrefix)
+	if hr := s.httpRouter.Load(); hr != nil {
+		hr.RemoveRoute(pathPrefix)
 		if debugFlag.Load() {
-			log.Printf("[HTTP-ROUTE] removed: %s", pathPrefix)
+			Dbg("[HTTP-ROUTE] removed: %s", pathPrefix)
 		}
 	}
 }
@@ -1847,12 +1939,25 @@ func (s *Server) RemoveHTTPRoute(pathPrefix string) {
 // Example: s.SetCORS(CORSConfig{AllowOrigins: []string{"*"}})
 // Example: s.SetCORS(CORSConfig{AllowOrigins: []string{"https://example.com"}, AllowMethods: []string{"GET", "POST"}, AllowCredentials: true})
 func (s *Server) SetCORS(cfg CORSConfig) {
-	if s.CORS == nil {
-		s.CORS = NewCORSEngine(cfg)
+	s.runtimeSetupMu.Lock()
+	s.adoptAssignedEnginesLocked()
+	if ce := s.corsEngine.Load(); ce != nil {
+		ce.Update(cfg)
 	} else {
-		s.CORS.Update(cfg)
+		ce = NewCORSEngine(cfg)
+		s.CORS = ce
+		s.corsEngine.Store(ce)
 	}
+	s.runtimeSetupMu.Unlock()
 	s.computeFastDispatch()
+}
+
+func (s *Server) ensureHTTPRouter() *HTTPRouter {
+	if hr := s.httpRouter.Load(); hr != nil {
+		return hr
+	}
+	s.httpRouter.CompareAndSwap(nil, newHTTPRouter())
+	return s.httpRouter.Load()
 }
 
 // UpdateCORS replaces the server's CORS policy; it is an alias for SetCORS.
@@ -1863,11 +1968,40 @@ func (s *Server) UpdateCORS(cfg CORSConfig) {
 	s.SetCORS(cfg)
 }
 
-func (s *Server) ensureRateLimit() {
-	if s.RateLimit == nil {
-		s.RateLimit = NewRateLimitEngine()
+func (s *Server) ensureRateLimit() *RateLimitEngine {
+	s.runtimeSetupMu.Lock()
+	adopted := s.adoptAssignedEnginesLocked()
+	rl := s.rateLimitEngine.Load()
+	created := rl == nil
+	if created {
+		rl = NewRateLimitEngine()
+		s.RateLimit = rl
+		s.rateLimitEngine.Store(rl)
+	}
+	s.runtimeSetupMu.Unlock()
+	if created || adopted {
 		s.computeFastDispatch()
 	}
+	return rl
+}
+
+func (s *Server) adoptAssignedEngines() {
+	s.runtimeSetupMu.Lock()
+	s.adoptAssignedEnginesLocked()
+	s.runtimeSetupMu.Unlock()
+}
+
+func (s *Server) adoptAssignedEnginesLocked() bool {
+	adopted := false
+	if s.RateLimit != nil && s.rateLimitEngine.Load() == nil {
+		s.rateLimitEngine.Store(s.RateLimit)
+		adopted = true
+	}
+	if s.CORS != nil && s.corsEngine.Load() == nil {
+		s.corsEngine.Store(s.CORS)
+		adopted = true
+	}
+	return adopted
 }
 
 // SetRateLimitRules replaces all rate-limit rules; each rule matches a path pattern and enforces a per-client-IP request budget.
@@ -1875,8 +2009,7 @@ func (s *Server) ensureRateLimit() {
 // Example: s.SetRateLimitRules([]RateLimitRule{{Path: "/api/*", MaxReqs: 100, Window: 60 * time.Second, BlockFor: 5 * time.Minute}})
 // Example: s.SetRateLimitRules([]RateLimitRule{{Path: "/*", MaxReqs: 300, Window: 60 * time.Second, BlockFor: 2 * time.Minute}})
 func (s *Server) SetRateLimitRules(rules []RateLimitRule) {
-	s.ensureRateLimit()
-	s.RateLimit.SetRules(rules)
+	s.ensureRateLimit().SetRules(rules)
 }
 
 // AddRateLimitRule appends a single rate-limit rule without replacing existing ones.
@@ -1884,8 +2017,7 @@ func (s *Server) SetRateLimitRules(rules []RateLimitRule) {
 // Example: s.AddRateLimitRule(RateLimitRule{Path: "/login", MaxReqs: 5, Window: time.Minute, BlockFor: 10 * time.Minute})
 // Example: s.AddRateLimitRule(RateLimitRule{Path: "/api/*", MaxReqs: 100, Window: time.Minute})
 func (s *Server) AddRateLimitRule(rule RateLimitRule) {
-	s.ensureRateLimit()
-	s.RateLimit.AddRule(rule)
+	s.ensureRateLimit().AddRule(rule)
 }
 
 // RemoveRateLimitRule removes the rule matching the given path pattern.
@@ -1893,10 +2025,9 @@ func (s *Server) AddRateLimitRule(rule RateLimitRule) {
 // Example: s.RemoveRateLimitRule("/api/*")
 // Example: s.RemoveRateLimitRule("/login")
 func (s *Server) RemoveRateLimitRule(path string) {
-	if s.RateLimit == nil {
-		return
+	if rl := s.rateLimitEngine.Load(); rl != nil {
+		rl.RemoveRule(path)
 	}
-	s.RateLimit.RemoveRule(path)
 }
 
 // OnRateLimit registers a global callback invoked when a request is rate-limited; return true if the callback wrote the response, or false to fall through to the default 429.
@@ -1904,6 +2035,5 @@ func (s *Server) RemoveRateLimitRule(path string) {
 // Example: s.OnRateLimit(func(event RateLimitEvent, req *Request, resp *Response) bool { resp.Status(429).JSON([]byte(`{"error":"too many requests"}`)); return true })
 // Example: s.OnRateLimit(func(event RateLimitEvent, req *Request, resp *Response) bool { metrics.Inc("ratelimited"); return false })
 func (s *Server) OnRateLimit(fn RateLimitFunc) {
-	s.ensureRateLimit()
-	s.RateLimit.OnLimit = fn
+	s.ensureRateLimit().liveOnLimit.Store(&fn)
 }

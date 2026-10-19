@@ -228,7 +228,7 @@ func TestCT_PerIPRequestLimiter(t *testing.T) {
 func TestCT_AcquireIPConn_ProxyVsDirect(t *testing.T) {
 	t.Run("proxy mode rewrites real IP and never limits", func(t *testing.T) {
 		s := New(Config{ProxyMode: true, MaxConnsPerIP: 2})
-		defer s.perIPConnLimiter.Stop()
+		defer s.perIPConnLimiter.Load().Stop()
 		for i := 0; i < 50; i++ {
 			req := xffReq(strconv.Itoa(i), "198.51.100.7")
 			c := &epollConn{}
@@ -242,7 +242,7 @@ func TestCT_AcquireIPConn_ProxyVsDirect(t *testing.T) {
 	})
 	t.Run("different XFF IPs on the pooled path each rewrite independently", func(t *testing.T) {
 		s := New(Config{ProxyMode: true, MaxConnsPerIP: 1})
-		defer s.perIPConnLimiter.Stop()
+		defer s.perIPConnLimiter.Load().Stop()
 		a := xffReq("1", "203.0.113.10")
 		b := xffReq("2", "203.0.113.11")
 		ca, cb := &epollConn{}, &epollConn{}
@@ -255,7 +255,7 @@ func TestCT_AcquireIPConn_ProxyVsDirect(t *testing.T) {
 	})
 	t.Run("non-proxy defers to accept and does not set ipHeld", func(t *testing.T) {
 		s := New(Config{MaxConnsPerIP: 1})
-		defer s.perIPConnLimiter.Stop()
+		defer s.perIPConnLimiter.Load().Stop()
 		c := &epollConn{}
 		if !c.acquireIPConn(s, &Request{RemoteAddr: "10.0.0.1:5"}) {
 			t.Fatal("non-proxy acquireIPConn must return true")
@@ -266,7 +266,7 @@ func TestCT_AcquireIPConn_ProxyVsDirect(t *testing.T) {
 	})
 	t.Run("disabled limiter is always a no-op", func(t *testing.T) {
 		s := New(Config{ProxyMode: true, MaxConnsPerIP: -1})
-		if s.perIPConnLimiter != nil {
+		if s.perIPConnLimiter.Load() != nil {
 			t.Fatal("negative MaxConnsPerIP must disable the connection limiter")
 		}
 		c := &epollConn{}

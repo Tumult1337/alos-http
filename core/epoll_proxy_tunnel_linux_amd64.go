@@ -17,24 +17,11 @@ func (w *epollWorker) beginTunnel(c *backendConn, p *h1Parser) bool {
 	}
 	px := proxyExchangeOf(ex)
 	cc := px.c
-	if cc == nil || cc.generation != px.cGen || cc.fd < 0 {
+	if cc == nil || px.h2Stream != nil || cc.generation != px.cGen || cc.fd < 0 {
 		return false
 	}
 
-	scratch := w.beScratch[:0]
-	scratch = append(scratch, "HTTP/1.1 101 "...)
-	scratch = append(scratch, statusText(101)...)
-	scratch = append(scratch, '\r', '\n')
-	for _, h := range p.hdr {
-		if headerNameIsBytes(h[0], "content-length") {
-			continue
-		}
-		scratch = append(scratch, h[0]...)
-		scratch = append(scratch, ':', ' ')
-		scratch = append(scratch, h[1]...)
-		scratch = append(scratch, '\r', '\n')
-	}
-	scratch = append(scratch, '\r', '\n')
+	scratch := appendTunnelResponseHead(w.beScratch[:0], p.hdr)
 	w.beScratch = scratch[:0]
 	w.clientAppend(cc, scratch)
 
@@ -42,6 +29,7 @@ func (w *epollWorker) beginTunnel(c *backendConn, p *h1Parser) bool {
 	ex.finished = true
 	if px.b != nil {
 		px.b.ActiveConns.Add(-1)
+		px.ds.outlier.recordSuccess(px.b)
 		px.b = nil
 	}
 	cc.proxyEx = nil
@@ -72,12 +60,28 @@ func (w *epollWorker) beginTunnel(c *backendConn, p *h1Parser) bool {
 	return true
 }
 
+func appendTunnelResponseHead(dst []byte, hdr [][2][]byte) []byte {
+	dst = append(dst, "HTTP/1.1 101 "...)
+	dst = append(dst, statusText(101)...)
+	dst = append(dst, '\r', '\n')
+	for _, h := range hdr {
+		if headerNameIsBytes(h[0], "content-length") {
+			continue
+		}
+		dst = append(dst, h[0]...)
+		dst = append(dst, ':', ' ')
+		dst = append(dst, h[1]...)
+		dst = append(dst, '\r', '\n')
+	}
+	return append(dst, '\r', '\n')
+}
+
 // tunnelToClient relays backend bytes to the client, pausing the backend read
 // side when the client falls behind.
 func (w *epollWorker) tunnelToClient(c *backendConn, data []byte) {
 	cc := c.tunnelClient
 	if cc == nil || cc.fd < 0 {
-		w.be.closeConn(c, fpErrClientClosed)
+		w.be.closeConn(c, errFPClientClosed)
 		return
 	}
 	w.clientAppend(cc, data)
@@ -101,6 +105,20 @@ func (w *epollWorker) tunnelToBackend(cc *epollConn) {
 		cc.h1Off = 0
 		w.be.flushWrites(c)
 	}
+	if c.state != connClosed && c.wbuf.length() > proxyStreamHighWater {
+		cc.tunnelPaused = true
+	}
+}
+
+func (w *epollWorker) resumeTunnelIfDrained(c *backendConn) {
+	cc := c.tunnelClient
+	if cc == nil || !cc.tunnelPaused || cc.fd < 0 || c.wbuf.length() > proxyStreamLowWater {
+		return
+	}
+	cc.tunnelPaused = false
+	if cc.readPending {
+		w.readable(cc, false)
+	}
 }
 
 // closeTunnelPeer tears down the client half when the backend end goes away.
@@ -112,6 +130,7 @@ func (w *epollWorker) closeTunnelPeer(c *backendConn) {
 	}
 	cc.tunnelBE = nil
 	cc.pausedBackend = nil
+	cc.tunnelPaused = false
 	if cc.fd >= 0 {
 		cc.closeAfter = true
 		w.flush(cc)
@@ -123,11 +142,12 @@ func (w *epollWorker) closeTunnelFromClient(cc *epollConn) {
 	c := cc.tunnelBE
 	cc.tunnelBE = nil
 	cc.pausedBackend = nil
+	cc.tunnelPaused = false
 	if c == nil {
 		return
 	}
 	c.tunnelClient = nil
 	if c.state != connClosed {
-		w.be.closeConn(c, fpErrClientClosed)
+		w.be.closeConn(c, errFPClientClosed)
 	}
 }

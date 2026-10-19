@@ -4,6 +4,7 @@ package core
 
 import (
 	"net"
+	"net/netip"
 	"syscall"
 	"unsafe"
 )
@@ -61,6 +62,10 @@ func sockaddrToUDPAddr(sa *syscall.RawSockaddrInet4) *net.UDPAddr {
 	copy(ip, sa.Addr[:])
 	port := int(htons(sa.Port))
 	return &net.UDPAddr{IP: ip, Port: port}
+}
+
+func sockaddrToAddrPort(sa *syscall.RawSockaddrInet4) netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), htons(sa.Port))
 }
 
 func udpAddrToSockaddr4(addr *net.UDPAddr) syscall.RawSockaddrInet4 {

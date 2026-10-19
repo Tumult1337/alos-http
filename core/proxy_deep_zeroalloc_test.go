@@ -16,7 +16,7 @@ import (
 // indistinguishable from the proxy's own in MemStats. This one reads into a
 // fixed buffer, counts request terminators and writes a canned reply, so a
 // MemStats delta around it reflects the proxy alone.
-func zeroAllocOrigin(t *testing.T, bodySize int) string {
+func zeroAllocOrigin(t testing.TB, bodySize int) string {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {

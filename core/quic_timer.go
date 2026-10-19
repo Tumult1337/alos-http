@@ -1,7 +1,8 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"log"
 	"sync"
 	"time"
 
@@ -14,10 +15,12 @@ const (
 )
 
 type quicTimerHub struct {
-	mu       sync.Mutex
-	conns    map[*QUICConn]struct{}
-	snapshot []*QUICConn
-	started  bool
+	mu        sync.Mutex
+	conns     map[*QUICConn]struct{}
+	snapshot  []*QUICConn
+	started   bool
+	stopped   chan struct{}
+	goingAway bool
 }
 
 func (h *quicTimerHub) add(qc *QUICConn, done <-chan struct{}) {
@@ -26,11 +29,31 @@ func (h *quicTimerHub) add(qc *QUICConn, done <-chan struct{}) {
 		h.conns = make(map[*QUICConn]struct{}, 256)
 	}
 	h.conns[qc] = struct{}{}
+	late := h.goingAway
 	start := !h.started
-	h.started = true
+	if start {
+		h.started = true
+		h.stopped = make(chan struct{})
+	}
 	h.mu.Unlock()
+	if late {
+		qc.signalGoAway()
+	}
 	if start {
 		go h.run(done)
+	}
+}
+
+func (h *quicTimerHub) goAwayAll() {
+	h.mu.Lock()
+	h.goingAway = true
+	conns := make([]*QUICConn, 0, len(h.conns))
+	for qc := range h.conns {
+		conns = append(conns, qc)
+	}
+	h.mu.Unlock()
+	for _, qc := range conns {
+		qc.signalGoAway()
 	}
 }
 
@@ -40,6 +63,35 @@ func (h *quicTimerHub) remove(qc *QUICConn) {
 	h.mu.Unlock()
 }
 
+func (h *quicTimerHub) awaitStopped() {
+	h.mu.Lock()
+	stopped := h.stopped
+	h.mu.Unlock()
+	if stopped != nil {
+		<-stopped
+	}
+}
+
+func (h *quicTimerHub) closeAll(cause error) {
+	h.mu.Lock()
+	conns := make([]*QUICConn, 0, len(h.conns))
+	for qc := range h.conns {
+		conns = append(conns, qc)
+	}
+	h.mu.Unlock()
+	for _, qc := range conns {
+		qc.closeForShutdown(cause)
+	}
+}
+
+func (h *quicTimerHub) stopIfIdleLocked() bool {
+	if len(h.conns) > 0 {
+		return false
+	}
+	close(h.stopped)
+	return true
+}
+
 func (h *quicTimerHub) run(done <-chan struct{}) {
 	ticker := time.NewTicker(quicTimerTick)
 	defer ticker.Stop()
@@ -47,7 +99,7 @@ func (h *quicTimerHub) run(done <-chan struct{}) {
 	for {
 		select {
 		case <-done:
-			return
+			done = nil
 		case <-ticker.C:
 		}
 		now := turbo.UnixNano()
@@ -56,6 +108,10 @@ func (h *quicTimerHub) run(done <-chan struct{}) {
 			lastIdleCheck = now
 		}
 		h.mu.Lock()
+		if done == nil && h.stopIfIdleLocked() {
+			h.mu.Unlock()
+			return
+		}
 		h.snapshot = h.snapshot[:0]
 		for qc := range h.conns {
 			h.snapshot = append(h.snapshot, qc)
@@ -70,11 +126,21 @@ func (h *quicTimerHub) run(done <-chan struct{}) {
 func (qc *QUICConn) tick(now int64, checkIdle bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[QUIC-PANIC] timer tick: %v", r)
+			qc.server.reportPanic(nil, r)
 		}
 	}()
-	if checkIdle && qc.idleTimeout > 0 && time.Duration(now-qc.lastActive.Load()) > qc.idleTimeout {
+	if checkIdle && (qc.idleTimeout > 0 && time.Duration(now-qc.lastActive.Load()) > qc.idleTimeout || qc.handshakeExpired(now)) {
 		qc.close()
+		return
+	}
+	if checkIdle && qc.sendStalledTooLong(now) {
+		qc.resetStalledStreams(now)
+	}
+	if qc.probing.Load() {
+		qc.checkPathProbe()
+	}
+	if qc.draining.Load() && qc.drained() {
+		qc.closeWithAppError(h3ErrNoError, "")
 		return
 	}
 	if !qc.timerWork.Swap(false) {

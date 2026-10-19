@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 const (
@@ -8,8 +10,7 @@ const (
 	// MaxRecordSize is the maximum total size of a TLS record (payload plus overhead) in bytes.
 	MaxRecordSize = MaxRecordPayload + MaxRecordOverhead
 	// CacheLineSize is the assumed CPU cache line size in bytes, used to pad structs and avoid false sharing.
-	CacheLineSize         = 64
-	writeRequestBatchSize = 96
+	CacheLineSize = 64
 
 	// H2PrefaceLen is the length in bytes of the HTTP/2 connection preface.
 	H2PrefaceLen = 24
@@ -103,4 +104,6 @@ const (
 	H2SettingMaxFrameSize uint16 = 0x5
 	// H2SettingMaxHeaderListSize is the HTTP/2 SETTINGS_MAX_HEADER_LIST_SIZE identifier.
 	H2SettingMaxHeaderListSize uint16 = 0x6
+
+	H2SettingEnableConnectProtocol uint16 = 0x8
 )

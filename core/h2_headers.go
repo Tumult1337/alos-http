@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
@@ -22,7 +24,7 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 	case 0:
 	case 1:
 		name := headers[0][0]
-		if name != "" && name[0] != ':' && !isHopByHopFold(name) {
+		if name != "" && name[0] != ':' && !isConnectionSpecificResponseField(name) {
 			switch {
 			case EqualFoldASCII(name, "content-type"):
 				if !wroteContentType {
@@ -49,7 +51,7 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 			if name == "" {
 				continue
 			}
-			if name[0] == ':' || isHopByHopFold(name) {
+			if name[0] == ':' || isConnectionSpecificResponseField(name) {
 				continue
 			}
 			switch {

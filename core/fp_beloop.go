@@ -1,9 +1,10 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
 	"strconv"
+	"sync/atomic"
 
 	"github.com/guno1928/turbo"
 )
@@ -36,6 +37,11 @@ type beLoop struct {
 	liveConns int
 	lastSweep int64
 
+	sweepEveryNano int64
+	liveMaxIdle    *atomic.Int64
+	panicReporter  *Server
+	dnsInflight    map[string]*backendConn
+
 	// seq identifies the batch of epoll events currently being processed.
 	// Dialling happens inside that batch, so a fresh socket can reuse a
 	// descriptor that an earlier event in the same batch just closed. Stamping
@@ -64,6 +70,7 @@ func (l *beLoop) init(ep int, cfg *fpConfig, sink beSink) {
 	l.sink = sink
 	l.idle = make(map[poolKey][]*backendConn)
 	l.h2conns = make(map[poolKey]*backendConn)
+	l.dnsInflight = make(map[string]*backendConn)
 	l.scratch = make([]byte, loopScratchSize)
 }
 
@@ -74,9 +81,12 @@ func (l *beLoop) nowNano() int64 {
 // closeAll drops every backend connection this loop owns. The epoll fd belongs
 // to the host, so it is deliberately left open.
 func (l *beLoop) closeAll() {
+	for _, c := range l.dnsInflight {
+		l.dnsFail(c, errFPClientClosed)
+	}
 	for _, c := range l.conns {
 		if c != nil && c.state != connClosed {
-			l.closeConn(c, fpErrClientClosed)
+			l.closeConn(c, errFPClientClosed)
 		}
 	}
 }
@@ -89,8 +99,9 @@ func (l *beLoop) ensureFD(fd int) {
 
 func (l *beLoop) startExchange(ex *Exchange) {
 	now := l.nowNano()
+	l.tightenSweep(ex, now)
 	if now >= ex.deadline {
-		l.finish(ex, fpErrTimeout)
+		l.finish(ex, errFPTimeout)
 		return
 	}
 	if ex.key.h2 {
@@ -102,7 +113,7 @@ func (l *beLoop) startExchange(ex *Exchange) {
 		return
 	}
 	list := l.idle[ex.key]
-	for len(list) > 0 {
+	for ex.body == nil && len(list) > 0 {
 		c := list[len(list)-1]
 		list = list[:len(list)-1]
 		l.idle[ex.key] = list
@@ -147,7 +158,7 @@ func (l *beLoop) removeIdle(c *backendConn) {
 func (l *beLoop) idlePut(c *backendConn) {
 	maxIdle := c.maxIdle
 	if maxIdle <= 0 {
-		maxIdle = l.cfg.MaxIdlePerBackend
+		maxIdle = l.maxIdlePerBackend()
 	}
 	list := l.idle[c.key]
 	if len(list) >= maxIdle {
@@ -165,6 +176,13 @@ func (l *beLoop) idlePut(c *backendConn) {
 	l.idle[c.key] = append(list, c)
 }
 
+func (l *beLoop) maxIdlePerBackend() int {
+	if l.liveMaxIdle != nil {
+		return int(l.liveMaxIdle.Load())
+	}
+	return l.cfg.MaxIdlePerBackend
+}
+
 func (l *beLoop) completeH1(c *backendConn) {
 	ex := c.cur
 	if ex == nil {
@@ -172,6 +190,9 @@ func (l *beLoop) completeH1(c *backendConn) {
 	}
 	c.cur = nil
 	p := &c.h1
+	if ex.body.incomplete() {
+		p.keepAlive = false
+	}
 	if p.stream {
 		ex.resp.Status = p.status
 		ex.resp.hdrRaw = p.hdr
@@ -217,23 +238,35 @@ func (l *beLoop) sweepBackends(now int64) {
 		if c == nil || c.state == connClosed {
 			continue
 		}
-		// A tunnel has no request cadence, so no request deadline applies.
-		if c.tunnelClient != nil {
-			continue
+		l.sweepConn(c, now)
+	}
+}
+
+func (l *beLoop) sweepConn(c *backendConn, now int64) {
+	defer l.recoverSweep(c)
+	// A tunnel has no request cadence, so no request deadline applies.
+	if c.tunnelClient != nil {
+		return
+	}
+	if c.inIdle {
+		if now > c.idleDeadline {
+			l.closeConn(c, nil)
 		}
-		if c.inIdle {
-			if now > c.idleDeadline {
-				l.closeConn(c, nil)
-			}
-			continue
-		}
-		if c.h2 != nil {
-			l.sweepH2(c, now)
-			continue
-		}
-		if c.cur != nil && now > c.cur.deadline {
-			l.closeConn(c, fpErrTimeout)
-		}
+		return
+	}
+	if c.dns != nil {
+		l.sweepDNSWaiters(c, now)
+	}
+	if c.h2 != nil && c.dns == nil {
+		l.sweepH2(c, now)
+		return
+	}
+	if c.cur != nil && now > c.cur.deadline {
+		l.closeConn(c, errFPTimeout)
+		return
+	}
+	if c.dns != nil && now > c.dns.deadline {
+		l.dnsNext(c, false)
 	}
 }
 
@@ -242,9 +275,9 @@ func (l *beLoop) sweepH2(c *backendConn, now int64) {
 		if !st.ended && now > st.ex.deadline {
 			st.ended = true
 			delete(c.h2.streams, id)
-			c.send(h2Frame(h2FrameRSTStream, 0, id, []byte{0, 0, 0, 8}))
+			c.send(h2Frame(h2FrameRSTStream, 0, id, h2RSTCancelPayload))
 			l.flushWrites(c)
-			l.finish(st.ex, fpErrTimeout)
+			l.finish(st.ex, errFPTimeout)
 		}
 	}
 }
@@ -316,12 +349,3 @@ func (h respHeaders) intValue(i int) (int64, bool) {
 // The H1 parser lowercases names in place, so the byte forms compare directly.
 // Go allocates nothing for string(b) in a comparison or a switch.
 func headerNameIsBytes(name []byte, lower string) bool { return string(name) == lower }
-
-// fpIsClientForwardedHeader reports whether a client-supplied header claims to
-// describe the original caller. Such a claim is never trustworthy and is
-// replaced rather than relayed.
-func fpIsClientForwardedHeader(name []byte) bool {
-	return asciiEqualFold(name, "x-forwarded-for") ||
-		asciiEqualFold(name, "x-real-ip") ||
-		asciiEqualFold(name, "forwarded")
-}

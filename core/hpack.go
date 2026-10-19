@@ -1,9 +1,13 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"bytes"
+	"encoding/binary"
 	"strings"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/zeebo/xxh3"
 )
@@ -543,8 +547,10 @@ type hpackDynEntry struct {
 }
 
 const (
-	hpackHuffmanDecodeCacheSize = 16
-	hpackHuffmanDecodeInlineMax = 64
+	hpackHuffmanDecodeCacheSize   = 16
+	hpackHuffmanDecodeInlineMax   = 64
+	hpackHuffmanDecodeCacheMaxRaw = 256
+	hpackHuffmanMaxCodeBits       = 30
 )
 
 type hpackHuffmanDecodeCacheEntry struct {
@@ -612,6 +618,8 @@ type HpackDecoder struct {
 	dynHead          int
 	dynLen           int
 	dynSize          int
+	dynRefBytes      int
+	dynNameMax       int
 	huffmanCache     [hpackHuffmanDecodeCacheSize]hpackHuffmanDecodeCacheEntry
 	huffmanCacheNext uint8
 	tableGen         uint64
@@ -620,6 +628,9 @@ type HpackDecoder struct {
 	memoMeta         hpackRequestMeta
 	memoValid        bool
 	memoRoot         bool
+
+	allowExtendedConnect bool
+	maxHeaderListSize    int
 }
 
 // NewHpackDecoder returns an HpackDecoder initialized with the connection's
@@ -630,7 +641,7 @@ func NewHpackDecoder() *HpackDecoder {
 
 func newHpackDecoder(tableSize uint32) *HpackDecoder {
 	limit := int(tableSize)
-	return &HpackDecoder{maxTableSize: limit, protocolMaxSize: limit}
+	return &HpackDecoder{maxTableSize: limit, protocolMaxSize: limit, maxHeaderListSize: H2MaxHeaderListSize}
 }
 
 func (d *HpackDecoder) decodeString(data []byte) (string, int) {
@@ -656,9 +667,11 @@ func (d *HpackDecoder) decodeString(data []byte) (string, int) {
 	if !ok {
 		return "", 0
 	}
-	slot := int(d.huffmanCacheNext) % len(d.huffmanCache)
-	d.huffmanCacheNext++
-	d.huffmanCache[slot].store(hash, raw, decoded)
+	if len(raw) <= hpackHuffmanDecodeCacheMaxRaw {
+		slot := int(d.huffmanCacheNext) % len(d.huffmanCache)
+		d.huffmanCacheNext++
+		d.huffmanCache[slot].store(hash, raw, decoded)
+	}
 	return decoded, n + int(sLen)
 }
 
@@ -695,15 +708,13 @@ func (d *HpackDecoder) growDynRing() {
 }
 
 func (d *HpackDecoder) lookupIndex(idx uint64) (string, string, bool) {
-	if idx == 0 {
-		return "", "", false
-	}
 	if idx < uint64(len(HpackStaticTable)) {
-		return HpackStaticTable[idx][0], HpackStaticTable[idx][1], true
+		f := &HpackStaticTable[idx]
+		return f[0], f[1], idx != 0
 	}
-	dynIdx := int(idx) - len(HpackStaticTable)
-	if dynIdx >= 0 && dynIdx < d.dynLen {
-		e := d.dynGet(dynIdx)
+	if dynIdx := idx - uint64(len(HpackStaticTable)); dynIdx < uint64(d.dynLen) {
+		e := d.dynGet(int(dynIdx))
+		d.dynRefBytes += e.size
 		return e.name, e.value, true
 	}
 	return "", "", false
@@ -726,7 +737,8 @@ func (d *HpackDecoder) lookupName(idx uint64) (string, bool) {
 func (d *HpackDecoder) addEntry(name, value string) {
 	d.tableGen++
 	d.memoValid = false
-	entrySize := 32 + len(name) + len(value)
+	d.dynNameMax = max(d.dynNameMax, len(name))
+	entrySize := hpackEntryOverhead + len(name) + len(value)
 	for d.dynSize+entrySize > d.maxTableSize && d.dynLen > 0 {
 		tail := d.dynGet(d.dynLen - 1)
 		d.dynSize -= tail.size
@@ -823,6 +835,9 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 			}
 			d.addEntry(name, val)
 		} else if b&0x20 != 0 {
+			if len(headers) > 0 {
+				return nil, errHpackSizeUpdateAfterField
+			}
 			maxSize, n := HpackDecodeInt(data[pos:], 5)
 			if n <= 0 {
 				return nil, ErrH2BadHeader
@@ -872,7 +887,7 @@ func (d *HpackDecoder) DecodeInto(headers [][2]string, data []byte) ([][2]string
 // takes a fast path for the common GET-path-over-HTTPS request shape.
 func (d *HpackDecoder) DecodeIntoRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, error) {
 	const maxHeaders = 128
-	var meta hpackRequestMeta
+	meta := hpackRequestMeta{allowProtocol: d.allowExtendedConnect}
 	if headers, meta, ok, err := decodeSimpleGetPathHTTPSRequest(d, headers, data); ok {
 		return headers, meta, err
 	}
@@ -932,6 +947,9 @@ func (d *HpackDecoder) DecodeIntoRequest(headers [][2]string, data []byte) ([][2
 			meta.headerCount++
 			d.addEntry(name, value)
 		} else if b&0x20 != 0 {
+			if meta.headerCount > 0 {
+				return nil, meta, errHpackSizeUpdateAfterField
+			}
 			maxSize, n := HpackDecodeInt(data[pos:], 5)
 			if n <= 0 {
 				return nil, meta, ErrH2BadHeader
@@ -997,6 +1015,9 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 		headers = make([][2]string, 0, 3)
 	}
 	headers = headers[:0]
+	if !isValidH2Path(path) {
+		return nil, meta, true, ErrH2BadHeader
+	}
 	rawPath := path
 	path = sanitizeRequestPath(path)
 	_, query := splitPathQuery(rawPath)
@@ -1011,19 +1032,59 @@ func decodeSimpleGetPathHTTPSRequest(d *HpackDecoder, headers [][2]string, data 
 	meta.query = query
 	meta.scheme = "https"
 	meta.headerCount = 3
+	if err := meta.validate(); err != nil {
+		return nil, meta, true, err
+	}
 	return headers, meta, true, nil
 }
 
 type hpackRequestMeta struct {
-	method      string
-	path        string
-	rawPath     string
-	query       string
-	scheme      string
-	authority   string
-	headerCount int
-	pseudoMask  uint8
-	sawRegular  bool
+	method            string
+	path              string
+	rawPath           string
+	query             string
+	scheme            string
+	authority         string
+	headerCount       int
+	contentLength     int
+	pseudoMask        uint8
+	sawRegular        bool
+	hasContentLength  bool
+	allowProtocol     bool
+	protocolSet       bool
+	protocolWebSocket bool
+}
+
+var errH2MalformedRequest = &staticError{"h2 malformed request"}
+
+var errH2HeaderListTooLarge = &staticError{"h2 header list too large"}
+
+const (
+	hpackEntryOverhead       = 32
+	hpackHuffmanMaxExpandNum = 8
+	hpackHuffmanMaxExpandDen = 5
+)
+
+var hpackStaticFieldMaxSize = func() int {
+	largest := 0
+	for _, f := range HpackStaticTable {
+		largest = max(largest, len(f[0])+len(f[1]))
+	}
+	return largest + hpackEntryOverhead
+}()
+
+func (d *HpackDecoder) fieldListTooLarge(blockLen int, headers [][2]string, indexedRefBytes int) bool {
+	bound := blockLen*hpackHuffmanMaxExpandNum/hpackHuffmanMaxExpandDen + len(headers)*(hpackStaticFieldMaxSize+d.dynNameMax) + indexedRefBytes
+	return bound > d.maxHeaderListSize && h2FieldListSize(headers) > d.maxHeaderListSize
+}
+
+var errHpackSizeUpdateAfterField = &staticError{"hpack: dynamic table size update after a field line"}
+
+func (meta *hpackRequestMeta) declaredLength() int64 {
+	if !meta.hasContentLength {
+		return -1
+	}
+	return int64(meta.contentLength)
 }
 
 const (
@@ -1031,6 +1092,7 @@ const (
 	hpackPseudoScheme
 	hpackPseudoPath
 	hpackPseudoAuthority
+	hpackPseudoProtocol
 )
 
 var h2FieldNameValid [256]bool
@@ -1062,26 +1124,54 @@ func isValidH2FieldName(name string) bool {
 	return true
 }
 
-var h2FieldValueInvalid [256]bool
-
-func init() {
-	h2FieldValueInvalid[0] = true
-	h2FieldValueInvalid['\r'] = true
-	h2FieldValueInvalid['\n'] = true
-}
-
 func isValidH2FieldValue(value string) bool {
 	if len(value) > 0 {
 		if value[0] == ' ' || value[0] == '\t' || value[len(value)-1] == ' ' || value[len(value)-1] == '\t' {
 			return false
 		}
 	}
-	for i := 0; i < len(value); i++ {
-		if h2FieldValueInvalid[value[i]] {
+	return !containsLineBreak(value, lineBreakCRLFNUL)
+}
+
+const (
+	h2PathFirstValidByte = '!'
+	h2PathDELByte        = 0x7f
+	h2PathWordLen        = 8
+)
+
+func isValidH2Path(path string) bool {
+	if len(path) < h2PathWordLen {
+		for i := 0; i < len(path); i++ {
+			if c := path[i]; c < h2PathFirstValidByte || c == h2PathDELByte {
+				return false
+			}
+		}
+		return true
+	}
+	b := unsafe.Slice(unsafe.StringData(path), len(path))
+	last := len(b) - h2PathWordLen
+	for i := 0; i < last; i += h2PathWordLen {
+		if wordHasPathControl(binary.LittleEndian.Uint64(b[i:])) {
 			return false
 		}
 	}
-	return true
+	return !wordHasPathControl(binary.LittleEndian.Uint64(b[last:]))
+}
+
+func wordHasPathControl(w uint64) bool {
+	return (w-h2PathFirstValidByte*swarOnes)&^w&swarHigh|swarZeroBytes(w^h2PathDELByte*swarOnes) != 0
+}
+
+func isH2Method(value string) bool {
+	return value == internedGET || isH1Token(UnsafeBytes(value))
+}
+
+func h2FieldListSize(fields [][2]string) int {
+	n := 0
+	for i := range fields {
+		n += len(fields[i][0]) + len(fields[i][1]) + hpackEntryOverhead
+	}
+	return n
 }
 
 func isH2ConnectionSpecificField(name, value string) bool {
@@ -1096,7 +1186,7 @@ func isH2ConnectionSpecificField(name, value string) bool {
 }
 
 func (meta *hpackRequestMeta) observeHeader(name, value string) error {
-	if !isValidH2FieldName(name) || !isValidH2FieldValue(value) {
+	if !isValidH2FieldName(name) {
 		return ErrH2BadHeader
 	}
 	if name[0] == ':' {
@@ -1105,19 +1195,14 @@ func (meta *hpackRequestMeta) observeHeader(name, value string) error {
 		}
 		switch name {
 		case ":method":
-			if meta.pseudoMask&hpackPseudoMethod != 0 {
+			if meta.pseudoMask&hpackPseudoMethod != 0 || value != "" && !isH2Method(value) {
 				return ErrH2BadHeader
 			}
 			meta.pseudoMask |= hpackPseudoMethod
 			meta.method = value
-		case ":scheme":
-			if meta.pseudoMask&hpackPseudoScheme != 0 {
-				return ErrH2BadHeader
-			}
-			meta.pseudoMask |= hpackPseudoScheme
-			meta.scheme = value
+			return nil
 		case ":path":
-			if meta.pseudoMask&hpackPseudoPath != 0 {
+			if meta.pseudoMask&hpackPseudoPath != 0 || !isValidH2Path(value) {
 				return ErrH2BadHeader
 			}
 			meta.pseudoMask |= hpackPseudoPath
@@ -1128,6 +1213,18 @@ func (meta *hpackRequestMeta) observeHeader(name, value string) error {
 			} else {
 				meta.path = sanitizeRequestPath(value)
 			}
+			return nil
+		}
+		if !isValidH2FieldValue(value) {
+			return ErrH2BadHeader
+		}
+		switch name {
+		case ":scheme":
+			if meta.pseudoMask&hpackPseudoScheme != 0 {
+				return ErrH2BadHeader
+			}
+			meta.pseudoMask |= hpackPseudoScheme
+			meta.scheme = value
 		case ":authority":
 			if meta.pseudoMask&hpackPseudoAuthority != 0 {
 				return ErrH2BadHeader
@@ -1137,27 +1234,60 @@ func (meta *hpackRequestMeta) observeHeader(name, value string) error {
 			}
 			meta.pseudoMask |= hpackPseudoAuthority
 			meta.authority = value
+		case ":protocol":
+			if !meta.allowProtocol || meta.pseudoMask&hpackPseudoProtocol != 0 {
+				return ErrH2BadHeader
+			}
+			meta.pseudoMask |= hpackPseudoProtocol
+			meta.protocolSet = value != ""
+			meta.protocolWebSocket = EqualFoldASCII(value, "websocket")
 		default:
 			return ErrH2BadHeader
 		}
 		return nil
 	}
+	if !isValidH2FieldValue(value) {
+		return ErrH2BadHeader
+	}
 	meta.sawRegular = true
 	if isH2ConnectionSpecificField(name, value) {
 		return ErrH2BadHeader
 	}
+	if len(name) == len("content-length") && name == "content-length" {
+		n, ok := parseUint(value)
+		if !ok || meta.hasContentLength && n != meta.contentLength {
+			return ErrH2BadHeader
+		}
+		meta.contentLength = n
+		meta.hasContentLength = true
+	}
 	return nil
 }
 
-func (meta hpackRequestMeta) validate() error {
-	if meta.method == "CONNECT" {
-		if meta.authority == "" || meta.scheme != "" || meta.path != "" {
-			return ErrH2BadHeader
+func (meta *hpackRequestMeta) validate() error {
+	if meta.pseudoMask&hpackPseudoProtocol != 0 || meta.method == "CONNECT" {
+		return meta.validateConnect()
+	}
+	if meta.method == "" || meta.scheme == "" || meta.path == "" || !meta.pathFormValid() {
+		return errH2MalformedRequest
+	}
+	return nil
+}
+
+func (meta *hpackRequestMeta) pathFormValid() bool {
+	p := meta.rawPath
+	return len(p) > 0 && (p[0] == '/' || p == "*" && meta.method == "OPTIONS")
+}
+
+func (meta *hpackRequestMeta) validateConnect() error {
+	if meta.pseudoMask&hpackPseudoProtocol != 0 {
+		if meta.method != "CONNECT" || !meta.protocolSet || meta.authority == "" || meta.scheme == "" || meta.path == "" || len(meta.rawPath) == 0 || meta.rawPath[0] != '/' {
+			return errH2MalformedRequest
 		}
 		return nil
 	}
-	if meta.method == "" || meta.scheme == "" || meta.path == "" {
-		return ErrH2BadHeader
+	if meta.authority == "" || meta.scheme != "" || meta.path != "" {
+		return errH2MalformedRequest
 	}
 	return nil
 }
@@ -1194,7 +1324,7 @@ func (d *HpackDecoder) decodeStringSelective(data []byte, want bool) (string, in
 // need.
 func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) {
 	const maxHeaders = 128
-	var meta hpackRequestMeta
+	meta := hpackRequestMeta{allowProtocol: d.allowExtendedConnect}
 	pos := 0
 	for pos < len(data) {
 		b := data[pos]
@@ -1244,6 +1374,9 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 			meta.headerCount++
 			d.addEntry(name, value)
 		} else if b&0x20 != 0 {
+			if meta.headerCount > 0 {
+				return meta, errHpackSizeUpdateAfterField
+			}
 			maxSize, n := HpackDecodeInt(data[pos:], 5)
 			if n <= 0 {
 				return meta, ErrH2BadHeader
@@ -1276,7 +1409,7 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 				}
 				pos += n
 			}
-			wantValue := name == ":method" || name == ":path" || name == ":scheme" || name == ":authority"
+			wantValue := name == ":method" || name == ":path" || name == ":scheme" || name == ":authority" || name == ":protocol"
 			value, n, err := d.decodeStringSelective(data[pos:], wantValue)
 			if err != nil {
 				return meta, err
@@ -1316,9 +1449,13 @@ func (d *HpackDecoder) DecodeRequest(headers [][2]string, data []byte) ([][2]str
 		return headers, d.memoMeta, d.memoRoot, nil
 	}
 	gen := d.tableGen
+	refStart := d.dynRefBytes
 	headers, meta, err := d.DecodeIntoRequest(headers, data)
 	if err != nil {
 		return headers, meta, false, err
+	}
+	if d.fieldListTooLarge(len(data), headers, d.dynRefBytes-refStart) {
+		return headers, meta, false, errH2HeaderListTooLarge
 	}
 	isRoot := meta.method == "GET" && meta.path == "/"
 	if d.tableGen == gen && len(data) <= hpackMemoMaxBlock {
@@ -1396,6 +1533,9 @@ func hpackHuffmanDecodeInto(dst, src []byte) ([]byte, bool) {
 		for nbits >= 5 {
 			decoded, codeLen := huffmanLookup(bits, nbits)
 			if codeLen == 0 {
+				if nbits >= hpackHuffmanMaxCodeBits {
+					return dst, false
+				}
 				break
 			}
 			dst = append(dst, decoded)
@@ -1431,6 +1571,9 @@ func hpackHuffmanDecode(src []byte) (string, bool) {
 		for nbits >= 5 {
 			decoded, codeLen := huffmanLookup(bits, nbits)
 			if codeLen == 0 {
+				if nbits >= hpackHuffmanMaxCodeBits {
+					return "", false
+				}
 				break
 			}
 			dst = append(dst, decoded)
@@ -1554,7 +1697,7 @@ func huffmanLookup(bits uint64, nbits uint8) (byte, uint8) {
 		if e.bits > 0 {
 			return e.sym, e.bits
 		}
-		for b := uint8(9); b <= nbits && b <= 30; b++ {
+		for b := uint8(9); b <= nbits && b <= hpackHuffmanMaxCodeBits; b++ {
 			group := huffLong[b]
 			target := uint32(bits >> (nbits - b))
 			for _, g := range group {

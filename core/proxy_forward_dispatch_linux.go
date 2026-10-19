@@ -1,10 +1,10 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 func (pe *ProxyEngine) forwardRequest(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
-	if isWebSocket(req) {
-		return pe.forwardWebSocket(req, resp, b, cfg)
+	if req.Header("Upgrade") != "" {
+		return pe.forwardUpgrade(req, resp, b, cfg)
 	}
 	return pe.forwardRequestFP(req, resp, b, cfg)
 }

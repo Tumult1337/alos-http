@@ -14,7 +14,26 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/guno1928/turbo"
 )
+
+const (
+	goroutineGrowthAllowance = 25
+	poolIdleGap              = 150 * time.Millisecond
+)
+
+func settledGoroutines(baseline int) int {
+	deadline := turbo.Deadline(harnessIOTimeout)
+	for {
+		runtime.GC()
+		n := runtime.NumGoroutine()
+		if n-baseline <= goroutineGrowthAllowance || turbo.Until(deadline) <= 0 {
+			return n
+		}
+		turbo.Sleep(harnessPollInterval)
+	}
+}
 
 // ---------- backend misbehaviour ----------
 
@@ -359,11 +378,9 @@ func TestDeepNoGoroutineGrowthUnderLoad(t *testing.T) {
 	before := runtime.NumGoroutine()
 
 	do(500)
-	runtime.GC()
-	time.Sleep(150 * time.Millisecond)
-	after := runtime.NumGoroutine()
+	after := settledGoroutines(before)
 
-	if after-before > 25 {
+	if after-before > goroutineGrowthAllowance {
 		t.Fatalf("500 proxied requests grew goroutines from %d to %d", before, after)
 	}
 }
@@ -384,10 +401,8 @@ func TestDeepConnectionChurnDoesNotLeak(t *testing.T) {
 		io.ReadAll(conn)
 		conn.Close()
 	}
-	runtime.GC()
-	time.Sleep(200 * time.Millisecond)
-	after := runtime.NumGoroutine()
-	if after-before > 25 {
+	after := settledGoroutines(before)
+	if after-before > goroutineGrowthAllowance {
 		t.Fatalf("300 connection open/close cycles grew goroutines from %d to %d", before, after)
 	}
 }
@@ -450,7 +465,7 @@ func TestDeepPoolSurvivesIdlePeriod(t *testing.T) {
 	if resp, body := doProxyGet(t, addr, "/1"); resp.StatusCode != 200 || body != "still-here" {
 		t.Fatalf("first request failed: %d %q", resp.StatusCode, body)
 	}
-	time.Sleep(400 * time.Millisecond) // well inside IdleTimeout
+	time.Sleep(poolIdleGap) // well inside IdleTimeout
 	if resp, body := doProxyGet(t, addr, "/2"); resp.StatusCode != 200 || body != "still-here" {
 		t.Fatalf("request after an idle gap failed: %d %q", resp.StatusCode, body)
 	}

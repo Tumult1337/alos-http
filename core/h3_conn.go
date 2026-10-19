@@ -1,8 +1,8 @@
+//go:build linux && amd64
+
 package core
 
-import (
-	"log"
-)
+import ()
 
 // H3Conn represents an HTTP/3 connection layered on a QUICConn. It manages
 // the control and QPACK streams and dispatches incoming request streams to
@@ -12,6 +12,12 @@ type H3Conn struct {
 	server     *Server
 	remoteAddr string
 	decoder    QPACKDecoder
+
+	controlID       uint64
+	peerStreams     map[uint64]*h3PeerStream
+	peerControlSeen bool
+	peerEncoderSeen bool
+	peerDecoderSeen bool
 }
 
 func newH3Conn(qconn *QUICConn) *H3Conn {
@@ -27,15 +33,31 @@ func newH3Conn(qconn *QUICConn) *H3Conn {
 func (h3 *H3Conn) start() {
 	h3.sendControlStream()
 	h3.sendQPACKStreams()
+	for _, s := range h3.qconn.acquirePeerUniStreams() {
+		h3.readPeerStream(s)
+		h3.qconn.releaseStream(s)
+	}
 }
 
 func (h3 *H3Conn) sendControlStream() {
 	s := h3.qconn.openLocalUniStream()
+	h3.controlID = s.id
 	var buf []byte
 	buf = h3AppendStreamType(buf, h3StreamControl)
 	buf = h3AppendSettingsFrame(buf)
 	s.Write(buf)
 	h3.qconn.sendStreamData(s)
+}
+
+func (h3 *H3Conn) sendGoAway(id uint64) {
+	s := h3.qconn.acquireStream(h3.controlID)
+	if s == nil {
+		return
+	}
+	defer h3.qconn.releaseStream(s)
+	if s.Write(h3AppendFrame(nil, h3FrameGoaway, quicAppendVarint(nil, id))) == nil {
+		h3.qconn.sendStreamData(s)
+	}
 }
 
 func (h3 *H3Conn) sendQPACKStreams() {
@@ -53,17 +75,27 @@ func (h3 *H3Conn) sendQPACKStreams() {
 }
 
 func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
-	var arenaPtr *[]byte
+	var arenaPtr, trailerArenaPtr *[]byte
+	var handlerReq *Request
 	defer func() {
+		r := recover()
+		if r != nil {
+			h3.server.reportPanic(handlerReq, r)
+		}
+		if handlerReq != nil {
+			s.endHandler(handlerReq)
+		}
 		if arenaPtr != nil {
 			putBoxedBufCapped(&qpackArenaPool, arenaPtr, qpackArenaPoolMaxCap)
 		}
-		if r := recover(); r != nil {
-			log.Printf("[H3-PANIC] handleRequestStream: %v", r)
+		if trailerArenaPtr != nil {
+			putBoxedBufCapped(&qpackArenaPool, trailerArenaPtr, qpackArenaPoolMaxCap)
+		}
+		if r != nil {
 			h3.writeErrorResponse(s, 500)
 		}
 	}()
-	data, err := s.ReadAll()
+	data, err := s.readRequest()
 	if err != nil {
 		return
 	}
@@ -75,6 +107,8 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 	req := RequestPool.Get().(*Request)
 	req.Reset()
 
+	var meta hpackRequestMeta
+	headersSeen, trailersSeen := false, false
 	reader := h3FrameReader{data: data}
 	for {
 		frameType, payload, ok := reader.next()
@@ -83,97 +117,108 @@ func (h3 *H3Conn) handleRequestStream(s *QUICStream) {
 		}
 		switch frameType {
 		case h3FrameHeaders:
-			var decErr error
-			if cached, hit := qpackDecodedBlocks.get(payload); hit {
-				req.Headers = append(req.Headers, cached...)
-				break
+			if trailersSeen {
+				h3.abortRequestStream(req, "HEADERS frame after trailers")
+				return
 			}
-			hadHeaders := len(req.Headers) > 0
-			var ap *[]byte
-			req.Headers, ap, decErr = h3.decoder.DecodeAppend(payload, req.Headers)
-			if arenaPtr == nil {
-				arenaPtr = ap
+			status := 0
+			if headersSeen {
+				trailersSeen = true
+				trailerArenaPtr, status = h3.decodeTrailerSection(payload, req)
+			} else {
+				headersSeen = true
+				meta, arenaPtr, status = h3.decodeRequestSection(payload, req)
 			}
-			if decErr == nil && !hadHeaders {
-				qpackDecodedBlocks.put(payload, req.Headers)
-			}
-			if decErr != nil {
-				if debugFlag.Load() {
-					log.Printf("[H3] QPACK decode error: %v", decErr)
-				}
-				releaseRequestToPool(req)
-				h3.writeErrorResponse(s, 400)
+			if status != 0 {
+				h3.rejectRequest(s, req, status)
 				return
 			}
 		case h3FrameData:
+			if !headersSeen || trailersSeen {
+				h3.abortRequestStream(req, "DATA frame outside the request body")
+				return
+			}
 			req.Body = append(req.Body, payload...)
-			if max := h3.server.config.MaxBodySize; max > 0 && int64(len(req.Body)) > max {
-				releaseRequestToPool(req)
-				h3.writeErrorResponse(s, 413)
+			if h3.server.limits.Load().bodyTooLarge(int64(len(req.Body))) {
+				h3.rejectRequest(s, req, 413)
+				return
+			}
+		case h3FrameSettings, h3FrameGoaway, h3FrameMaxPushID, h3FrameCancelPush, h3FramePushPromise:
+			h3.abortRequestStream(req, "control frame on a request stream")
+			return
+		default:
+			if h3FrameTypeReservedFromHTTP2(frameType) {
+				h3.abortRequestStream(req, "HTTP/2 frame type on a request stream")
 				return
 			}
 		}
 	}
 
-	var method, path, authority, scheme, query, rawPath string
-	n := 0
-	for _, h := range req.Headers {
-		switch h[0] {
-		case ":method":
-			method = h[1]
-		case ":path":
-			rawPath = h[1]
-			path = sanitizeRequestPath(h[1])
-			_, query = splitPathQuery(h[1])
-		case ":authority":
-			authority = h[1]
-		case ":scheme":
-			scheme = h[1]
-		default:
-			req.Headers[n] = h
-			n++
-		}
-	}
-	req.Headers = req.Headers[:n]
-
-	if method == "" || path == "" {
-		releaseRequestToPool(req)
-		h3.writeErrorResponse(s, 400)
+	if !headersSeen || meta.path == "" {
+		h3.rejectRequest(s, req, 400)
 		return
 	}
-	_ = scheme
+	if declared := meta.declaredLength(); declared >= 0 && declared != int64(len(req.Body)) {
+		h3.rejectRequest(s, req, 400)
+		return
+	}
 
 	Stats.RawReqs.Add(1)
-	req.Method = method
-	req.Path = path
-	req.RawPath = rawPath
-	req.Query = query
+	req.Method = meta.method
+	req.Path = meta.path
+	req.RawPath = meta.rawPath
+	req.Query = meta.query
 	req.Proto = "HTTP/3"
-	req.Host = authority
-	req.cachedHost = authority
+	req.Host = meta.authority
+	req.cachedHost = meta.authority
 	req.headerCacheMask = headerCacheHost
 	req.RemoteAddr = h3.remoteAddr
 	req.IsH2 = false
 	req.IsTLS = true
+	req.peerCerts = h3.qconn.peerCerts
+	req.TLSVersion = TLSVersion13
 	req.server = h3.server
 	req.aliasesReadBuf = true
+	if h3.server.misdirectsClientAuth(h3.qconn.tlsCertEntry, meta.authority) {
+		releaseRequestToPool(req)
+		h3.writeErrorResponse(s, 421)
+		return
+	}
 
 	resp := ResponsePool.Get().(*Response)
 	resp.Reset()
 	resp.lazyReq = req
 
-	if h3.server.fastDispatch.Load() {
-		promoteRequestStrings(req)
-		handler := h3.server.Router.Lookup(req.Method, req.Path, req)
-		handler(req, resp)
-	} else {
-		h3.server.dispatch(req, resp)
-	}
-
+	Stats.TotalReqs.Add(1)
+	handlerReq = req
+	s.beginHandler(req)
+	h3.dispatchRequest(req, resp)
+	s.endHandler(req)
+	handlerReq = nil
 	h3.writeResponse(s, resp)
 
 	releaseRequestToPool(req)
 	releaseResponseToPool(resp)
+}
+
+func (h3 *H3Conn) dispatchRequest(req *Request, resp *Response) {
+	if h3.server.fastDispatch.Load() {
+		promoteRequestStrings(req)
+		handler := h3.server.Router.Lookup(req.Method, req.Path, req)
+		handler(req, resp)
+		return
+	}
+	h3.server.dispatch(req, resp)
+}
+
+func (h3 *H3Conn) rejectRequest(s *QUICStream, req *Request, status int) {
+	releaseRequestToPool(req)
+	h3.writeErrorResponse(s, status)
+}
+
+func (h3 *H3Conn) abortRequestStream(req *Request, reason string) {
+	releaseRequestToPool(req)
+	h3.qconn.closeWithAppError(h3ErrFrameUnexpected, reason)
 }
 
 func (h3 *H3Conn) writeErrorResponse(s *QUICStream, status int) {
@@ -207,5 +252,7 @@ func (h3 *H3Conn) writeResponse(s *QUICStream, resp *Response) {
 	if s.sendBufDrained() {
 		*fbp = frames
 		putBoxedBufCapped(&h3FrameBufPool, fbp, h3FrameBufPoolMaxCap)
+		return
 	}
+	h3.qconn.trackStalledSend(s)
 }

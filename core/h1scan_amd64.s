@@ -1,0 +1,475 @@
+//go:build linux && amd64
+
+#include "textflag.h"
+
+DATA h1ctlmax<>+0(SB)/8, $0x1F1F1F1F1F1F1F1F
+DATA h1ctlmax<>+8(SB)/8, $0x1F1F1F1F1F1F1F1F
+DATA h1ctlmax<>+16(SB)/8, $0x1F1F1F1F1F1F1F1F
+DATA h1ctlmax<>+24(SB)/8, $0x1F1F1F1F1F1F1F1F
+GLOBL h1ctlmax<>(SB), RODATA|NOPTR, $32
+
+DATA h1tab<>+0(SB)/8, $0x0909090909090909
+DATA h1tab<>+8(SB)/8, $0x0909090909090909
+DATA h1tab<>+16(SB)/8, $0x0909090909090909
+DATA h1tab<>+24(SB)/8, $0x0909090909090909
+GLOBL h1tab<>(SB), RODATA|NOPTR, $32
+
+DATA h1del<>+0(SB)/8, $0x7F7F7F7F7F7F7F7F
+DATA h1del<>+8(SB)/8, $0x7F7F7F7F7F7F7F7F
+DATA h1del<>+16(SB)/8, $0x7F7F7F7F7F7F7F7F
+DATA h1del<>+24(SB)/8, $0x7F7F7F7F7F7F7F7F
+GLOBL h1del<>(SB), RODATA|NOPTR, $32
+
+TEXT ·firstH1SpecialAVX2(SB), NOSPLIT, $0-24
+	MOVQ p+0(FP), SI
+	MOVQ n+8(FP), CX
+	XORQ AX, AX
+	CMPQ CX, $32
+	JL   tail
+	VMOVDQU h1ctlmax<>(SB), Y5
+	VMOVDQU h1tab<>(SB), Y6
+	VMOVDQU h1del<>(SB), Y7
+
+loop:
+	MOVQ AX, DX
+	ADDQ $32, DX
+	CMPQ DX, CX
+	JG   vtail
+	VMOVDQU  (SI)(AX*1), Y0
+	VPMINUB  Y5, Y0, Y1
+	VPCMPEQB Y0, Y1, Y1
+	VPCMPEQB Y6, Y0, Y2
+	VPXOR    Y2, Y1, Y1
+	VPCMPEQB Y7, Y0, Y3
+	VPOR     Y3, Y1, Y1
+	VPMOVMSKB Y1, BX
+	TESTL    BX, BX
+	JNZ      vfound
+	ADDQ     $32, AX
+	JMP      loop
+
+vfound:
+	BSFL BX, BX
+	ADDQ BX, AX
+	VZEROUPPER
+	MOVQ AX, ret+16(FP)
+	RET
+
+vtail:
+	CMPQ AX, CX
+	JGE  vnotfound
+	MOVQ CX, DI
+	SUBQ $32, DI
+	VMOVDQU  (SI)(DI*1), Y0
+	VPMINUB  Y5, Y0, Y1
+	VPCMPEQB Y0, Y1, Y1
+	VPCMPEQB Y6, Y0, Y2
+	VPXOR    Y2, Y1, Y1
+	VPCMPEQB Y7, Y0, Y3
+	VPOR     Y3, Y1, Y1
+	VPMOVMSKB Y1, BX
+	MOVQ AX, CX
+	SUBQ DI, CX
+	SHRL CX, BX
+	TESTL BX, BX
+	JZ   vnotfound
+	BSFL BX, BX
+	ADDQ BX, AX
+	VZEROUPPER
+	MOVQ AX, ret+16(FP)
+	RET
+
+vnotfound:
+	VZEROUPPER
+	MOVQ $-1, ret+16(FP)
+	RET
+
+tail:
+	CMPQ AX, CX
+	JGE  notfound
+	MOVBLZX (SI)(AX*1), DX
+	CMPB DL, $0x7F
+	JE   found
+	CMPB DL, $0x1F
+	JA   next
+	CMPB DL, $0x09
+	JNE  found
+
+next:
+	INCQ AX
+	JMP  tail
+
+found:
+	MOVQ AX, ret+16(FP)
+	RET
+
+notfound:
+	MOVQ $-1, ret+16(FP)
+	RET
+
+DATA h1tcharlo<>+0(SB)/8, $0xFCFCFCFCFCF8FCE8
+DATA h1tcharlo<>+8(SB)/8, $0x70F454D054F4F8F8
+DATA h1tcharlo<>+16(SB)/8, $0xFCFCFCFCFCF8FCE8
+DATA h1tcharlo<>+24(SB)/8, $0x70F454D054F4F8F8
+GLOBL h1tcharlo<>(SB), RODATA|NOPTR, $32
+
+DATA h1tcharhi<>+0(SB)/8, $0x8040201008040201
+DATA h1tcharhi<>+8(SB)/8, $0x0000000000000000
+DATA h1tcharhi<>+16(SB)/8, $0x8040201008040201
+DATA h1tcharhi<>+24(SB)/8, $0x0000000000000000
+GLOBL h1tcharhi<>(SB), RODATA|NOPTR, $32
+
+DATA h1nibble<>+0(SB)/8, $0x0F0F0F0F0F0F0F0F
+DATA h1nibble<>+8(SB)/8, $0x0F0F0F0F0F0F0F0F
+DATA h1nibble<>+16(SB)/8, $0x0F0F0F0F0F0F0F0F
+DATA h1nibble<>+24(SB)/8, $0x0F0F0F0F0F0F0F0F
+GLOBL h1nibble<>(SB), RODATA|NOPTR, $32
+
+
+TEXT ·h1HeaderLineAVX2(SB), NOSPLIT, $0-32
+	MOVQ p+0(FP), SI
+	MOVQ n+8(FP), CX
+	XORQ AX, AX
+	MOVQ $-1, R10
+	VMOVDQU h1ctlmax<>(SB), Y5
+	VMOVDQU h1tab<>(SB), Y6
+	VMOVDQU h1del<>(SB), Y7
+	VMOVDQU h1tcharlo<>(SB), Y9
+	VMOVDQU h1tcharhi<>(SB), Y10
+	VMOVDQU h1nibble<>(SB), Y11
+	VPXOR   Y8, Y8, Y8
+
+hloop:
+	MOVQ AX, DX
+	ADDQ $32, DX
+	CMPQ DX, CX
+	JG   htail
+	VMOVDQU (SI)(AX*1), Y0
+	TESTQ   R10, R10
+	JNS     hspecial
+	VPAND    Y11, Y0, Y1
+	VPSRLW   $4, Y0, Y2
+	VPAND    Y11, Y2, Y2
+	VPSHUFB  Y1, Y9, Y1
+	VPSHUFB  Y2, Y10, Y2
+	VPAND    Y2, Y1, Y1
+	VPCMPEQB Y8, Y1, Y1
+	VPMOVMSKB Y1, BX
+	TESTL    BX, BX
+	JZ       hspecial
+	BSFL     BX, BX
+	LEAQ     (AX)(BX*1), R10
+
+hspecial:
+	VPMINUB  Y5, Y0, Y1
+	VPCMPEQB Y0, Y1, Y1
+	VPCMPEQB Y6, Y0, Y2
+	VPXOR    Y2, Y1, Y1
+	VPCMPEQB Y7, Y0, Y3
+	VPOR     Y3, Y1, Y1
+	VPMOVMSKB Y1, BX
+	TESTL    BX, BX
+	JNZ      hfound
+	ADDQ     $32, AX
+	JMP      hloop
+
+hfound:
+	BSFL BX, BX
+	ADDQ BX, AX
+	VZEROUPPER
+	MOVQ AX, special+16(FP)
+	MOVQ R10, nameEnd+24(FP)
+	RET
+
+htail:
+	CMPQ AX, CX
+	JGE  hnotfound
+	MOVQ CX, DI
+	SUBQ $32, DI
+	VMOVDQU (SI)(DI*1), Y0
+	MOVQ AX, R8
+	SUBQ DI, R8
+	MOVQ R8, CX
+	TESTQ R10, R10
+	JNS   htspecial
+	VPAND    Y11, Y0, Y1
+	VPSRLW   $4, Y0, Y2
+	VPAND    Y11, Y2, Y2
+	VPSHUFB  Y1, Y9, Y1
+	VPSHUFB  Y2, Y10, Y2
+	VPAND    Y2, Y1, Y1
+	VPCMPEQB Y8, Y1, Y1
+	VPMOVMSKB Y1, BX
+	SHRL     CX, BX
+	TESTL    BX, BX
+	JZ       htspecial
+	BSFL     BX, BX
+	LEAQ     (AX)(BX*1), R10
+
+htspecial:
+	VPMINUB  Y5, Y0, Y1
+	VPCMPEQB Y0, Y1, Y1
+	VPCMPEQB Y6, Y0, Y2
+	VPXOR    Y2, Y1, Y1
+	VPCMPEQB Y7, Y0, Y3
+	VPOR     Y3, Y1, Y1
+	VPMOVMSKB Y1, BX
+	SHRL     CX, BX
+	TESTL    BX, BX
+	JZ       hnotfound
+	BSFL     BX, BX
+	ADDQ     BX, AX
+	VZEROUPPER
+	MOVQ AX, special+16(FP)
+	MOVQ R10, nameEnd+24(FP)
+	RET
+
+hnotfound:
+	VZEROUPPER
+	MOVQ $-1, special+16(FP)
+	MOVQ R10, nameEnd+24(FP)
+	RET
+
+DATA h1blkcr<>+0(SB)/8, $0x0D0D0D0D0D0D0D0D
+DATA h1blkcr<>+8(SB)/8, $0x0D0D0D0D0D0D0D0D
+DATA h1blkcr<>+16(SB)/8, $0x0D0D0D0D0D0D0D0D
+DATA h1blkcr<>+24(SB)/8, $0x0D0D0D0D0D0D0D0D
+GLOBL h1blkcr<>(SB), RODATA|NOPTR, $32
+
+DATA h1blklf<>+0(SB)/8, $0x0A0A0A0A0A0A0A0A
+DATA h1blklf<>+8(SB)/8, $0x0A0A0A0A0A0A0A0A
+DATA h1blklf<>+16(SB)/8, $0x0A0A0A0A0A0A0A0A
+DATA h1blklf<>+24(SB)/8, $0x0A0A0A0A0A0A0A0A
+GLOBL h1blklf<>(SB), RODATA|NOPTR, $32
+
+DATA h1blkcolon<>+0(SB)/8, $0x3A3A3A3A3A3A3A3A
+DATA h1blkcolon<>+8(SB)/8, $0x3A3A3A3A3A3A3A3A
+DATA h1blkcolon<>+16(SB)/8, $0x3A3A3A3A3A3A3A3A
+DATA h1blkcolon<>+24(SB)/8, $0x3A3A3A3A3A3A3A3A
+GLOBL h1blkcolon<>(SB), RODATA|NOPTR, $32
+
+DATA h1blkpad<>+0(SB)/8, $0x6161616161616161
+DATA h1blkpad<>+8(SB)/8, $0x6161616161616161
+DATA h1blkpad<>+16(SB)/8, $0x6161616161616161
+DATA h1blkpad<>+24(SB)/8, $0x6161616161616161
+GLOBL h1blkpad<>(SB), RODATA|NOPTR, $32
+
+DATA h1blk20<>+0(SB)/8, $0x2020202020202020
+DATA h1blk20<>+8(SB)/8, $0x2020202020202020
+DATA h1blk20<>+16(SB)/8, $0x2020202020202020
+DATA h1blk20<>+24(SB)/8, $0x2020202020202020
+GLOBL h1blk20<>(SB), RODATA|NOPTR, $32
+
+DATA h1blkc<>+0(SB)/8, $0x6363636363636363
+DATA h1blkc<>+8(SB)/8, $0x6363636363636363
+DATA h1blkc<>+16(SB)/8, $0x6363636363636363
+DATA h1blkc<>+24(SB)/8, $0x6363636363636363
+GLOBL h1blkc<>(SB), RODATA|NOPTR, $32
+
+DATA h1blke<>+0(SB)/8, $0x6565656565656565
+DATA h1blke<>+8(SB)/8, $0x6565656565656565
+DATA h1blke<>+16(SB)/8, $0x6565656565656565
+DATA h1blke<>+24(SB)/8, $0x6565656565656565
+GLOBL h1blke<>(SB), RODATA|NOPTR, $32
+
+DATA h1blkh<>+0(SB)/8, $0x6868686868686868
+DATA h1blkh<>+8(SB)/8, $0x6868686868686868
+DATA h1blkh<>+16(SB)/8, $0x6868686868686868
+DATA h1blkh<>+24(SB)/8, $0x6868686868686868
+GLOBL h1blkh<>(SB), RODATA|NOPTR, $32
+
+DATA h1blkt<>+0(SB)/8, $0x7474747474747474
+DATA h1blkt<>+8(SB)/8, $0x7474747474747474
+DATA h1blkt<>+16(SB)/8, $0x7474747474747474
+DATA h1blkt<>+24(SB)/8, $0x7474747474747474
+GLOBL h1blkt<>(SB), RODATA|NOPTR, $32
+
+#define BLK_NONTOKEN(src, dst) \
+	VPAND    Y11, src, dst; \
+	VPSRLW   $4, src, Y3; \
+	VPAND    Y11, Y3, Y3; \
+	VPSHUFB  dst, Y9, dst; \
+	VPSHUFB  Y3, Y10, Y3; \
+	VPAND    Y3, dst, dst; \
+	VPCMPEQB Y8, dst, dst
+
+#define BLK_BADCTL(src) \
+	VPCMPEQB Y12, src, Y3; \
+	VPCMPEQB Y13, src, Y4; \
+	VPOR     Y3, Y4, Y4; \
+	VPMINUB  Y5, src, Y2; \
+	VPCMPEQB src, Y2, Y2; \
+	VPCMPEQB Y6, src, Y3; \
+	VPXOR    Y3, Y2, Y2; \
+	VPCMPEQB Y7, src, Y3; \
+	VPOR     Y3, Y2, Y2; \
+	VPANDN   Y2, Y4, Y2; \
+	VPTEST   Y2, Y2
+
+#define BLK_MASK64(cmplo, cmphi, dst) \
+	VPMOVMSKB cmplo, dst; \
+	VPMOVMSKB cmphi, BX; \
+	SHLQ      $32, BX; \
+	ORQ       BX, dst
+
+TEXT ·h1BlockIndexAVX2(SB), NOSPLIT, $72-25
+	MOVQ p+0(FP), SI
+	MOVQ n+8(FP), CX
+	MOVQ out+16(FP), DI
+	XORQ AX, AX
+	XORQ R9, R9
+	MOVQ $1, R10
+	XORQ R11, R11
+	XORQ R12, R12
+	MOVQ $-1, BX
+	MOVQ BX, 64(SP)
+	VMOVDQU h1ctlmax<>(SB), Y5
+	VMOVDQU h1tab<>(SB), Y6
+	VMOVDQU h1del<>(SB), Y7
+	VPXOR   Y8, Y8, Y8
+	VMOVDQU h1tcharlo<>(SB), Y9
+	VMOVDQU h1tcharhi<>(SB), Y10
+	VMOVDQU h1nibble<>(SB), Y11
+	VMOVDQU h1blkcr<>(SB), Y12
+	VMOVDQU h1blklf<>(SB), Y13
+	VMOVDQU h1blkcolon<>(SB), Y14
+
+bchunk:
+	MOVQ CX, BX
+	SUBQ AX, BX
+	JLE  bdone
+	CMPQ BX, $64
+	JL   btailprep
+	VMOVDQU (SI)(AX*1), Y0
+	VMOVDQU 32(SI)(AX*1), Y1
+	ADDQ    $64, AX
+	JMP     bprocess
+
+btailprep:
+	MOVQ    BX, CX
+	MOVQ    $1, DX
+	SHLQ    CX, DX
+	DECQ    DX
+	MOVQ    DX, 64(SP)
+	VMOVDQU h1blkpad<>(SB), Y15
+	VMOVDQU Y15, 0(SP)
+	VMOVDQU Y15, 32(SP)
+	LEAQ    (SI)(AX*1), R14
+	XORQ    R13, R13
+
+btailcopy8:
+	LEAQ 8(R13), DX
+	CMPQ DX, CX
+	JG   btailcopy1
+	MOVQ (R14)(R13*1), DX
+	MOVQ DX, (SP)(R13*1)
+	ADDQ $8, R13
+	JMP  btailcopy8
+
+btailcopy1:
+	CMPQ    R13, CX
+	JGE     btailloaded
+	MOVBLZX (R14)(R13*1), DX
+	MOVB    DX, (SP)(R13*1)
+	INCQ    R13
+	JMP     btailcopy1
+
+btailloaded:
+	ADDQ    CX, AX
+	MOVQ    AX, CX
+	VMOVDQU 0(SP), Y0
+	VMOVDQU 32(SP), Y1
+
+bprocess:
+	BLK_BADCTL(Y0)
+	JNZ bfail
+	BLK_BADCTL(Y1)
+	JNZ bfail
+
+	BLK_NONTOKEN(Y0, Y2)
+	BLK_NONTOKEN(Y1, Y4)
+	BLK_MASK64(Y2, Y4, R14)
+	NOTQ R14
+
+	VPCMPEQB Y12, Y0, Y2
+	VPCMPEQB Y12, Y1, Y4
+	BLK_MASK64(Y2, Y4, DX)
+
+	VPCMPEQB Y13, Y0, Y2
+	VPCMPEQB Y13, Y1, Y4
+	BLK_MASK64(Y2, Y4, R13)
+
+	VPCMPEQB Y14, Y0, Y2
+	VPCMPEQB Y14, Y1, Y4
+	BLK_MASK64(Y2, Y4, R15)
+
+	VPOR     h1blk20<>(SB), Y0, Y2
+	VPCMPEQB h1blkc<>(SB), Y2, Y3
+	VPCMPEQB h1blke<>(SB), Y2, Y4
+	VPOR     Y4, Y3, Y3
+	VPCMPEQB h1blkh<>(SB), Y2, Y4
+	VPOR     Y4, Y3, Y3
+	VPCMPEQB h1blkt<>(SB), Y2, Y4
+	VPOR     Y4, Y3, Y3
+	VPOR     h1blk20<>(SB), Y1, Y2
+	VPCMPEQB h1blkc<>(SB), Y2, Y15
+	VPCMPEQB h1blke<>(SB), Y2, Y4
+	VPOR     Y4, Y15, Y15
+	VPCMPEQB h1blkh<>(SB), Y2, Y4
+	VPOR     Y4, Y15, Y15
+	VPCMPEQB h1blkt<>(SB), Y2, Y4
+	VPOR     Y4, Y15, Y15
+	BLK_MASK64(Y3, Y15, R8)
+
+	MOVQ DX, BX
+	SHLQ $1, BX
+	ORQ  R9, BX
+	XORQ R13, BX
+	ORQ  BX, R12
+	MOVQ DX, R9
+	SHRQ $63, R9
+
+	MOVQ R13, BX
+	SHLQ $1, BX
+	ORQ  R10, BX
+	ANDQ 64(SP), BX
+	MOVQ R13, R10
+	SHRQ $63, R10
+	MOVQ BX, (DI)
+	ANDQ BX, R8
+	MOVQ R8, 256(DI)
+
+	MOVQ R14, R13
+	NOTQ R13
+	ANDQ BX, R13
+	ORQ  R13, R12
+
+	ANDQ    R14, BX
+	BTQ     $0, R11
+	ADCQ    R14, BX
+	SETCS   R11B
+	MOVBQZX R11B, R11
+	MOVQ    R14, R13
+	NOTQ    R13
+	ANDQ    R13, BX
+	MOVQ    BX, 128(DI)
+	ADDQ    $8, DI
+
+	MOVQ R15, R13
+	NOTQ R13
+	ANDQ BX, R13
+	ORQ  R13, R12
+	JMP  bchunk
+
+bdone:
+	VZEROUPPER
+	ORQ   R9, R12
+	ORQ   R11, R12
+	TESTQ R12, R12
+	SETEQ ret+24(FP)
+	RET
+
+bfail:
+	VZEROUPPER
+	MOVB $0, ret+24(FP)
+	RET

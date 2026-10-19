@@ -1,8 +1,11 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -194,11 +197,14 @@ func TestCache_TTLExpiry_HandlerCalledAgain(t *testing.T) {
 	var calls int32
 	h := func(req *Request, resp *Response) { atomic.AddInt32(&calls, 1); resp.Status(200).String("x") }
 	rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
-	time.Sleep(200 * time.Millisecond)
 	rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
-	if calls != 2 {
-		t.Fatalf("handler called %d times, want 2 after TTL expiry", calls)
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("handler called %d times before the TTL elapsed, want 1", got)
 	}
+	waitForPool(t, "the cached entry to expire", func() bool {
+		rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
+		return atomic.LoadInt32(&calls) == 2
+	})
 }
 
 func TestCache_MethodGETCached(t *testing.T) {
@@ -527,7 +533,7 @@ func TestCache_Skip_LargeBody(t *testing.T) {
 func TestCache_Skip_Streamed(t *testing.T) {
 	rc := NewResponseCache(CacheConfig{TTL: time.Minute})
 	defer rc.Stop()
-	if rc.captureAndStore("k", nil) != nil {
+	if rc.captureAndStore("k", "GET", nil) != nil {
 		t.Fatal("nil resp must not cache")
 	}
 }
@@ -603,30 +609,66 @@ func TestCache_Len_Reflects(t *testing.T) {
 func TestCache_Concurrent_RaceFree(t *testing.T) {
 	rc := NewResponseCache(CacheConfig{TTL: time.Minute, Gzip: true, GzipMinBytes: 10})
 	defer rc.Stop()
-	h := func(req *Request, resp *Response) { resp.Status(200).String(bigBody(300)) }
+	const goroutines, iterations, paths = 32, 100, 8
+	var calls atomic.Int32
+	h := func(req *Request, resp *Response) {
+		calls.Add(1)
+		resp.Status(200).String(req.Path + bigBody(300))
+	}
 	var wg sync.WaitGroup
-	for g := 0; g < 32; g++ {
+	for g := 0; g < goroutines; g++ {
 		wg.Add(1)
-		go func(g int) {
+		go func() {
 			defer wg.Done()
-			for i := 0; i < 100; i++ {
-				path := "/p" + string(rune('A'+(i%8)))
-				rc.handle(h, cReq("GET", "x", path, "", gzHdr()), cResp())
+			for i := 0; i < iterations; i++ {
+				path := "/p" + string(rune('A'+(i%paths)))
+				resp := cResp()
+				rc.handle(h, cReq("GET", "x", path, "", gzHdr()), resp)
+				if err := appFixCheckCachedBody(resp, path+bigBody(300)); err != nil {
+					t.Errorf("GET %s: %v", path, err)
+					return
+				}
 			}
-		}(g)
+		}()
 	}
 	wg.Wait()
+	if rc.Len() != paths {
+		t.Fatalf("cache holds %d entries after %d distinct paths", rc.Len(), paths)
+	}
+	if got := calls.Load(); got < paths || got > goroutines*paths {
+		t.Fatalf("handler ran %d times, want between %d and %d: each goroutine may miss each path at most once", got, paths, goroutines*paths)
+	}
+}
+
+func appFixCheckCachedBody(resp *Response, want string) error {
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("status %d", resp.StatusCode)
+	}
+	body := resp.transmittedBodyBytes()
+	if enc, _ := respHeader(resp, "Content-Encoding"); enc == "gzip" {
+		gr, err := gzip.NewReader(bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		if body, err = io.ReadAll(gr); err != nil {
+			return err
+		}
+	}
+	if string(body) != want {
+		return fmt.Errorf("body %q, want %q", body, want)
+	}
+	return nil
 }
 
 func TestCache_Key_Format(t *testing.T) {
 	rc := NewResponseCache(CacheConfig{})
 	defer rc.Stop()
 	k := rc.key(cReq("GET", "host", "/p", "a=1"))
-	if k != "GET host/p?a=1" {
+	if k != "GET \x04host/p?a=1" {
 		t.Fatalf("key=%q", k)
 	}
 	rc.cfg.IgnoreQuery = true
-	if k2 := rc.key(cReq("GET", "host", "/p", "a=1")); k2 != "GET host/p" {
+	if k2 := rc.key(cReq("GET", "host", "/p", "a=1")); k2 != "GET \x04host/p" {
 		t.Fatalf("ignore-query key=%q", k2)
 	}
 }
@@ -660,9 +702,26 @@ func TestCache_Defaults_Applied(t *testing.T) {
 }
 
 func TestCache_Stop_NoPanic(t *testing.T) {
-	rc := NewResponseCache(CacheConfig{TTL: time.Minute, SweepInterval: 10 * time.Millisecond})
+	const sweepEvery, ttl, quietPeriod = 10 * time.Millisecond, 5 * time.Millisecond, 150 * time.Millisecond
+	rc := NewResponseCache(CacheConfig{TTL: ttl, SweepInterval: sweepEvery})
+	h := func(req *Request, resp *Response) { resp.Status(200).String("x") }
+	rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
+	waitForPool(t, "the sweeper to evict the expired entry", func() bool { return rc.Len() == 0 })
 	rc.Stop()
 	rc.Stop()
+	select {
+	case <-rc.stop:
+	default:
+		t.Fatal("Stop did not close the sweeper's stop channel")
+	}
+	turbo.Sleep(quietPeriod)
+	rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
+	turbo.Sleep(quietPeriod)
+	if rc.Len() != 1 {
+		t.Fatalf("expired entry was swept %v after Stop: the sweeper is still running", quietPeriod)
+	}
+	var nilCache *ResponseCache
+	nilCache.Stop()
 }
 
 func TestCache_compressibleType(t *testing.T) {

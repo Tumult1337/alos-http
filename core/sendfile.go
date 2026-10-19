@@ -1,7 +1,8 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -33,13 +34,7 @@ func WithAttachment(filename string) SendFileOption {
 //	resp.SendFile("video.mp4", core.WithRateLimit(50))  // 50 Mbps
 func WithRateLimit(mbps int64) SendFileOption {
 	return func(c *sendFileConfig) {
-		if mbps < 1 {
-			mbps = 1
-		}
-		if mbps > 250000 {
-			mbps = 250000
-		}
-		bytesPerSec := mbps * 125000
+		bytesPerSec := mbpsToBytesPerSec(max(mbps, 1))
 		c.rateLimit = bytesPerSec
 		if c.burstSize == 0 {
 			c.burstSize = bytesPerSec
@@ -53,17 +48,8 @@ func WithRateLimit(mbps int64) SendFileOption {
 //	resp.SendFile("file.zip", core.WithRateLimitBurst(10, 50))  // 10 Mbps steady, 50 Mbps burst
 func WithRateLimitBurst(mbps, burstMbps int64) SendFileOption {
 	return func(c *sendFileConfig) {
-		if mbps < 1 {
-			mbps = 1
-		}
-		if mbps > 250000 {
-			mbps = 250000
-		}
-		if burstMbps < 1 {
-			burstMbps = 1
-		}
-		c.rateLimit = mbps * 125000
-		c.burstSize = burstMbps * 125000
+		c.rateLimit = mbpsToBytesPerSec(max(mbps, 1))
+		c.burstSize = mbpsToBytesPerSec(max(burstMbps, 1))
 	}
 }
 
@@ -117,13 +103,13 @@ func sanitizeFilename(name string) string {
 //	    core.WithAttachment("demo.mp4"))
 const sendFileBufferedMax = 64 << 20
 
-func (r *Response) sendFileBuffered(f *os.File, size int64, contentType string, hdrs [][2]string) error {
-	if size > sendFileBufferedMax {
+func (r *Response) sendFileBuffered(f *os.File, start, length int64, status int, contentType string, hdrs [][2]string) error {
+	if length > sendFileBufferedMax {
 		r.Status(500).String("no stream writer available")
 		return ErrStreamClosed
 	}
-	body := make([]byte, size)
-	if _, err := io.ReadFull(f, body); err != nil {
+	body := make([]byte, length)
+	if _, err := io.ReadFull(io.NewSectionReader(f, start, length), body); err != nil {
 		r.Status(500).String("read error")
 		return err
 	}
@@ -132,7 +118,7 @@ func (r *Response) sendFileBuffered(f *os.File, size int64, contentType string, 
 			r.SetHeader(h[0], h[1])
 		}
 	}
-	r.Status(200).Bytes(body)
+	r.Status(status).Bytes(body)
 	r.ContentType = contentType
 	return nil
 }
@@ -198,67 +184,7 @@ func (r *Response) SendFile(path string, opts ...SendFileOption) error {
 	if ct == "" {
 		ct = detectMIME(path)
 	}
-
-	var hdrs [][2]string
-	if cfg.attachment != "" {
-		hdrs = append(hdrs, [2]string{
-			"content-disposition",
-			"attachment; filename=\"" + sanitizeFilename(cfg.attachment) + "\"",
-		})
-	}
-	var clBuf [20]byte
-	hdrs = append(hdrs, [2]string{
-		"content-length",
-		string(appendUint(clBuf[:0], fi.Size())),
-	})
-
-	sw := r.ensureSW()
-	if sw == nil {
-		return r.sendFileBuffered(f, fi.Size(), ct, hdrs)
-	}
-	if err := sw.WriteHeader(200, hdrs, ct); err != nil {
-		return err
-	}
-	r.SetStreamer(sw)
-
-	var limiter *TokenBucket
-	if cfg.rateLimit > 0 {
-		burst := cfg.burstSize
-		if burst <= 0 {
-			burst = cfg.rateLimit
-		}
-		limiter = NewTokenBucket(cfg.rateLimit, burst)
-	}
-
-	if sent, err := trySendFileFastPath(sw, f, fi.Size(), limiter); sent {
-		if err != nil {
-			return err
-		}
-		return sw.Close()
-	}
-
-	bp := FileReadBufPool.Get().(*[]byte)
-	buf := *bp
-	defer FileReadBufPool.Put(bp)
-
-	for {
-		n, readErr := f.Read(buf)
-		if n > 0 {
-			if limiter != nil {
-				limiter.Wait(int64(n))
-			}
-			if writeErr := sw.WriteChunk(buf[:n]); writeErr != nil {
-				return writeErr
-			}
-		}
-		if readErr != nil {
-			if errors.Is(readErr, io.EOF) {
-				break
-			}
-			return readErr
-		}
-	}
-	return sw.Close()
+	return r.serveContent(r.lazyReq, f, fi, ct, &cfg)
 }
 
 // Filename extracts the filename component from a file path, stripping any

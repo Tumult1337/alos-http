@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -32,6 +34,10 @@ type ServerStats struct {
 	_           [CacheLineSize - 8]byte
 	BlockedReqs atomic.Uint64
 	_           [CacheLineSize - 8]byte
+	H1Rejected  atomic.Uint64
+	_           [CacheLineSize - 8]byte
+	H3Conns     atomic.Uint64
+	_           [CacheLineSize - 8]byte
 
 	rawPerSec atomic.Uint64
 	_         [CacheLineSize - 8]byte
@@ -43,6 +49,36 @@ type ServerStats struct {
 // automatically by the server as connections are accepted and requests
 // are processed.
 var Stats ServerStats
+
+type StatsSnapshot struct {
+	ActiveConns int64
+	TotalConns  uint64
+	H1Conns     uint64
+	H2Conns     uint64
+	H3Conns     uint64
+	TotalReqs   uint64
+	RawReqs     uint64
+	BlockedReqs uint64
+	H1Rejected  uint64
+	BytesIn     uint64
+	BytesOut    uint64
+}
+
+func (s *ServerStats) Snapshot() StatsSnapshot {
+	return StatsSnapshot{
+		ActiveConns: s.ActiveConns.Load(),
+		TotalConns:  s.TotalConns.Load(),
+		H1Conns:     s.H1Conns.Load(),
+		H2Conns:     s.H2Conns.Load(),
+		H3Conns:     s.H3Conns.Load(),
+		TotalReqs:   s.TotalReqs.Load(),
+		RawReqs:     s.RawReqs.Load(),
+		BlockedReqs: s.BlockedReqs.Load(),
+		H1Rejected:  s.H1Rejected.Load(),
+		BytesIn:     s.BytesIn.Load(),
+		BytesOut:    s.BytesOut.Load(),
+	}
+}
 
 func (s *ServerStats) ReqsPerSec() uint64 { return s.rawPerSec.Load() }
 

@@ -10,9 +10,17 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/guno1928/turbo"
+)
+
+const (
+	heldOriginCeiling  = 2 * time.Second
+	slowBackendClients = 24
 )
 
 // inloopOrigin is a minimal HTTP/1.1 upstream whose behaviour each test drives
@@ -58,6 +66,30 @@ func (o *inloopOrigin) serve() {
 }
 
 func (o *inloopOrigin) addr() string { return o.ln.Addr().String() }
+
+type heldOrigin struct {
+	*inloopOrigin
+	arrived atomic.Int32
+	release chan struct{}
+	once    sync.Once
+}
+
+func newHeldOrigin(t *testing.T, body string) *heldOrigin {
+	t.Helper()
+	h := &heldOrigin{release: make(chan struct{})}
+	h.inloopOrigin = newInloopOrigin(t, func(req *http.Request, conn net.Conn, br *bufio.Reader) {
+		h.arrived.Add(1)
+		select {
+		case <-h.release:
+		case <-turbo.After(heldOriginCeiling):
+		}
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	})
+	t.Cleanup(h.releaseAll)
+	return h
+}
+
+func (h *heldOrigin) releaseAll() { h.once.Do(func() { close(h.release) }) }
 
 // startInloopProxy brings up a proxy server on the epoll path for one domain.
 func startInloopProxy(t *testing.T, cfg DomainConfig, tune func(*ProxyEngine)) string {
@@ -344,13 +376,10 @@ func TestInLoopProxyStopsReadingBackendForStalledClient(t *testing.T) {
 	defer conn.Close()
 	io.WriteString(conn, "GET /huge HTTP/1.1\r\nHost: origin.test\r\n\r\n")
 
-	// Read nothing at all and let the relay stall.
-	time.Sleep(600 * time.Millisecond)
-	stalled := written.Load()
-
 	// Socket buffers on both hops plus the proxy's own high-water mark account
 	// for a few MiB; anything near the full body means it never stopped.
 	const ceiling = 24 << 20
+	stalled := plateauOf(written.Load, ceiling)
 	if stalled > ceiling {
 		t.Fatalf("origin pushed %d MiB into the proxy while the client read nothing (ceiling %d MiB); backpressure is not holding",
 			stalled>>20, ceiling>>20)
@@ -404,7 +433,7 @@ func TestAppendProxyRequestDropsCRLFBearingFields(t *testing.T) {
 			{"X-Evil-Name\r\nX-Also-Injected: 1", "v"},
 		},
 	}
-	out := string(appendProxyRequest(nil, req, "origin.test", "1.2.3.4"))
+	out := string(appendProxyRequest(nil, withRemote(req, "1.2.3.4"), "origin.test"))
 
 	if strings.Contains(out, "X-Injected") || strings.Contains(out, "X-Also-Injected") {
 		t.Fatalf("CRLF in a header field forged an upstream header:\n%s", out)
@@ -423,7 +452,7 @@ func TestAppendProxyRequestSanitisesTargetAndHost(t *testing.T) {
 		Path:    "/x",
 		RawPath: "/x HTTP/1.1\r\nX-Injected: 1",
 	}
-	out := string(appendProxyRequest(nil, req, "origin.test", ""))
+	out := string(appendProxyRequest(nil, req, "origin.test"))
 	if strings.Contains(out, "X-Injected") {
 		t.Fatalf("CRLF in the request target forged a header:\n%s", out)
 	}
@@ -432,7 +461,7 @@ func TestAppendProxyRequestSanitisesTargetAndHost(t *testing.T) {
 	}
 
 	req = &Request{Method: "GET", Path: "/x", RawPath: "/x"}
-	out = string(appendProxyRequest(nil, req, "evil\r\nX-Injected: 1", ""))
+	out = string(appendProxyRequest(nil, req, "evil\r\nX-Injected: 1"))
 	if strings.Contains(out, "X-Injected") {
 		t.Fatalf("CRLF in the Host header forged a header:\n%s", out)
 	}
@@ -598,9 +627,4 @@ func waitForPort(t *testing.T, addr string) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("%s never accepted connections", addr)
-}
-
-// contextWithCancel is the non-testing.T variant used by benchmarks.
-func contextWithCancel() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), 2*time.Second)
 }

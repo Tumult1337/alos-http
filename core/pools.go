@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -29,12 +31,7 @@ var LargeBufPool = sync.Pool{
 
 // HdrBufPool pools 5-byte buffers sized for a TLS record header.
 var HdrBufPool = sync.Pool{
-	New: func() any { b := make([]byte, 5, 5); return &b },
-}
-
-// H2FrameBufPool pools byte slices sized for a maximum-size HTTP/2 frame plus its 9-byte header.
-var H2FrameBufPool = sync.Pool{
-	New: func() any { b := make([]byte, 0, H2DefaultMaxFrameSize+9); return &b },
+	New: func() any { b := make([]byte, 5); return &b },
 }
 
 // RequestPool pools reusable Request objects.
@@ -101,16 +98,6 @@ var H1StreamWriterPool = sync.Pool{
 // PlainH1StreamWriterPool pools reusable PlainH1StreamWriter objects.
 var PlainH1StreamWriterPool = sync.Pool{
 	New: func() any { return &PlainH1StreamWriter{} },
-}
-
-// H2StreamWriterPool pools reusable H2StreamWriter objects.
-var H2StreamWriterPool = sync.Pool{
-	New: func() any { return &H2StreamWriter{} },
-}
-
-// ErrChanPool pools buffered error channels with a capacity of 1.
-var ErrChanPool = sync.Pool{
-	New: func() any { return make(chan error, 1) },
 }
 
 // H2FramePool pools reusable H2Frame objects.

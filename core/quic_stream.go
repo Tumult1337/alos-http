@@ -1,16 +1,37 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"io"
-	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/guno1928/turbo"
 )
 
 type quicOOOSegment struct {
 	off  uint64
 	data []byte
 }
+
+func (seg *quicOOOSegment) end() uint64 {
+	return seg.off + uint64(len(seg.data))
+}
+
+const (
+	quicMinOOOSegmentCap     = 256
+	quicOOOWindowBytesPerGap = 1200
+	quicOOOSegmentOverhead   = 64
+)
+
+type quicOOOResult uint8
+
+const (
+	quicOOOStored quicOOOResult = iota
+	quicOOODropped
+	quicOOOTooManyGaps
+)
 
 func quicStreamIsLocal(id uint64, isServer bool) bool {
 	initiator := id & 0x01
@@ -37,7 +58,9 @@ type QUICStream struct {
 
 	recvBuf      []byte
 	recvBufP     *[]byte
-	recvOOO      []quicOOOSegment
+	recvOOO      quicOOOList
+	oooBytes     uint64
+	recvMax      uint64
 	recvOff      uint64
 	recvFin      bool
 	recvFinSeen  bool
@@ -55,8 +78,16 @@ type QUICStream struct {
 	sendClosed      bool
 	maxSend         uint64
 	blockedSent     uint64
+	stalledSend     int64
+	stallSince      int64
 	awaitingCleanup bool
 	recvAccounted   int64
+
+	recvReset   bool
+	sendReset   bool
+	inHandler   bool
+	peerAborted bool
+	cancel      cancelSlot
 }
 
 func newQUICStream(id uint64, conn *QUICConn) *QUICStream {
@@ -88,11 +119,11 @@ func quicStreamRecvCap(conn *QUICConn, window uint64) uint64 {
 	if conn == nil || conn.server == nil {
 		return window
 	}
-	cfg := &conn.server.config
-	if cfg.MaxBodySize < 0 {
+	limits := conn.server.limits.Load()
+	if limits.MaxBodySize < 0 {
 		return quicStreamRecvUnlimitedCap
 	}
-	capBytes := uint64(cfg.MaxBodySize) + uint64(cfg.MaxHeaderSize) + quicStreamRecvFrameSlack
+	capBytes := uint64(limits.MaxBodySize) + uint64(limits.MaxHeaderSize) + quicStreamRecvFrameSlack
 	if capBytes < window {
 		return window
 	}
@@ -103,6 +134,8 @@ const (
 	quicRecvAccepted = 1 << iota
 	quicRecvEndOfData
 	quicRecvViolation
+	quicRecvRejected
+	quicRecvFinalSizeError
 )
 
 var quicStreamPool = sync.Pool{
@@ -121,7 +154,9 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 	s.conn = conn
 	s.recvBuf = nil
 	s.recvBufP = nil
-	s.recvOOO = nil
+	s.recvOOO = quicOOOList{}
+	s.oooBytes = 0
+	s.recvMax = 0
 	s.recvOff = 0
 	s.recvFin = false
 	s.recvFinSeen = false
@@ -141,8 +176,17 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 		s.maxSend = conn.peerStreamWindow
 	}
 	s.blockedSent = 0
+	s.stalledSend = 0
+	s.stallSince = 0
 	s.awaitingCleanup = false
 	s.recvAccounted = 0
+	s.recvReset = false
+	s.sendReset = false
+	s.inHandler = false
+	s.peerAborted = false
+	if s.cancel.p.Load() != nil {
+		s.cancel.p.Store(nil)
+	}
 	s.refCount.Store(0)
 	s.dispatched.Store(false)
 	s.cleanupDone.Store(false)
@@ -152,7 +196,7 @@ func getPooledStream(id uint64, conn *QUICConn) *QUICStream {
 func (qc *QUICConn) releaseStream(s *QUICStream) {
 	if s.refCount.Add(-1) == 0 {
 		if s.conn != nil && s.recvAccounted > 0 {
-			s.conn.server.releaseBodyBytes(s.recvAccounted)
+			s.conn.server.releaseConnBodyBytes(&s.conn.bodyReserved, s.recvAccounted)
 			s.recvAccounted = 0
 		}
 		if s.recvBufP != nil {
@@ -161,7 +205,7 @@ func (qc *QUICConn) releaseStream(s *QUICStream) {
 		}
 		s.conn = nil
 		s.recvBuf = nil
-		s.recvOOO = nil
+		s.recvOOO = quicOOOList{}
 		s.sendBuf = nil
 		quicStreamPool.Put(s)
 	}
@@ -179,6 +223,15 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) (accepted int, flags i
 	if end > s.recvGranted {
 		return 0, quicRecvViolation
 	}
+	if s.violatesFinalSizeLocked(end, f.fin) {
+		return 0, quicRecvFinalSizeError
+	}
+	if end > s.recvMax {
+		if s.conn != nil && !s.conn.consumeRecvFlowCredit(end-s.recvMax) {
+			return 0, quicRecvViolation
+		}
+		s.recvMax = end
+	}
 
 	if s.recvBufP == nil {
 		s.recvBufP = quicRecvDataPool.Get().(*[]byte)
@@ -193,14 +246,17 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) (accepted int, flags i
 		}
 		if f.offset == s.recvOff {
 			if !s.appendContig(f.data) {
-				return 0, 0
+				return 0, s.rejectRecvLocked()
 			}
 			accepted = len(f.data)
-			s.coalesceOOO()
+			if s.recvOOO.len() > 0 {
+				s.coalesceOOO()
+			}
 		} else {
-			n, ok := s.insertOOO(f.offset, f.data)
-			if !ok {
-				return 0, 0
+			n, result := s.insertOOO(f.offset, f.data)
+			switch result {
+			case quicOOOTooManyGaps, quicOOODropped:
+				return 0, s.rejectRecvLocked()
 			}
 			accepted = n
 		}
@@ -231,6 +287,28 @@ func (s *QUICStream) handleStreamFrame(f quicStreamFrame) (accepted int, flags i
 	return accepted, flags
 }
 
+func (s *QUICStream) violatesFinalSizeLocked(end uint64, fin bool) bool {
+	if s.recvFinSeen {
+		return end > s.recvFinOff || fin && end != s.recvFinOff
+	}
+	return fin && end < s.recvMax
+}
+
+func (s *QUICStream) rejectRecvLocked() int {
+	s.recvClosed = true
+	return quicRecvRejected
+}
+
+func (s *QUICStream) unreceivedCredit() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, unique := s.receivedExtent()
+	if s.recvGranted <= unique {
+		return 0
+	}
+	return s.recvGranted - unique
+}
+
 func (s *QUICStream) streamCreditToGrant() uint64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -252,11 +330,7 @@ func (s *QUICStream) overflowed() bool {
 }
 
 func (s *QUICStream) outstanding() uint64 {
-	total := uint64(len(s.recvBuf))
-	for i := range s.recvOOO {
-		total += uint64(len(s.recvOOO[i].data))
-	}
-	return total
+	return uint64(len(s.recvBuf)) + s.oooBytes
 }
 
 func (s *QUICStream) reserve(n int) bool {
@@ -266,7 +340,7 @@ func (s *QUICStream) reserve(n int) bool {
 	if s.outstanding()+uint64(n) > s.maxRecv {
 		return false
 	}
-	if s.conn != nil && s.conn.server != nil && !s.conn.server.tryReserveBodyBytes(n) {
+	if s.conn != nil && s.conn.server != nil && !s.conn.server.tryReserveConnBodyBytes(&s.conn.bodyReserved, n) {
 		return false
 	}
 	s.recvAccounted += int64(n)
@@ -278,7 +352,7 @@ func (s *QUICStream) releaseReserved(n int) {
 		return
 	}
 	if s.conn != nil && s.conn.server != nil {
-		s.conn.server.releaseBodyBytes(int64(n))
+		s.conn.server.releaseConnBodyBytes(&s.conn.bodyReserved, int64(n))
 	}
 	s.recvAccounted -= int64(n)
 	if s.recvAccounted < 0 {
@@ -295,67 +369,107 @@ func (s *QUICStream) appendContig(data []byte) bool {
 	return true
 }
 
-func (s *QUICStream) insertOOO(off uint64, data []byte) (int, bool) {
-	end := off + uint64(len(data))
+func (s *QUICStream) oooSegmentCap() int {
+	return max(quicMinOOOSegmentCap, int(s.recvWindow/quicOOOWindowBytesPerGap))
+}
+
+func (s *QUICStream) oooNewBytes(first quicOOOPos, off, end uint64) (newBytes uint64, opensSegment bool) {
 	pos := off
-	var additions []quicOOOSegment
-	for i := range s.recvOOO {
-		seg := s.recvOOO[i]
-		if pos >= end || seg.off >= end {
+	for p := first; pos < end; p = s.recvOOO.next(p) {
+		seg := s.recvOOO.at(p)
+		gapEnd := end
+		if seg != nil && seg.off < end {
+			gapEnd = seg.off
+		}
+		if gapEnd > pos {
+			if pos == off {
+				prev := s.recvOOO.before(first)
+				opensSegment = prev == nil || prev.end() != off
+			}
+			newBytes += gapEnd - pos
+		}
+		if seg == nil || seg.off >= end {
 			break
 		}
-		segEnd := seg.off + uint64(len(seg.data))
-		if segEnd <= pos {
-			continue
+		pos = seg.end()
+	}
+	return newBytes, opensSegment
+}
+
+func (s *QUICStream) insertOOO(off uint64, data []byte) (int, quicOOOResult) {
+	end := off + uint64(len(data))
+	first := s.recvOOO.firstEndingAfter(off)
+	newBytes, opensSegment := s.oooNewBytes(first, off, end)
+	if newBytes == 0 {
+		return 0, quicOOOStored
+	}
+	if opensSegment && s.recvOOO.len() >= s.oooSegmentCap() {
+		return 0, quicOOOTooManyGaps
+	}
+	if !s.reserve(int(newBytes)) {
+		return 0, quicOOODropped
+	}
+	if opensSegment && !s.reserveSegmentOverhead() {
+		s.releaseReserved(int(newBytes))
+		return 0, quicOOODropped
+	}
+	pos := off
+	prev := s.recvOOO.before(first)
+	for p := first; pos < end; p = s.recvOOO.next(p) {
+		seg := s.recvOOO.at(p)
+		gapEnd := end
+		if seg != nil && seg.off < end {
+			gapEnd = seg.off
 		}
-		if seg.off > pos {
-			additions = append(additions, quicOOOSegment{off: pos, data: data[pos-off : seg.off-off]})
+		if gapEnd > pos {
+			piece := data[pos-off : gapEnd-off]
+			if prev != nil && prev.end() == pos {
+				prev.data = append(prev.data, piece...)
+			} else {
+				p = s.recvOOO.next(s.recvOOO.insert(p, quicOOOSegment{off: pos, data: append([]byte(nil), piece...)}))
+				seg = s.recvOOO.at(p)
+			}
 		}
-		if segEnd > pos {
-			pos = segEnd
+		if seg == nil || seg.off >= end {
+			break
 		}
+		pos = seg.end()
+		prev = seg
 	}
-	if pos < end {
-		additions = append(additions, quicOOOSegment{off: pos, data: data[pos-off:]})
+	s.oooBytes += newBytes
+	return int(newBytes), quicOOOStored
+}
+
+func (s *QUICStream) reserveSegmentOverhead() bool {
+	if s.conn != nil && s.conn.server != nil && !s.conn.server.tryReserveConnBodyBytes(&s.conn.bodyReserved, quicOOOSegmentOverhead) {
+		return false
 	}
-	total := 0
-	for i := range additions {
-		total += len(additions[i].data)
-	}
-	if total == 0 {
-		return 0, true
-	}
-	if !s.reserve(total) {
-		return 0, false
-	}
-	for i := range additions {
-		s.recvOOO = append(s.recvOOO, quicOOOSegment{off: additions[i].off, data: append([]byte(nil), additions[i].data...)})
-	}
-	sort.Slice(s.recvOOO, func(a, b int) bool { return s.recvOOO[a].off < s.recvOOO[b].off })
-	return total, true
+	s.recvAccounted += quicOOOSegmentOverhead
+	return true
 }
 
 func (s *QUICStream) coalesceOOO() {
-	i := 0
-	for i < len(s.recvOOO) {
-		seg := s.recvOOO[i]
+	consumed := 0
+	for p := (quicOOOPos{}); consumed < s.recvOOO.len(); p = s.recvOOO.next(p) {
+		seg := s.recvOOO.at(p)
 		if seg.off > s.recvOff {
 			break
 		}
-		segEnd := seg.off + uint64(len(seg.data))
+		consumed++
+		s.oooBytes -= uint64(len(seg.data))
+		s.releaseReserved(quicOOOSegmentOverhead)
+		segEnd := seg.end()
 		if segEnd <= s.recvOff {
 			s.releaseReserved(len(seg.data))
-			i++
 			continue
 		}
 		start := s.recvOff - seg.off
 		s.releaseReserved(int(start))
 		s.recvBuf = append(s.recvBuf, seg.data[start:]...)
 		s.recvOff = segEnd
-		i++
 	}
-	if i > 0 {
-		s.recvOOO = append(s.recvOOO[:0], s.recvOOO[i:]...)
+	if consumed > 0 {
+		s.recvOOO.dropFront(consumed)
 	}
 }
 
@@ -396,11 +510,25 @@ func (s *QUICStream) Read(p []byte) (int, error) {
 // ReadAll blocks until the peer finishes sending or the stream is closed,
 // then returns all data received so far.
 func (s *QUICStream) ReadAll() ([]byte, error) {
+	return s.readAll(false)
+}
+
+func (s *QUICStream) readRequest() ([]byte, error) {
+	return s.readAll(true)
+}
+
+func (s *QUICStream) readAll(startHandler bool) ([]byte, error) {
 	for {
 		s.mu.Lock()
 		if s.recvFin || s.recvClosed {
 			buf := s.recvBuf
 			s.recvBuf = nil
+			if startHandler {
+				s.inHandler = true
+				if s.peerAborted {
+					s.cancel.cancel(ErrClientGone)
+				}
+			}
 			s.mu.Unlock()
 			return buf, nil
 		}
@@ -430,7 +558,9 @@ func (s *QUICStream) Write(data []byte) error {
 
 func (s *QUICStream) setSendBuf(data []byte) {
 	s.mu.Lock()
-	s.sendBuf = data
+	if !s.sendReset {
+		s.sendBuf = data
+	}
 	s.sendFin = true
 	s.mu.Unlock()
 }
@@ -469,6 +599,9 @@ func (s *QUICStream) drainSendBuf(maxBytes int) (data []byte, offset uint64, fin
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.sendReset {
+		return nil, s.sendOff, false
+	}
 	if len(s.sendBuf) == 0 {
 		if s.sendFin && !s.sendClosed {
 			return nil, s.sendOff, true
@@ -485,7 +618,124 @@ func (s *QUICStream) drainSendBuf(maxBytes int) (data []byte, offset uint64, fin
 	offset = s.sendOff
 	s.sendBuf = s.sendBuf[n:]
 	s.sendOff += uint64(n)
+	if s.stalledSend > 0 {
+		s.releaseStalledLocked(min(int64(n), s.stalledSend))
+	}
 
 	fin = s.sendFin && len(s.sendBuf) == 0
 	return data, offset, fin
+}
+
+func (s *QUICStream) receivedExtent() (highest, unique uint64) {
+	highest = s.recvOff
+	if s.recvOOO.len() > 0 {
+		highest = s.recvOOO.last().end()
+	}
+	return highest, s.recvOff + s.oooBytes
+}
+
+func (s *QUICStream) applyPeerReset(finalSize uint64) (uncounted uint64, errCode uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	highest, unique := s.receivedExtent()
+	if (s.recvFinSeen && finalSize != s.recvFinOff) || finalSize < max(highest, s.recvMax) {
+		return 0, quicErrFinalSize
+	}
+	if finalSize > s.recvGranted {
+		return 0, quicErrFlowControl
+	}
+	if finalSize > s.recvMax {
+		if s.conn != nil && !s.conn.consumeRecvFlowCredit(finalSize-s.recvMax) {
+			return 0, quicErrFlowControl
+		}
+		s.recvMax = finalSize
+	}
+	if s.recvReset {
+		return 0, 0
+	}
+	s.recvReset = true
+	s.recvFinSeen = true
+	s.recvFinOff = finalSize
+	s.recvClosed = true
+	if s.recvReady != nil {
+		select {
+		case s.recvReady <- struct{}{}:
+		default:
+		}
+	}
+	return finalSize - unique, 0
+}
+
+func (s *QUICStream) takeReceived() (data []byte, fin bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	data = s.recvBuf
+	s.recvBuf = s.recvBuf[:0]
+	s.releaseReserved(len(data))
+	return data, s.recvFin
+}
+
+func (s *QUICStream) resetSend() (finalSize uint64, first bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sendReset {
+		return s.sendOff, false
+	}
+	s.sendReset = true
+	s.sendClosed = true
+	s.sendBuf = nil
+	s.releaseStalledLocked(s.stalledSend)
+	return s.sendOff, true
+}
+
+func (s *QUICStream) beginStalledAccounting(now int64) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := int64(len(s.sendBuf)) - s.stalledSend
+	if pending <= 0 {
+		return 0
+	}
+	if s.stalledSend == 0 {
+		s.stallSince = now
+	}
+	s.stalledSend += pending
+	return pending
+}
+
+func (s *QUICStream) stallStart() (since int64, stalled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stallSince, s.stalledSend > 0
+}
+
+func (s *QUICStream) releaseStalledLocked(n int64) {
+	if n <= 0 || s.conn == nil {
+		return
+	}
+	now := turbo.UnixNano()
+	s.stalledSend -= n
+	s.stallSince = now
+	s.conn.stalledSendBytes.Add(-n)
+	s.conn.lastSendProgress.Store(now)
+}
+
+func (s *QUICStream) beginHandler(req *Request) {
+	s.cancel.attach(req)
+}
+
+func (s *QUICStream) endHandler(req *Request) {
+	req.finishContext()
+}
+
+func (s *QUICStream) handlerFinishedLocked() {
+	s.inHandler = false
+}
+
+func (s *QUICStream) abortHandler(cause error) {
+	s.mu.Lock()
+	s.peerAborted = true
+	if s.inHandler {
+		s.cancel.cancel(cause)
+	}
+	s.mu.Unlock()
 }

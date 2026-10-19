@@ -1,46 +1,48 @@
+//go:build linux && amd64
+
 package core
 
 import (
+	"crypto/ecdh"
 	"crypto/rand"
 	"runtime"
 	"sync"
 	"time"
-
-	"golang.org/x/crypto/curve25519"
 )
 
 type x25519Keypair struct {
-	priv [32]byte
+	priv *ecdh.PrivateKey
 	pub  [32]byte
 }
 
 func generateX25519Keypair() (x25519Keypair, error) {
-	var kp x25519Keypair
-	if _, err := rand.Read(kp.priv[:]); err != nil {
+	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
 		return x25519Keypair{}, err
 	}
-	curve25519.ScalarBaseMult(&kp.pub, &kp.priv)
+	kp := x25519Keypair{priv: priv}
+	copy(kp.pub[:], priv.PublicKey().Bytes())
 	return kp, nil
 }
 
-func deriveX25519SharedSecret(priv, peer *[32]byte) ([32]byte, bool) {
+func (kp *x25519Keypair) sharedSecret(peer []byte) ([32]byte, bool) {
 	var shared [32]byte
-	secret, err := curve25519.X25519(priv[:], peer[:])
+	pub, err := ecdh.X25519().NewPublicKey(peer)
+	if err != nil {
+		return shared, false
+	}
+	secret, err := kp.priv.ECDH(pub)
 	if err != nil {
 		return shared, false
 	}
 	copy(shared[:], secret)
-	for i := range secret {
-		secret[i] = 0
-	}
+	clear(secret)
 	return shared, true
 }
 
 func (kp *x25519Keypair) zero() {
-	for i := range kp.priv {
-		kp.priv[i] = 0
-		kp.pub[i] = 0
-	}
+	kp.priv = nil
+	clear(kp.pub[:])
 }
 
 type x25519KeyPool struct {
@@ -101,12 +103,14 @@ func (p *x25519KeyPool) fillLoop() {
 }
 
 func (p *x25519KeyPool) Get() (x25519Keypair, error) {
-	select {
-	case kp, ok := <-p.ch:
-		if ok {
-			return kp, nil
+	if p != nil {
+		select {
+		case kp, ok := <-p.ch:
+			if ok {
+				return kp, nil
+			}
+		default:
 		}
-	default:
 	}
 	return generateX25519Keypair()
 }

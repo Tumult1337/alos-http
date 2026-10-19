@@ -1,7 +1,8 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"log"
 	"sync"
 
 	"github.com/bytedance/sonic"
@@ -40,7 +41,7 @@ func AcquireJSON() *JSON {
 func (j *JSON) Marshal(v any) []byte {
 	data, err := sonic.Marshal(v)
 	if err != nil {
-		log.Printf("[JSON] marshal failed: %v", err)
+		logger().Error("JSON marshal failed", "err", err)
 		return []byte("null")
 	}
 	return data

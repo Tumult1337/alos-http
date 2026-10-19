@@ -1,8 +1,9 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"cmp"
-	"compress/gzip"
 	"slices"
 	"strings"
 	"sync"
@@ -74,8 +75,11 @@ type CacheConfig struct {
 	Gzip            bool
 	GzipMinBytes    int
 	GzipLevel       int
+	Brotli          bool
+	BrotliLevel     int
 	SweepInterval   time.Duration
 	CacheableStatus func(int) bool
+	KeyFunc         func(*Request) (string, bool)
 }
 
 type cachedResponse struct {
@@ -84,6 +88,9 @@ type cachedResponse struct {
 	contentType string
 	body        []byte
 	gzipBody    []byte
+	brotliBody  []byte
+	encodings   encodingSet
+	addVary     bool
 	expiresAtNs int64
 	storedAtNs  int64
 }
@@ -140,6 +147,7 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 	if cfg.GzipLevel < 1 || cfg.GzipLevel > 9 {
 		cfg.GzipLevel = 6
 	}
+	cfg.BrotliLevel = normalizeBrotliLevel(cfg.BrotliLevel)
 	if cfg.SweepInterval <= 0 {
 		cfg.SweepInterval = 15 * time.Second
 	}
@@ -177,23 +185,44 @@ func (rc *ResponseCache) handle(next HandlerFunc, req *Request, resp *Response) 
 		next(req, resp)
 		return
 	}
-	key := rc.key(req)
-	wantGzip := rc.cfg.Gzip && acceptsGzip(req.Header("accept-encoding"))
+	var keyBuf [cacheKeyStackSize]byte
+	var key string
+	if rc.cfg.KeyFunc != nil {
+		custom, cacheable := rc.cfg.KeyFunc(req)
+		if !cacheable {
+			next(req, resp)
+			return
+		}
+		key = custom
+	} else {
+		if len(req.Host) > cacheKeyMaxHostLen || carriesCredentials(req.Headers) {
+			next(req, resp)
+			return
+		}
+		key = UnsafeString(rc.appendKey(keyBuf[:0], req))
+	}
 	if ent, ok := rc.store.Load(key); ok {
 		if turbo.UnixNano() <= ent.expiresAtNs {
-			serveCached(resp, ent, wantGzip)
+			serveCached(resp, ent, ent.negotiate(req))
 			return
 		}
 		rc.store.Delete(key)
 	}
 	next(req, resp)
-	ent := rc.captureAndStore(key, resp)
-	if ent != nil && wantGzip && ent.gzipBody != nil {
-		serveCached(resp, ent, true)
+	ent := rc.captureAndStore(key, req.Method, resp)
+	if ent != nil && ent.encodings != 0 {
+		serveCached(resp, ent, ent.negotiate(req))
 	}
 }
 
-func (rc *ResponseCache) captureAndStore(key string, resp *Response) *cachedResponse {
+func (ent *cachedResponse) negotiate(req *Request) encodingType {
+	if ent.encodings == 0 {
+		return encodingNone
+	}
+	return negotiateEncoding(req.Header("accept-encoding"), ent.encodings)
+}
+
+func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *cachedResponse {
 	if resp == nil || resp.IsStreamed() {
 		return nil
 	}
@@ -205,6 +234,9 @@ func (rc *ResponseCache) captureAndStore(key string, resp *Response) *cachedResp
 		return nil
 	}
 	body := resp.transmittedBodyBytes()
+	if EqualFoldASCII(method, "HEAD") {
+		body = resp.bodyBytesUnsafe()
+	}
 	if len(body) > rc.cfg.MaxBodyBytes {
 		return nil
 	}
@@ -223,10 +255,22 @@ func (rc *ResponseCache) captureAndStore(key string, resp *Response) *cachedResp
 		expiresAtNs: now + rc.ttlNs,
 		storedAtNs:  now,
 	}
-	if rc.cfg.Gzip && len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType) {
-		ent.gzipBody = gzipEncode(body, rc.cfg.GzipLevel)
+	if len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType) {
+		if rc.cfg.Gzip {
+			ent.gzipBody = compressedVariant(body, encodingGzip, rc.cfg.GzipLevel)
+		}
+		if rc.cfg.Brotli {
+			ent.brotliBody = compressedVariant(body, encodingBrotli, rc.cfg.BrotliLevel)
+		}
 	}
-	rc.store.Store(key, ent)
+	if ent.gzipBody != nil {
+		ent.encodings |= offerGzip
+	}
+	if ent.brotliBody != nil {
+		ent.encodings |= offerBrotli
+	}
+	ent.addVary = ent.encodings != 0 && !varyCoversAcceptEncoding(ent.headers)
+	rc.store.Store(strings.Clone(key), ent)
 	return ent
 }
 
@@ -237,31 +281,62 @@ func (rc *ResponseCache) statusCacheable(status int) bool {
 	return status == 200
 }
 
-func serveCached(resp *Response, ent *cachedResponse, wantGzip bool) {
+func serveCached(resp *Response, ent *cachedResponse, enc encodingType) {
 	resp.StatusCode = ent.status
 	resp.Headers = append(resp.Headers[:0], ent.headers...)
 	resp.ContentType = ent.contentType
-	if wantGzip && ent.gzipBody != nil {
+	switch enc {
+	case encodingGzip:
 		resp.SetBody(ent.gzipBody)
-		resp.SetHeaderUnsafe("Content-Encoding", "gzip")
-		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
-	} else {
+		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
+	case encodingBrotli:
+		resp.SetBody(ent.brotliBody)
+		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
+	default:
 		resp.SetBody(ent.body)
+	}
+	if ent.addVary {
+		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
 	}
 }
 
-func (rc *ResponseCache) key(req *Request) string {
-	var b strings.Builder
-	b.Grow(len(req.Method) + len(req.Host) + len(req.Path) + len(req.Query) + 8)
-	b.WriteString(req.Method)
-	b.WriteByte(' ')
-	b.WriteString(req.Host)
-	b.WriteString(req.Path)
-	if !rc.cfg.IgnoreQuery && req.Query != "" {
-		b.WriteByte('?')
-		b.WriteString(req.Query)
+func carriesCredentials(headers [][2]string) bool {
+	for i := range headers {
+		name := headers[i][0]
+		switch len(name) {
+		case len("cookie"):
+			if EqualFoldASCII(name, "cookie") {
+				return true
+			}
+		case len("authorization"):
+			if EqualFoldASCII(name, "authorization") {
+				return true
+			}
+		}
 	}
-	return b.String()
+	return false
+}
+
+const (
+	cacheKeyStackSize  = 256
+	cacheKeyMaxHostLen = 255
+)
+
+func (rc *ResponseCache) appendKey(dst []byte, req *Request) []byte {
+	dst = append(dst, req.Method...)
+	dst = append(dst, ' ', byte(len(req.Host)))
+	dst = append(dst, req.Host...)
+	dst = append(dst, req.Path...)
+	if !rc.cfg.IgnoreQuery && req.Query != "" {
+		dst = append(dst, '?')
+		dst = append(dst, req.Query...)
+	}
+	return dst
+}
+
+func (rc *ResponseCache) key(req *Request) string {
+	var buf [cacheKeyStackSize]byte
+	return string(rc.appendKey(buf[:0], req))
 }
 
 func (rc *ResponseCache) sweepLoop() {
@@ -314,11 +389,24 @@ func cacheableHeaders(headers [][2]string) bool {
 		if EqualFoldASCII(k, "set-cookie") || EqualFoldASCII(k, "content-encoding") {
 			return false
 		}
+		if EqualFoldASCII(k, "vary") && !varyOnlyAcceptEncoding(headers[i][1]) {
+			return false
+		}
 		if EqualFoldASCII(k, "cache-control") {
 			v := strings.ToLower(headers[i][1])
 			if strings.Contains(v, "no-store") || strings.Contains(v, "no-cache") || strings.Contains(v, "private") {
 				return false
 			}
+		}
+	}
+	return true
+}
+
+func varyOnlyAcceptEncoding(vary string) bool {
+	for field := range strings.SplitSeq(vary, ",") {
+		field = strings.TrimSpace(field)
+		if field != "" && !EqualFoldASCII(field, "accept-encoding") {
+			return false
 		}
 	}
 	return true
@@ -357,17 +445,9 @@ func cloneBytes(b []byte) []byte {
 	return out
 }
 
-func gzipEncode(body []byte, level int) []byte {
+func compressedVariant(body []byte, enc encodingType, level int) []byte {
 	bp := LargeBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	gw := gzipWriterPool[level].Get().(*gzip.Writer)
-	w := newBytesWriter(&buf)
-	gw.Reset(w)
-	_, _ = gw.Write(body)
-	_ = gw.Close()
-	gzipWriterPool[level].Put(gw)
-	w.buf = nil
-	bytesWriterPool.Put(w)
+	buf := appendCompressed((*bp)[:0], body, enc, level)
 	var out []byte
 	if len(buf) > 0 && len(buf) < len(body) {
 		out = make([]byte, len(buf))

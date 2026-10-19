@@ -31,7 +31,7 @@ func dpHeaderWatcher(t *testing.T, out chan<- http.Header) string {
 func TestDeepSerializerRejectsCRLFInHeaderValue(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x",
 		Headers: [][2]string{{"X-A", "ok"}, {"X-B", "bad\r\nX-Evil: 1"}}}
-	out := string(appendProxyRequest(nil, req, "h.test", "1.2.3.4"))
+	out := string(appendProxyRequest(nil, withRemote(req, "1.2.3.4"), "h.test"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("CRLF in a value forged a header:\n%s", out)
 	}
@@ -43,7 +43,7 @@ func TestDeepSerializerRejectsCRLFInHeaderValue(t *testing.T) {
 func TestDeepSerializerRejectsCRInHeaderValue(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x",
 		Headers: [][2]string{{"X-B", "bad\rX-Evil: 1"}}}
-	out := string(appendProxyRequest(nil, req, "h.test", ""))
+	out := string(appendProxyRequest(nil, req, "h.test"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("bare CR forged a header:\n%s", out)
 	}
@@ -52,7 +52,7 @@ func TestDeepSerializerRejectsCRInHeaderValue(t *testing.T) {
 func TestDeepSerializerRejectsLFInHeaderValue(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x",
 		Headers: [][2]string{{"X-B", "bad\nX-Evil: 1"}}}
-	out := string(appendProxyRequest(nil, req, "h.test", ""))
+	out := string(appendProxyRequest(nil, req, "h.test"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("bare LF forged a header:\n%s", out)
 	}
@@ -61,7 +61,7 @@ func TestDeepSerializerRejectsLFInHeaderValue(t *testing.T) {
 func TestDeepSerializerRejectsCRLFInHeaderName(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x",
 		Headers: [][2]string{{"X-B\r\nX-Evil: 1", "v"}}}
-	out := string(appendProxyRequest(nil, req, "h.test", ""))
+	out := string(appendProxyRequest(nil, req, "h.test"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("CRLF in a name forged a header:\n%s", out)
 	}
@@ -69,7 +69,7 @@ func TestDeepSerializerRejectsCRLFInHeaderName(t *testing.T) {
 
 func TestDeepSerializerSanitisesTarget(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x HTTP/1.1\r\nX-Evil: 1"}
-	out := string(appendProxyRequest(nil, req, "h.test", ""))
+	out := string(appendProxyRequest(nil, req, "h.test"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("CRLF in the target forged a header:\n%s", out)
 	}
@@ -80,7 +80,7 @@ func TestDeepSerializerSanitisesTarget(t *testing.T) {
 
 func TestDeepSerializerSanitisesHost(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x"}
-	out := string(appendProxyRequest(nil, req, "evil\r\nX-Evil: 1", ""))
+	out := string(appendProxyRequest(nil, req, "evil\r\nX-Evil: 1"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("CRLF in the Host forged a header:\n%s", out)
 	}
@@ -88,7 +88,7 @@ func TestDeepSerializerSanitisesHost(t *testing.T) {
 
 func TestDeepSerializerSanitisesClientIP(t *testing.T) {
 	req := &Request{Method: "GET", Path: "/x", RawPath: "/x"}
-	out := string(appendProxyRequest(nil, req, "h.test", "1.2.3.4\r\nX-Evil: 1"))
+	out := string(appendProxyRequest(nil, withRemote(req, "1.2.3.4\r\nX-Evil: 1"), "h.test"))
 	if strings.Contains(out, "X-Evil") {
 		t.Fatalf("CRLF in the client IP forged a header:\n%s", out)
 	}
@@ -97,7 +97,7 @@ func TestDeepSerializerSanitisesClientIP(t *testing.T) {
 func TestDeepSerializerEmitsExactlyOneHeaderTerminator(t *testing.T) {
 	req := &Request{Method: "POST", Path: "/x", RawPath: "/x",
 		Headers: [][2]string{{"X-A", "1"}}, Body: []byte("hi")}
-	out := string(appendProxyRequest(nil, req, "h.test", "1.2.3.4"))
+	out := string(appendProxyRequest(nil, withRemote(req, "1.2.3.4"), "h.test"))
 	if n := strings.Count(out, "\r\n\r\n"); n != 1 {
 		t.Fatalf("request has %d header terminators:\n%q", n, out)
 	}

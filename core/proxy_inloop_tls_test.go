@@ -179,10 +179,7 @@ func TestInLoopProxyOverTLSStreamsLargeResponse(t *testing.T) {
 // backend, so one slow upstream stalled every other TLS connection that worker
 // owned. Requests against a slow backend must no longer hold up a fast one.
 func TestInLoopProxyOverTLSSlowBackendDoesNotBlockOthers(t *testing.T) {
-	slow := newInloopOrigin(t, func(req *http.Request, conn net.Conn, br *bufio.Reader) {
-		time.Sleep(300 * time.Millisecond)
-		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow")
-	})
+	slow := newHeldOrigin(t, "slow")
 	fast := newInloopOrigin(t, echoBodyOrigin("fast"))
 
 	// Both domains are served by one server so they share the same workers;
@@ -195,7 +192,7 @@ func TestInLoopProxyOverTLSSlowBackendDoesNotBlockOthers(t *testing.T) {
 
 	// Saturate the slow proxy so every worker has a stalled exchange in flight.
 	var wg sync.WaitGroup
-	for i := 0; i < 24; i++ {
+	for i := 0; i < slowBackendClients; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -209,7 +206,7 @@ func TestInLoopProxyOverTLSSlowBackendDoesNotBlockOthers(t *testing.T) {
 			}
 		}()
 	}
-	time.Sleep(150 * time.Millisecond)
+	waitFor(t, harnessIOTimeout, func() bool { return slow.arrived.Load() == slowBackendClients })
 
 	// A request to the fast proxy must complete well inside the slow backend's
 	// delay rather than queueing behind it.
@@ -232,6 +229,8 @@ func TestInLoopProxyOverTLSSlowBackendDoesNotBlockOthers(t *testing.T) {
 			slowest = d
 		}
 	}
+	slow.releaseAll()
+	wg.Wait()
 	if slowest > 200*time.Millisecond {
 		t.Fatalf("a fast TLS request took %v while a slow backend was in flight; the worker is still being blocked", slowest)
 	}

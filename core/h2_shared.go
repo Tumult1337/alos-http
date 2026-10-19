@@ -1,11 +1,24 @@
+//go:build linux && amd64
+
 package core
 
-import "github.com/guno1928/turbo"
+import (
+	"math"
+	"slices"
+	"sync/atomic"
+
+	"github.com/guno1928/turbo"
+)
 
 const (
 	h2MaxResetsPerWindow = 200
 	h2ResetWindowNanos   = 1_000_000_000
 	h2MaxCtrlPerWindow   = 5000
+	h2MaxWindowSize      = 1<<31 - 1
+	h2GoAwayMinPayload   = 8
+	h2MaxRequestFields   = 128
+
+	h2StatusHeaderListTooLarge = 431
 )
 
 type tlsWorkerH2State struct {
@@ -17,6 +30,7 @@ type tlsWorkerH2State struct {
 	recvConnWindow    int64
 	pendingConnWindow uint32
 	lastStreamID      uint32
+	highestStreamID   uint32
 
 	prefaceReceived    bool
 	expectContinuation uint32
@@ -26,21 +40,27 @@ type tlsWorkerH2State struct {
 	headersBuf         [][2]string
 
 	sending map[uint32]*H2Stream
+	busy    *H2Stream
 
 	rstCount     int
 	rstWindow    int64
 	sendingBytes int64
 	ctrlCount    int
 	ctrlWindow   int64
+
+	peerGoingAway bool
+	bodyReserved  atomic.Int64
 }
 
-func (st *tlsWorkerH2State) init(tableSize uint32) {
+func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
 	if st.decoder == nil {
 		st.decoder = HpackDecoderPool.Get().(*HpackDecoder)
 	}
 	*st.decoder = HpackDecoder{
-		maxTableSize:    int(tableSize),
-		protocolMaxSize: int(tableSize),
+		maxTableSize:         int(tableSize),
+		protocolMaxSize:      int(tableSize),
+		allowExtendedConnect: true,
+		maxHeaderListSize:    headerListLimit,
 	}
 	if st.streams == nil {
 		st.streams = make(map[uint32]*H2Stream, 4)
@@ -66,6 +86,7 @@ func (st *tlsWorkerH2State) init(tableSize uint32) {
 	st.recvConnWindow = int64(H2ConnectionWindowSize)
 	st.pendingConnWindow = 0
 	st.lastStreamID = 0
+	st.highestStreamID = 0
 	st.prefaceReceived = false
 	st.expectContinuation = 0
 	st.headerEndStream = false
@@ -82,6 +103,7 @@ func (st *tlsWorkerH2State) init(tableSize uint32) {
 	st.sendingBytes = 0
 	st.ctrlCount = 0
 	st.ctrlWindow = 0
+	st.peerGoingAway = false
 }
 
 func (st *tlsWorkerH2State) countReset() bool {
@@ -104,19 +126,26 @@ func (st *tlsWorkerH2State) countCtrl() bool {
 	return st.ctrlCount > h2MaxCtrlPerWindow
 }
 
+func h2HeaderListLimitFor(maxHeaderSize int) int {
+	const fieldOverheadAllowance = hpackEntryOverhead * h2MaxRequestFields
+	return min(maxHeaderSize, math.MaxUint32-fieldOverheadAllowance) + fieldOverheadAllowance
+}
+
+func (s *Server) h2HeaderListLimit() int {
+	return h2HeaderListLimitFor(s.limits.Load().MaxHeaderSize)
+}
+
 func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
-	settings := [5][2]uint32{
+	settings := [...][2]uint32{
 		{uint32(H2SettingHeaderTableSize), s.h2HeaderTableSize()},
 		{uint32(H2SettingMaxConcurrentStreams), s.h2MaxStreams()},
 		{uint32(H2SettingInitialWindowSize), s.h2InitialWindow()},
 		{uint32(H2SettingMaxFrameSize), s.h2MaxFrameSize()},
-		{uint32(H2SettingMaxHeaderListSize), H2MaxHeaderListSize},
+		{uint32(H2SettingMaxHeaderListSize), uint32(s.h2HeaderListLimit())},
+		{uint32(H2SettingEnableConnectProtocol), 1},
 	}
-	settingsFrame := H2WriteSettings(nil, settings[:])
-	dst = append(dst, settingsFrame...)
-	windowFrame := H2WriteWindowUpdate(nil, 0, uint32(H2ConnectionWindowSize-H2DefaultWindowSize))
-	dst = append(dst, windowFrame...)
-	return dst
+	dst = H2WriteSettings(dst, settings[:])
+	return appendH2WindowUpdateFrame(dst, 0, uint32(H2ConnectionWindowSize-H2DefaultWindowSize))
 }
 
 func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uint32, maxFrame int) []byte {
@@ -156,19 +185,32 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 	return dst
 }
 
+func appendH2StatusOnlyResponse(dst []byte, streamID uint32, status int, serverName string) []byte {
+	off := len(dst)
+	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, nil)}
+	payloadStart := len(enc.Buf)
+	encodeH2ResponseHeaders(&enc, status, "", 0, nil, serverName)
+	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
+	return enc.Buf
+}
+
 func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, endStream bool) []byte {
-	bp := MediumBufPool.Get().(*[]byte)
-	enc := HpackEncoder{}
-	enc.Reset((*bp)[:0])
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, respServerName(resp))
 	flags := byte(H2FlagEndHeaders)
 	if endStream {
 		flags |= H2FlagEndStream
 	}
-	dst = appendH2Frame(dst, H2FrameHeaders, flags, streamID, enc.Buf)
-	*bp = enc.Buf[:0]
-	MediumBufPool.Put(bp)
-	return dst
+	off := len(dst)
+	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
+	payloadStart := len(enc.Buf)
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, respServerName(resp))
+	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
+	return enc.Buf
+}
+
+func putH2FrameLength(frame []byte, n int) {
+	frame[0] = byte(n >> 16)
+	frame[1] = byte(n >> 8)
+	frame[2] = byte(n)
 }
 
 func appendH2SettingsAckFrame(dst []byte) []byte {
@@ -213,4 +255,83 @@ func appendH2PingFrame(dst []byte, ack bool, data [8]byte) []byte {
 		flags = H2FlagAck
 	}
 	return appendH2Frame(dst, H2FramePing, flags, 0, data[:])
+}
+
+func (st *tlsWorkerH2State) linkBusy(s *H2Stream) {
+	s.busyPrev = nil
+	s.busyNext = st.busy
+	if st.busy != nil {
+		st.busy.busyPrev = s
+	}
+	st.busy = s
+}
+
+func (st *tlsWorkerH2State) unlinkBusy(s *H2Stream) {
+	if s.busyPrev != nil {
+		s.busyPrev.busyNext = s.busyNext
+	} else if st.busy == s {
+		st.busy = s.busyNext
+	}
+	if s.busyNext != nil {
+		s.busyNext.busyPrev = s.busyPrev
+	}
+	s.busyPrev = nil
+	s.busyNext = nil
+}
+
+func (st *tlsWorkerH2State) cancelBusy(cause error) {
+	for s := st.busy; s != nil; s = s.busyNext {
+		s.cancel.cancel(cause)
+	}
+}
+
+func (st *tlsWorkerH2State) findBusy(id uint32) *H2Stream {
+	for s := st.busy; s != nil; s = s.busyNext {
+		if s.ID == id {
+			return s
+		}
+	}
+	return nil
+}
+
+func (st *tlsWorkerH2State) cancelBusyStream(id uint32, cause error) *H2Stream {
+	s := st.findBusy(id)
+	if s == nil || s.abandoned {
+		return nil
+	}
+	s.abandoned = true
+	s.cancel.cancel(cause)
+	return s
+}
+
+func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
+	delete(st.sending, id)
+	st.sendingBytes -= int64(stream.stallBytes)
+	stream.Reset()
+	StreamPool.Put(stream)
+}
+
+func appendH2Frame(dst []byte, typ, flags byte, streamID uint32, payload []byte) []byte {
+	pLen := len(payload)
+	off := len(dst)
+	needed := off + 9 + pLen
+	if cap(dst) < needed {
+		dst = slices.Grow(dst, 9+pLen)
+	}
+	dst = dst[:needed]
+	frame := dst[off:]
+	_ = frame[8]
+	frame[0] = byte(pLen >> 16)
+	frame[1] = byte(pLen >> 8)
+	frame[2] = byte(pLen)
+	frame[3] = typ
+	frame[4] = flags
+	frame[5] = byte(streamID >> 24)
+	frame[6] = byte(streamID >> 16)
+	frame[7] = byte(streamID >> 8)
+	frame[8] = byte(streamID)
+	if pLen > 0 {
+		copy(frame[9:], payload)
+	}
+	return dst
 }

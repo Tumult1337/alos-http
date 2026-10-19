@@ -4,6 +4,11 @@
 # Then allow ONLY the production library + module definition.
 !/.gitignore
 !/README.md
+!/LICENSE
+!/SECURITY.md
+!/CHANGELOG.md
+!/.github/
+!/.github/**
 !/go.mod
 !/go.sum
 !/core/

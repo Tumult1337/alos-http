@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -94,14 +94,16 @@ func (l *eventLoop) run() {
 				break
 			}
 			drained = true
-			l.startExchange(exchangeFromNode(n))
+			l.dispatchQueued(exchangeFromNode(n))
 		}
 		timeout := l.nextTimeoutMs()
-		if !drained && timeout != 0 {
+		if drained {
+			timeout = 0
+		} else if timeout != 0 {
 			l.sleeping.Store(1)
 			if n := l.q.pop(); n != nil {
 				l.sleeping.Store(0)
-				l.startExchange(exchangeFromNode(n))
+				l.dispatchQueued(exchangeFromNode(n))
 				timeout = 0
 			}
 		}
@@ -128,10 +130,10 @@ func (l *eventLoop) run() {
 			if evs&unix.EPOLLERR != 0 {
 				err := socketError(c.fd)
 				if err == nil {
-					err = fpErrConnClosed
+					err = errFPConnClosed
 				}
 				if c.state == connConnecting {
-					err = fpErrDialFailed
+					err = errFPDialFailed
 				}
 				l.closeConn(c, err)
 				continue
@@ -153,6 +155,31 @@ func (l *eventLoop) run() {
 			}
 		}
 		l.maybeSweep(l.nowNano())
+	}
+}
+
+func (l *eventLoop) dispatchQueued(ex *Exchange) {
+	ex.queued.Store(false)
+	if !ex.started {
+		ex.started = true
+		l.startExchange(ex)
+		return
+	}
+	if ex.abortWanted.Swap(false) {
+		l.abortExchange(ex)
+		return
+	}
+	if ex.bodyReady.Swap(false) {
+		l.onBodyChunk(ex)
+	}
+	if ex.resumeWanted.Swap(false) {
+		l.resumeExchangeRead(ex)
+	}
+}
+
+func (l *eventLoop) notify(ex *Exchange) {
+	if ex.queued.CompareAndSwap(false, true) {
+		l.submit(ex)
 	}
 }
 
@@ -185,11 +212,15 @@ func (l *eventLoop) exPut(ex *Exchange) {
 // response as it arrives and everything else gets it buffered.
 
 func (l *eventLoop) shouldStreamResponse(c *backendConn, contentLen int64) bool {
-	return c.cur != nil && c.cur.sink != nil
+	return c.cur != nil && (c.cur.sink != nil || c.cur.pipe != nil)
 }
 
 func (l *eventLoop) beginStreamResponse(c *backendConn, p *h1Parser, contentLen int64) {
 	ex := c.cur
+	if ex != nil && ex.pipe != nil {
+		ex.pipe.setHead(p.status, p.stringHeaders())
+		return
+	}
 	if ex == nil || ex.sink == nil || ex.sink.OnHeaders == nil {
 		return
 	}
@@ -200,6 +231,12 @@ func (l *eventLoop) beginStreamResponse(c *backendConn, p *h1Parser, contentLen 
 
 func (l *eventLoop) streamResponseChunk(c *backendConn, data []byte) {
 	ex := c.cur
+	if ex != nil && ex.pipe != nil {
+		if ex.pipe.push(data) {
+			l.pauseBackendRead(c)
+		}
+		return
+	}
 	if ex == nil || ex.sink == nil || ex.sink.OnBody == nil {
 		return
 	}
@@ -209,6 +246,9 @@ func (l *eventLoop) streamResponseChunk(c *backendConn, data []byte) {
 }
 
 func (l *eventLoop) endStreamResponse(ex *Exchange) {
+	if ex.pipe != nil {
+		ex.pipe.finish(nil)
+	}
 	if ex.done != nil {
 		close(ex.done)
 		return

@@ -94,7 +94,7 @@ func startSingleLoopProxy(t *testing.T, cfg DomainConfig) string {
 	return addr
 }
 
-func waitForProxy(t *testing.T, addr string) {
+func waitForProxy(t testing.TB, addr string) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

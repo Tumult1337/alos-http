@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -14,7 +16,10 @@ func TestQUICLostAckOnlyPacketIsNotRetransmittedFromScratch(t *testing.T) {
 	for pn := uint64(2); pn <= 6; pn++ {
 		ls.onPacketSent(quicSpaceAppData, pn, 30, true, []byte{quicFramePing})
 	}
-	lost := ls.onAckReceived(quicSpaceAppData, quicAckFrame{largestAck: 6, firstRange: 4}, 0)
+	if _, err := ls.onAckReceived(quicSpaceAppData, quicAckFrame{largestAck: 6, firstRange: 4}, 0, 7); err != nil {
+		t.Fatal(err)
+	}
+	lost := ls.detectLostPackets(quicSpaceAppData)
 	for _, f := range lost {
 		if bytes.Equal(f, []byte{0xde, 0xad, 0xbe, 0xef, 0x00}) {
 			t.Fatal("lost non-ack-eliciting packet retransmitted the overwritten scratch buffer")

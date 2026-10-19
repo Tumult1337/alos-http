@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -100,7 +100,7 @@ func TestShardedOriginStillReusesConnections(t *testing.T) {
 // share connections instead of each opening their own.
 func TestOriginPoolIsSharedAcrossConcurrentVisitors(t *testing.T) {
 	srv, accepted := countingOrigin(t)
-	client, err := NewUpstreamClient(UpstreamConfig{})
+	client, err := NewUpstreamClient(UpstreamConfig{LoopsPerOrigin: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,10 +144,7 @@ func TestOriginPoolIsSharedAcrossConcurrentVisitors(t *testing.T) {
 	t.Logf("%d requests from %d concurrent visitors opened %d TCP connections (%.1f reqs/conn)",
 		total, visitors, conns, reqsPerConn)
 
-	// A connection can only serve one request at a time, so the floor is the
-	// number of simultaneous visitors; sharding and churn allow some headroom
-	// above that. What must never happen is a dial per request.
-	if conns > int64(visitors)*3 {
+	if conns > int64(visitors) {
 		t.Errorf("opened %d connections for %d concurrent visitors; pool is not bounded", conns, visitors)
 	}
 	if reqsPerConn < 5 {
@@ -181,4 +178,70 @@ func TestSeparateOriginsDoNotShareConnections(t *testing.T) {
 		t.Fatal("both origins should have been contacted")
 	}
 	t.Logf("origin A opened %d conns, origin B opened %d conns", acceptedA.Load(), acceptedB.Load())
+}
+
+const poolWaveSize = 4
+
+func gatedOrigin(t *testing.T) (*httptest.Server, *atomic.Int64, chan struct{}, chan struct{}) {
+	t.Helper()
+	var accepted atomic.Int64
+	arrived := make(chan struct{}, poolWaveSize)
+	release := make(chan struct{}, poolWaveSize)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		<-release
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			accepted.Add(1)
+		}
+	}
+	srv.Start()
+	t.Cleanup(srv.Close)
+	return srv, &accepted, arrived, release
+}
+
+func TestSetMaxIdlePerBackendAppliesToTheLivePool(t *testing.T) {
+	srv, accepted, arrived, release := gatedOrigin(t)
+	client, err := NewUpstreamClient(UpstreamConfig{Loops: 1, LoopsPerOrigin: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	wave := func() {
+		var wg sync.WaitGroup
+		for range poolWaveSize {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				resp, err := client.Do(&UpstreamRequest{Scheme: "http", Authority: authorityOf(t, srv.URL), Method: "GET", Path: "/"})
+				if err != nil || resp.Status != 200 {
+					t.Errorf("resp=%v err=%v", resp, err)
+				}
+			}()
+		}
+		for range poolWaveSize {
+			<-arrived
+		}
+		for range poolWaveSize {
+			release <- struct{}{}
+		}
+		wg.Wait()
+	}
+
+	client.SetMaxIdlePerBackend(1)
+	wave()
+	wave()
+	if got, want := accepted.Load(), int64(poolWaveSize+poolWaveSize-1); got != want {
+		t.Fatalf("with one idle slot two waves opened %d connections, want %d", got, want)
+	}
+
+	client.SetMaxIdlePerBackend(poolWaveSize)
+	wave()
+	wave()
+	if got, want := accepted.Load(), int64(3*poolWaveSize-2); got != want {
+		t.Fatalf("after raising the cap two more waves brought the total to %d connections, want %d", got, want)
+	}
 }

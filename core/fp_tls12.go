@@ -1,33 +1,16 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
-	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/hmac"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
-	"hash"
 )
-
-func hashForScheme(scheme uint16) crypto.Hash {
-	switch scheme & 0xff {
-	case 0x04:
-		return crypto.SHA256
-	case 0x05:
-		return crypto.SHA384
-	case 0x06:
-		return crypto.SHA512
-	}
-	return crypto.SHA256
-}
 
 const (
 	suite12RSAAES128  = 0xc02f
@@ -35,6 +18,27 @@ const (
 	suite12RSAAES256  = 0xc030
 	suite12ECDSAES256 = 0xc02c
 )
+
+const (
+	tlsHSServerKeyExchange = 12
+	tlsHSServerHelloDone   = 14
+)
+
+const (
+	hs12AwaitCertificate uint8 = iota
+	hs12AwaitKeyExchange
+	hs12AwaitHelloDone
+	hs12AwaitHelloDoneAfterRequest
+	hs12FlightDone
+)
+
+var tls12ServerFlight = []hsTransition{
+	{hs12AwaitCertificate, tlsHSCertificate, hs12AwaitKeyExchange},
+	{hs12AwaitKeyExchange, tlsHSServerKeyExchange, hs12AwaitHelloDone},
+	{hs12AwaitHelloDone, tlsHSCertificateRequest, hs12AwaitHelloDoneAfterRequest},
+	{hs12AwaitHelloDone, tlsHSServerHelloDone, hs12FlightDone},
+	{hs12AwaitHelloDoneAfterRequest, tlsHSServerHelloDone, hs12FlightDone},
+}
 
 type aead12 struct {
 	aead     cipher.AEAD
@@ -50,7 +54,7 @@ func (t *tlsTransport) begin12() error {
 	default:
 		return errTLS
 	}
-	if t.suite == suite12RSAAES256 || t.suite == suite12ECDSAES256 {
+	if suiteUsesAES256(t.suite) {
 		t.hashFn = sha512.New384
 		t.hashLen = 48
 	} else {
@@ -65,6 +69,9 @@ func (t *tlsTransport) begin12() error {
 func (t *tlsTransport) feed12Record(c *backendConn, ctype byte, body []byte) error {
 	switch ctype {
 	case tlsRecChangeCipher:
+		if t.state != tls12ExpectFinished || t.serverCipherActive {
+			return errTLS
+		}
 		t.serverCipherActive = true
 		return nil
 	case tlsRecHandshake:
@@ -75,15 +82,21 @@ func (t *tlsTransport) feed12Record(c *backendConn, ctype byte, body []byte) err
 			}
 			return t.handle12Finished(c, plain)
 		}
+		if t.state != tls12ExpectHandshake {
+			return errTLS
+		}
 		return t.handle12Handshake(c, body)
 	case tlsRecAppData:
+		if t.state != tlsDone {
+			return errTLS
+		}
 		plain, err := t.open12(&t.server12, tlsRecAppData, body)
 		if err != nil {
 			return err
 		}
 		return c.proto.onData(c, plain)
 	case tlsRecAlert:
-		return fpErrConnClosed
+		return errFPConnClosed
 	}
 	return nil
 }
@@ -100,15 +113,22 @@ func (t *tlsTransport) handle12Handshake(c *backendConn, data []byte) error {
 		}
 		msg := t.inHS[:4+mlen]
 		mtype := msg[0]
+		if err := t.stepHandshake(tls12ServerFlight, mtype); err != nil {
+			return err
+		}
 		t.transcript = append(t.transcript, msg...)
 		switch mtype {
 		case tlsHSCertificate:
 			t.parseCertificate(msg[4:])
-		case 12:
+		case tlsHSCertificateRequest:
+			if err := t.parseCertificateRequest12(msg[4:]); err != nil {
+				return err
+			}
+		case tlsHSServerKeyExchange:
 			if err := t.parseServerKeyExchange(msg[4:]); err != nil {
 				return err
 			}
-		case 14:
+		case tlsHSServerHelloDone:
 			if err := t.send12ClientFlight(c); err != nil {
 				return err
 			}
@@ -164,47 +184,7 @@ func (t *tlsTransport) verifySKESignature(scheme uint16, signed, sig []byte) err
 	if err != nil {
 		return err
 	}
-	var h hash.Hash
-	var ch []byte
-	switch scheme & 0xff {
-	case 0x04:
-		s := sha256.Sum256(signed)
-		ch = s[:]
-		h = sha256.New()
-	case 0x05:
-		s := sha512.Sum384(signed)
-		ch = s[:]
-		h = sha512.New384()
-	case 0x06:
-		s := sha512.Sum512(signed)
-		ch = s[:]
-		h = sha512.New()
-	case 0x08:
-		ch = signed
-	default:
-		s := sha256.Sum256(signed)
-		ch = s[:]
-		h = sha256.New()
-	}
-	_ = h
-	switch pub := leaf.PublicKey.(type) {
-	case *rsa.PublicKey:
-		if scheme>>8 == 0x08 {
-			return rsa.VerifyPSS(pub, hashForScheme(scheme), ch, sig, nil)
-		}
-		return rsa.VerifyPKCS1v15(pub, hashForScheme(scheme), ch, sig)
-	case *ecdsa.PublicKey:
-		if !ecdsa.VerifyASN1(pub, ch, sig) {
-			return errTLS
-		}
-		return nil
-	case ed25519.PublicKey:
-		if !ed25519.Verify(pub, signed, sig) {
-			return errTLS
-		}
-		return nil
-	}
-	return errTLS
+	return verifyTLS12Signature(leaf.PublicKey, scheme, signed, sig)
 }
 
 func (t *tlsTransport) send12ClientFlight(c *backendConn) error {
@@ -212,6 +192,10 @@ func (t *tlsTransport) send12ClientFlight(c *backendConn) error {
 		if err := t.verifyCerts(); err != nil {
 			return err
 		}
+	}
+	chain, signer, err := t.requestedClientChain()
+	if err != nil {
+		return err
 	}
 	peerPub, err := ecdh.X25519().NewPublicKey(t.serverPub12)
 	if err != nil {
@@ -240,12 +224,20 @@ func (t *tlsTransport) send12ClientFlight(c *backendConn) error {
 	t.client12 = makeAEAD12(cwk, civ)
 	t.server12 = makeAEAD12(swk, siv)
 
+	if t.certRequested {
+		t.writeClientCertificate12(c, chain)
+	}
 	pub := t.priv.PublicKey().Bytes()
 	cke := make([]byte, 0, 5+len(pub))
 	cke = append(cke, 16, 0, 0, byte(len(pub)+1), byte(len(pub)))
 	cke = append(cke, pub...)
 	t.transcript = append(t.transcript, cke...)
 	c.wbuf.write(tlsPlaintextRecord(tlsRecHandshake, cke))
+	if len(chain) > 0 {
+		if err := t.writeClientCertificateVerify12(c, signer); err != nil {
+			return err
+		}
+	}
 
 	verifyData := t.prf(master, "client finished", t.hashOf(t.transcript), 12)
 	fin := make([]byte, 4+12)
@@ -350,7 +342,7 @@ func (t *tlsTransport) seal12To(dst []byte, k *aead12, contentType byte, plain [
 }
 
 func (t *tlsTransport) open12(k *aead12, contentType byte, body []byte) ([]byte, error) {
-	if len(body) < 8+16 {
+	if len(body) < 8+16 || k.aead == nil {
 		return nil, errTLS
 	}
 	nonce := &k.nonceBuf

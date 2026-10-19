@@ -1,12 +1,15 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"math/rand"
 	"sync/atomic"
+
+	"github.com/guno1928/turbo"
 )
 
 type loadBalancer interface {
-	pick(backends []*backend, clientIP string) int
+	pick(backends []*backend, clientIP string, now int64) int
 }
 
 func newBalancer(typ LoadBalancerType, backends []*backend) loadBalancer {
@@ -28,7 +31,7 @@ type roundRobinBalancer struct {
 	counter atomic.Uint64
 }
 
-func (b *roundRobinBalancer) pick(backends []*backend, _ string) int {
+func (b *roundRobinBalancer) pick(backends []*backend, _ string, now int64) int {
 	n := len(backends)
 	if n == 0 {
 		return -1
@@ -36,7 +39,7 @@ func (b *roundRobinBalancer) pick(backends []*backend, _ string) int {
 	start := int(b.counter.Add(1) - 1)
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		if backends[idx].Healthy.Load() {
+		if backends[idx].available(now) {
 			return idx
 		}
 	}
@@ -62,7 +65,7 @@ func newWeightedRR(backends []*backend) *weightedRRBalancer {
 	return &weightedRRBalancer{indices: indices}
 }
 
-func (b *weightedRRBalancer) pick(backends []*backend, _ string) int {
+func (b *weightedRRBalancer) pick(backends []*backend, _ string, now int64) int {
 	n := len(b.indices)
 	if n == 0 {
 		return -1
@@ -70,7 +73,7 @@ func (b *weightedRRBalancer) pick(backends []*backend, _ string) int {
 	start := int(b.counter.Add(1) - 1)
 	for i := 0; i < n; i++ {
 		idx := b.indices[(start+i)%n]
-		if backends[idx].Healthy.Load() {
+		if backends[idx].available(now) {
 			return idx
 		}
 	}
@@ -79,11 +82,11 @@ func (b *weightedRRBalancer) pick(backends []*backend, _ string) int {
 
 type leastConnBalancer struct{}
 
-func (b *leastConnBalancer) pick(backends []*backend, _ string) int {
+func (b *leastConnBalancer) pick(backends []*backend, _ string, now int64) int {
 	best := -1
 	var bestCount int64 = 1<<63 - 1
 	for i, be := range backends {
-		if !be.Healthy.Load() {
+		if !be.available(now) {
 			continue
 		}
 		c := be.ActiveConns.Load()
@@ -97,7 +100,7 @@ func (b *leastConnBalancer) pick(backends []*backend, _ string) int {
 
 type ipHashBalancer struct{}
 
-func (b *ipHashBalancer) pick(backends []*backend, clientIP string) int {
+func (b *ipHashBalancer) pick(backends []*backend, clientIP string, now int64) int {
 	n := len(backends)
 	if n == 0 {
 		return -1
@@ -106,7 +109,7 @@ func (b *ipHashBalancer) pick(backends []*backend, clientIP string) int {
 	start := int(h % uint64(n))
 	for i := 0; i < n; i++ {
 		idx := (start + i) % n
-		if backends[idx].Healthy.Load() {
+		if backends[idx].available(now) {
 			return idx
 		}
 	}
@@ -115,23 +118,23 @@ func (b *ipHashBalancer) pick(backends []*backend, clientIP string) int {
 
 type randomBalancer struct{}
 
-func (b *randomBalancer) pick(backends []*backend, _ string) int {
+func (b *randomBalancer) pick(backends []*backend, _ string, now int64) int {
 	n := len(backends)
 	if n == 0 {
 		return -1
 	}
 	count := 0
 	for i := 0; i < n; i++ {
-		if backends[i].Healthy.Load() {
+		if backends[i].available(now) {
 			count++
 		}
 	}
 	if count == 0 {
 		return -1
 	}
-	target := rand.Intn(count)
+	target := turbo.Intn(count)
 	for i := 0; i < n; i++ {
-		if backends[i].Healthy.Load() {
+		if backends[i].available(now) {
 			if target == 0 {
 				return i
 			}

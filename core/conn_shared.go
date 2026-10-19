@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 const (
@@ -28,42 +30,23 @@ func indexByteFrom(b []byte, c byte, from int) int {
 }
 
 func asyncChunkedComplete(buf []byte, pos int) (bodyEnd int, status int, resume int) {
+	var d chunkedDecoder
+	chunkStart := pos
 	for {
-		chunkStart := pos
-		nl := indexByteFrom(buf, '\n', pos)
-		if nl < 0 {
-			return 0, 0, chunkStart
-		}
-		line := buf[pos:nl]
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
-		}
-		if semi := indexByteFrom(line, ';', 0); semi >= 0 {
-			line = line[:semi]
-		}
-		line = trimASCIISpaceBytes(line)
-		size, ok := parseHex64Bytes(line)
-		if !ok {
+		n, _, err := d.next(buf[pos:])
+		if err != nil {
 			return 0, -1, chunkStart
 		}
-		pos = nl + 1
-		if size == 0 {
-			for {
-				nl2 := indexByteFrom(buf, '\n', pos)
-				if nl2 < 0 {
-					return 0, 0, chunkStart
-				}
-				tline := buf[pos:nl2]
-				pos = nl2 + 1
-				if len(tline) == 0 || (len(tline) == 1 && tline[0] == '\r') {
-					return pos, 1, pos
-				}
-			}
-		}
-		if size > int64(len(buf)-pos-2) {
+		if n == 0 {
 			return 0, 0, chunkStart
 		}
-		pos += int(size) + 2
+		pos += n
+		if d.done() {
+			return pos, 1, pos
+		}
+		if d.state == chunkedAwaitSize {
+			chunkStart = pos
+		}
 	}
 }
 

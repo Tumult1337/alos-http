@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -27,7 +29,7 @@ const (
 //
 //	Example: Name: "session" emits "session=...".
 //
-// Value is the cookie value; it is written verbatim with CR, LF, and NUL bytes stripped.
+// Value is the cookie value; it is written verbatim with CR, LF, NUL and ";" bytes stripped.
 //
 //	Example: Value: "abc123" emits "session=abc123".
 //
@@ -63,15 +65,16 @@ const (
 //
 //	Example: SameSite: SameSiteLax emits "; SameSite=Lax".
 type Cookie struct {
-	Name     string
-	Value    string
-	Path     string
-	Domain   string
-	MaxAge   int
-	Expires  time.Time
-	Secure   bool
-	HttpOnly bool
-	SameSite SameSite
+	Name        string
+	Value       string
+	Path        string
+	Domain      string
+	MaxAge      int
+	Expires     time.Time
+	Secure      bool
+	HttpOnly    bool
+	SameSite    SameSite
+	Partitioned bool
 }
 
 const maxCookiePairs = 1000
@@ -114,19 +117,32 @@ func cookieStripCTL(s string) string {
 	return strings.NewReplacer("\r", "", "\n", "", "\x00", "").Replace(s)
 }
 
-// String serializes the cookie into a Set-Cookie header value, stripping CR, LF, and NUL bytes from Name, Value, Path, and Domain.
+func cookieAttributeSafe(s string) string {
+	if !strings.ContainsAny(s, "\r\n\x00;") {
+		return s
+	}
+	b := make([]byte, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c != '\r' && c != '\n' && c != 0 && c != ';' {
+			b = append(b, c)
+		}
+	}
+	return string(b)
+}
+
+// String serializes the cookie into a Set-Cookie header value, stripping CR, LF, NUL and ";" bytes from Name, Value, Path, and Domain.
 func (c *Cookie) String() string {
 	var b strings.Builder
-	b.WriteString(cookieStripCTL(c.Name))
+	b.WriteString(cookieAttributeSafe(c.Name))
 	b.WriteByte('=')
-	b.WriteString(cookieStripCTL(c.Value))
+	b.WriteString(cookieAttributeSafe(c.Value))
 	if c.Path != "" {
 		b.WriteString("; Path=")
-		b.WriteString(cookieStripCTL(c.Path))
+		b.WriteString(cookieAttributeSafe(c.Path))
 	}
 	if c.Domain != "" {
 		b.WriteString("; Domain=")
-		b.WriteString(cookieStripCTL(c.Domain))
+		b.WriteString(cookieAttributeSafe(c.Domain))
 	}
 	if c.MaxAge > 0 {
 		b.WriteString("; Max-Age=")
@@ -141,7 +157,7 @@ func (c *Cookie) String() string {
 	if c.HttpOnly {
 		b.WriteString("; HttpOnly")
 	}
-	if c.Secure {
+	if c.Secure || c.Partitioned {
 		b.WriteString("; Secure")
 	}
 	switch c.SameSite {
@@ -151,6 +167,9 @@ func (c *Cookie) String() string {
 		b.WriteString("; SameSite=Strict")
 	case SameSiteNone:
 		b.WriteString("; SameSite=None")
+	}
+	if c.Partitioned {
+		b.WriteString("; Partitioned")
 	}
 	return b.String()
 }

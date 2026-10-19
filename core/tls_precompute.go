@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -86,6 +88,10 @@ func (cs *CipherSuiteConfig) initPrecompute() {
 	cs.labelServerHSTraffic = newHKDFLabelTemplate("s hs traffic", cs.HashLen, cs.HashLen, cs.HashLen)
 	cs.labelClientAppTraffic = newHKDFLabelTemplate("c ap traffic", cs.HashLen, cs.HashLen, cs.HashLen)
 	cs.labelServerAppTraffic = newHKDFLabelTemplate("s ap traffic", cs.HashLen, cs.HashLen, cs.HashLen)
+	cs.labelResBinder = newHKDFLabelTemplate("res binder", cs.HashLen, cs.HashLen, cs.HashLen)
+	cs.labelResMaster = newHKDFLabelTemplate("res master", cs.HashLen, cs.HashLen, cs.HashLen)
+	cs.labelResumption = newHKDFLabelTemplate("resumption", cs.HashLen, 0, cs.HashLen)
+	cs.labelTrafficUpdate = newHKDFLabelTemplate("traffic upd", cs.HashLen, 0, cs.HashLen)
 
 	var earlyBuf [64]byte
 	cs.earlySecret = append(cs.earlySecret[:0], TLSExtractTo(cs.HashFn, cs.zeroHashInput, cs.zeroHashInput, earlyBuf[:0])...)

@@ -1,7 +1,8 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"log"
 	"regexp"
 	"sync/atomic"
 	"time"
@@ -124,6 +125,26 @@ type RateLimitEngine struct {
 	clients *alosmap.TypedMap[string, *rlEntry]
 	stopCh  chan struct{}
 	OnLimit RateLimitFunc
+
+	liveOnLimit atomic.Pointer[RateLimitFunc]
+}
+
+func (rle *RateLimitEngine) limitHook() RateLimitFunc {
+	if fn := rle.liveOnLimit.Load(); fn != nil {
+		return *fn
+	}
+	return rle.OnLimit
+}
+
+type rateLimitRefusal struct {
+	rule       *compiledRule
+	retryAfter time.Duration
+}
+
+func (r rateLimitRefusal) refused() bool { return r.rule != nil }
+
+func (r rateLimitRefusal) runsHook(rle *RateLimitEngine) bool {
+	return r.rule.rule.OnLimit != nil || rle.limitHook() != nil
 }
 
 // NewRateLimitEngine creates a new rate limiter with an empty rule set and starts
@@ -148,7 +169,7 @@ func compileRule(rule RateLimitRule) compiledRule {
 		var err error
 		cr.re, err = regexp.Compile(path[1:])
 		if err != nil {
-			log.Printf("[RATELIMIT] invalid regex pattern %q: %v", path[1:], err)
+			logger().Error("rate limit rule has an invalid regex", "pattern", path[1:], "err", err)
 		}
 		return cr
 	}
@@ -259,6 +280,9 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 	cr := rle.matchRule(path)
 	if cr == nil {
 		return true, nil, 0
+	}
+	if !isIPv4Text(ip) {
+		ip = rateLimitKeyForIP(ip)
 	}
 
 	var keyBuf [128]byte

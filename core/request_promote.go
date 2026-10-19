@@ -1,16 +1,58 @@
+//go:build linux && amd64
+
 package core
 
 import "unsafe"
 
 const promoteArenaChunk = 16 << 10
 
+const (
+	internedGET     = "GET"
+	internedPOST    = "POST"
+	internedPUT     = "PUT"
+	internedDELETE  = "DELETE"
+	internedPATCH   = "PATCH"
+	internedHEAD    = "HEAD"
+	internedOPTIONS = "OPTIONS"
+	internedHTTP10  = "HTTP/1.0"
+	internedHTTP11  = "HTTP/1.1"
+)
+
+func isInternedString(s string) bool {
+	data := unsafe.StringData(s)
+	switch len(s) {
+	case 3:
+		return data == unsafe.StringData(internedGET) || data == unsafe.StringData(internedPUT)
+	case 4:
+		return data == unsafe.StringData(internedPOST) || data == unsafe.StringData(internedHEAD)
+	case 5:
+		return data == unsafe.StringData(internedPATCH)
+	case 6:
+		return data == unsafe.StringData(internedDELETE)
+	case 7:
+		return data == unsafe.StringData(internedOPTIONS)
+	case 8:
+		return data == unsafe.StringData(internedHTTP11) || data == unsafe.StringData(internedHTTP10)
+	}
+	return false
+}
+
+func sameStringBytes(a, b string) bool {
+	return len(a) == len(b) && unsafe.StringData(a) == unsafe.StringData(b)
+}
+
+func (r *Request) setOwnedRemoteAddr(addr string) {
+	r.RemoteAddr = addr
+	r.ownedRemoteAddr = addr
+}
+
 func (r *Request) promoteAlloc(n int) []byte {
-	if r.promoteBuf == nil || r.promoteOff+n > len(r.promoteBuf) {
-		size := promoteArenaChunk
-		if n > size {
-			size = n
-		}
-		r.promoteBuf = make([]byte, size)
+	switch {
+	case r.promoteBuf == nil:
+		r.promoteBuf = make([]byte, n)
+		r.promoteOff = 0
+	case r.promoteOff+n > len(r.promoteBuf):
+		r.promoteBuf = make([]byte, max(n, promoteArenaChunk))
 		r.promoteOff = 0
 	}
 	start := r.promoteOff
@@ -69,4 +111,67 @@ func promoteRequestStrings(r *Request) {
 		r.Headers[i][0], off = promoteTake(buf, off, r.Headers[i][0])
 		r.Headers[i][1], off = promoteTake(buf, off, r.Headers[i][1])
 	}
+}
+
+type promoteNamedFields = [7]string
+
+type promoteCachedFields = [12]string
+
+type aliasRebase struct {
+	base uintptr
+	size uintptr
+	dst  unsafe.Pointer
+}
+
+func (a *aliasRebase) rebase(s string) (string, bool) {
+	off := uintptr(unsafe.Pointer(unsafe.StringData(s))) - a.base
+	if off < a.size && a.size-off >= uintptr(len(s)) {
+		return unsafe.String((*byte)(unsafe.Add(a.dst, off)), len(s)), true
+	}
+	return s, len(s) == 0
+}
+
+func (a *aliasRebase) promoteAll(r *Request, fields []string) {
+	for i := range fields {
+		if rebased, done := a.rebase(fields[i]); done {
+			fields[i] = rebased
+			continue
+		}
+		fields[i] = r.promoteCopy(fields[i])
+	}
+}
+
+//go:noinline
+func (r *Request) promoteCopy(s string) string {
+	own := r.promoteAlloc(len(s))
+	copy(own, s)
+	return unsafe.String(&own[0], len(s))
+}
+
+func promoteRequestHead(r *Request, block []byte) {
+	if !r.aliasesReadBuf {
+		return
+	}
+	r.aliasesReadBuf = false
+	buf := r.promoteAlloc(len(block))
+	copy(buf, block)
+	a := aliasRebase{
+		base: uintptr(unsafe.Pointer(unsafe.SliceData(block))),
+		size: uintptr(len(block)),
+		dst:  unsafe.Pointer(unsafe.SliceData(buf)),
+	}
+	named := (*promoteNamedFields)(unsafe.Pointer(&r.Method))
+	if !isInternedString(r.Method) {
+		a.promoteAll(r, named[0:1])
+	}
+	a.promoteAll(r, named[1:4])
+	if !isInternedString(r.Proto) {
+		a.promoteAll(r, named[4:5])
+	}
+	a.promoteAll(r, named[5:6])
+	if !sameStringBytes(r.RemoteAddr, r.ownedRemoteAddr) {
+		a.promoteAll(r, named[6:7])
+	}
+	a.promoteAll(r, (*promoteCachedFields)(unsafe.Pointer(&r.cachedCL))[:])
+	a.promoteAll(r, unsafe.Slice((*string)(unsafe.Pointer(unsafe.SliceData(r.Headers))), 2*len(r.Headers)))
 }

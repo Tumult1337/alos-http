@@ -1,7 +1,10 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"log"
+	"crypto/tls"
+	"crypto/x509"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +58,9 @@ type BackendConfig struct {
 	Weight        int
 	TLS           bool
 	TLSSkipVerify bool
+	RootCAs       *x509.CertPool
+	ServerName    string
+	ClientCert    *tls.Certificate
 }
 
 // HealthCheckConfig configures active health checking for backends in a domain.
@@ -323,8 +329,11 @@ type DomainConfig struct {
 	MaxIdleConns   int
 	IdleTimeout    time.Duration
 	HealthCheck    HealthCheckConfig
+	Outlier        OutlierConfig
 	HostHeader     string
 	PreserveHost   bool
+
+	TrustIdempotencyKey bool
 }
 
 func (dc *DomainConfig) normalize() {
@@ -352,6 +361,7 @@ func (dc *DomainConfig) normalize() {
 		}
 		normalizeBackendAddr(&dc.Backends[i])
 	}
+	dc.Outlier.normalize()
 	if dc.HealthCheck.Enabled {
 		if dc.HealthCheck.Interval <= 0 {
 			dc.HealthCheck.Interval = 10 * time.Second
@@ -400,14 +410,25 @@ type backend struct {
 	TLSSkipVerify bool
 	Healthy       atomic.Bool
 	ActiveConns   atomic.Int64
-	pool          *connPool
+	trust         *upstreamTrust
+	outlier       outlierState
 }
 
 type domainState struct {
 	config   DomainConfig
 	backends []*backend
 	balancer loadBalancer
+	outlier  *outlierDetector
 	health   *healthChecker
+}
+
+func newDomainState(cfg DomainConfig, backends []*backend) *domainState {
+	return &domainState{
+		config:   cfg,
+		backends: backends,
+		balancer: newBalancer(cfg.LoadBalancer, backends),
+		outlier:  newOutlierDetector(cfg.Outlier, backends),
+	}
 }
 
 // ProxyEngine is the core reverse-proxy component that routes incoming TLS
@@ -431,6 +452,50 @@ type ProxyEngine struct {
 	OnRequest  ProxyInterceptFunc
 	OnResponse ProxyResponseFunc
 	Cache      *ProxyCache
+
+	h2Buffered     atomic.Int64
+	liveOnError    atomic.Pointer[ProxyErrorFunc]
+	liveOnRequest  atomic.Pointer[ProxyInterceptFunc]
+	liveOnResponse atomic.Pointer[ProxyResponseFunc]
+	liveCache      atomic.Pointer[ProxyCache]
+}
+
+func (pe *ProxyEngine) errorHook() ProxyErrorFunc {
+	if fn := pe.liveOnError.Load(); fn != nil {
+		return *fn
+	}
+	return pe.OnError
+}
+
+func (pe *ProxyEngine) requestHook() ProxyInterceptFunc {
+	if fn := pe.liveOnRequest.Load(); fn != nil {
+		return *fn
+	}
+	return pe.OnRequest
+}
+
+func (pe *ProxyEngine) responseHook() ProxyResponseFunc {
+	if fn := pe.liveOnResponse.Load(); fn != nil {
+		return *fn
+	}
+	return pe.OnResponse
+}
+
+func (pe *ProxyEngine) activeCache() *ProxyCache {
+	if c := pe.liveCache.Load(); c != nil {
+		return c
+	}
+	return pe.Cache
+}
+
+func (pe *ProxyEngine) replaceCache(cfg ProxyCacheConfig) {
+	old := pe.liveCache.Swap(NewProxyCache(cfg))
+	if old == nil {
+		old = pe.Cache
+	}
+	if old != nil {
+		old.Stop()
+	}
 }
 
 // NewProxyEngine creates a ProxyEngine with an empty domain table. This is called
@@ -441,20 +506,6 @@ func NewProxyEngine() *ProxyEngine {
 		stopCh:  make(chan struct{}),
 	}
 	return pe
-}
-
-func (pe *ProxyEngine) ensureCache() *ProxyCache {
-	if pe.Cache != nil {
-		return pe.Cache
-	}
-
-	pe.mu.Lock()
-	defer pe.mu.Unlock()
-
-	if pe.Cache == nil {
-		pe.Cache = NewProxyCache(DefaultProxyCacheConfig())
-	}
-	return pe.Cache
 }
 
 // AddDomain registers or replaces a domain configuration. If a domain with the
@@ -469,7 +520,7 @@ func (pe *ProxyEngine) ensureCache() *ProxyCache {
 func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 	cfg.Domain = normalizeCertDomain(cfg.Domain)
 	if cfg.Domain == "" {
-		log.Printf("[PROXY] AddDomain rejected: empty domain name")
+		logger().Warn("proxy domain rejected: empty domain name")
 		return
 	}
 
@@ -482,11 +533,6 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 		if prev.health != nil {
 			prev.health.stop()
 		}
-		for _, b := range prev.backends {
-			if b.pool != nil {
-				b.pool.close()
-			}
-		}
 	}
 
 	backends := make([]*backend, len(cfg.Backends))
@@ -496,19 +542,13 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 			Weight:        bc.Weight,
 			TLS:           bc.TLS,
 			TLSSkipVerify: bc.TLSSkipVerify,
+			trust:         newUpstreamTrust(bc),
 		}
 		b.Healthy.Store(true)
-		if backendPoolRequired {
-			b.pool = newConnPool(bc.Addr, bc.TLS, bc.TLSSkipVerify, cfg.MaxIdleConns, cfg.IdleTimeout, cfg.ConnectTimeout)
-		}
 		backends[i] = b
 	}
 
-	ds := &domainState{
-		config:   cfg,
-		backends: backends,
-		balancer: newBalancer(cfg.LoadBalancer, backends),
-	}
+	ds := newDomainState(cfg, backends)
 
 	if cfg.HealthCheck.Enabled && len(backends) > 0 {
 		ds.health = newHealthChecker(backends, cfg.HealthCheck, pe.stopCh)
@@ -517,7 +557,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 
 	pe.domains.Store(cfg.Domain, ds)
 
-	log.Printf("[PROXY] domain %s configured (%d backends, lb=%d)", cfg.Domain, len(backends), cfg.LoadBalancer)
+	logger().Info("proxy domain configured", "domain", cfg.Domain, "backends", len(backends), "balancer", int(cfg.LoadBalancer))
 }
 
 // RemoveDomain removes a domain by name and gracefully shuts down its health
@@ -536,14 +576,9 @@ func (pe *ProxyEngine) RemoveDomain(domain string) {
 	if prev.health != nil {
 		prev.health.stop()
 	}
-	for _, b := range prev.backends {
-		if b.pool != nil {
-			b.pool.close()
-		}
-	}
 
 	pe.domains.Delete(domain)
-	log.Printf("[PROXY] domain %s removed", domain)
+	logger().Info("proxy domain removed", "domain", domain)
 }
 
 // Lookup returns the domainState registered for host, or nil if host has no matching domain.
@@ -560,17 +595,12 @@ func (pe *ProxyEngine) Lookup(host string) *domainState {
 func (pe *ProxyEngine) Stop() {
 	pe.stopOnce.Do(func() {
 		close(pe.stopCh)
-		if pe.Cache != nil {
-			pe.Cache.Stop()
+		if cache := pe.activeCache(); cache != nil {
+			cache.Stop()
 		}
 		pe.domains.Range(func(_ string, ds *domainState) bool {
 			if ds.health != nil {
 				ds.health.stop()
-			}
-			for _, b := range ds.backends {
-				if b.pool != nil {
-					b.pool.close()
-				}
 			}
 			return true
 		})

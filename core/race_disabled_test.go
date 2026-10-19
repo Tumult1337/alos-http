@@ -1,4 +1,4 @@
-//go:build !race
+//go:build linux && amd64 && !race
 
 package core
 

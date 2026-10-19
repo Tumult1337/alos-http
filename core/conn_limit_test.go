@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -159,26 +161,26 @@ func TestPerIPConnLimiter_NeverExceedsLimitUnderRace(t *testing.T) {
 
 func TestConfig_MaxConnsPerIP_Default20(t *testing.T) {
 	s := New(Config{})
-	defer s.perIPConnLimiter.Stop()
-	if s.perIPConnLimiter == nil {
+	defer s.perIPConnLimiter.Load().Stop()
+	if s.perIPConnLimiter.Load() == nil {
 		t.Fatal("limiter should be created by default")
 	}
-	if s.maxConnsPerIP != 20 {
-		t.Fatalf("default maxConnsPerIP=%d want 20", s.maxConnsPerIP)
+	if s.Limits().MaxConnsPerIP != 20 {
+		t.Fatalf("default maxConnsPerIP=%d want 20", s.Limits().MaxConnsPerIP)
 	}
 }
 
 func TestConfig_MaxConnsPerIP_Explicit(t *testing.T) {
 	s := New(Config{MaxConnsPerIP: 5})
-	defer s.perIPConnLimiter.Stop()
-	if s.maxConnsPerIP != 5 {
-		t.Fatalf("maxConnsPerIP=%d want 5", s.maxConnsPerIP)
+	defer s.perIPConnLimiter.Load().Stop()
+	if s.Limits().MaxConnsPerIP != 5 {
+		t.Fatalf("maxConnsPerIP=%d want 5", s.Limits().MaxConnsPerIP)
 	}
 }
 
 func TestConfig_MaxConnsPerIP_Disabled(t *testing.T) {
 	s := New(Config{MaxConnsPerIP: -1})
-	if s.perIPConnLimiter != nil {
+	if s.perIPConnLimiter.Load() != nil {
 		t.Fatal("negative MaxConnsPerIP must disable the limiter")
 	}
 }

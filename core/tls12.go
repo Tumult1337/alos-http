@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -12,6 +14,7 @@ import (
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"hash"
@@ -44,6 +47,10 @@ func tls12MasterSecret(newHash func() hash.Hash, pms, clientRandom, serverRandom
 	seed = append(seed, clientRandom...)
 	seed = append(seed, serverRandom...)
 	return tls12PRF(newHash, pms, []byte("master secret"), seed, 48)
+}
+
+func tls12ExtendedMasterSecret(newHash func() hash.Hash, pms, sessionHash []byte) []byte {
+	return tls12PRF(newHash, pms, []byte("extended master secret"), sessionHash, 48)
 }
 
 func tls12KeyBlock(newHash func() hash.Hash, master, clientRandom, serverRandom []byte, keyLen, ivLen int) (cwk, swk, civ, siv []byte) {
@@ -279,16 +286,38 @@ func tls12Handshake(typ byte, body []byte) []byte {
 	return append(out, body...)
 }
 
-func buildTLS12ServerHello(serverRandom []byte, suite uint16, alpn string) []byte {
+type tls12HelloOptions struct {
+	alpn                 string
+	sessionID            []byte
+	extendedMasterSecret bool
+	secureRenegotiation  bool
+	sessionTicket        bool
+	ocspStaple           bool
+}
+
+func buildTLS12ServerHello(serverRandom []byte, suite uint16, opts tls12HelloOptions) []byte {
+	alpn := opts.alpn
 	body := make([]byte, 0, 80)
 	body = append(body, 0x03, 0x03)
 	body = append(body, serverRandom...)
-	body = append(body, 0x00)
+	body = append(body, byte(len(opts.sessionID)))
+	body = append(body, opts.sessionID...)
 	body = append(body, byte(suite>>8), byte(suite))
 	body = append(body, 0x00)
 
-	ext := make([]byte, 0, 32)
-	ext = append(ext, 0xff, 0x01, 0x00, 0x01, 0x00)
+	ext := make([]byte, 0, 36)
+	if opts.secureRenegotiation {
+		ext = append(ext, 0xff, 0x01, 0x00, 0x01, 0x00)
+	}
+	if opts.extendedMasterSecret {
+		ext = append(ext, 0x00, 0x17, 0x00, 0x00)
+	}
+	if opts.sessionTicket {
+		ext = append(ext, 0x00, 0x23, 0x00, 0x00)
+	}
+	if opts.ocspStaple {
+		ext = append(ext, byte(tlsExtStatusRequest>>8), byte(tlsExtStatusRequest), 0x00, 0x00)
+	}
 	ext = append(ext, 0x00, 0x0b, 0x00, 0x02, 0x01, 0x00)
 	if alpn != "" {
 		inner := []byte{byte(len(alpn))}
@@ -319,16 +348,28 @@ func buildTLS12Certificate(chain [][]byte) []byte {
 func buildTLS12ServerHelloDone() []byte { return tls12Handshake(0x0e, nil) }
 
 type tls12State struct {
-	suite        *tls12Suite
-	curve        tls12Curve
-	ecdhePriv    *ecdh.PrivateKey
-	clientRandom [32]byte
-	serverRandom [32]byte
-	master       []byte
-	transcript   hash.Hash
-	reader       *tls12AEAD
-	writer       *tls12AEAD
-	gotCCS       bool
+	suite         *tls12Suite
+	curve         tls12Curve
+	ecdhePriv     *ecdh.PrivateKey
+	clientRandom  [32]byte
+	serverRandom  [32]byte
+	master        []byte
+	transcript    hash.Hash
+	reader        *tls12AEAD
+	writer        *tls12AEAD
+	gotCCS        bool
+	ems           bool
+	resumed       bool
+	serverCCSSent bool
+	issueTicket   bool
+	sni           string
+	clientAuth    clientAuthPolicy
+	expectCert    bool
+	expectCV      bool
+	cvTranscript  hash.Hash
+	pending       []byte
+	peerCerts     []*x509.Certificate
+	peerChain     [][]byte
 }
 
 func tls12KeyTypeOf(signer crypto.Signer) (tls12KeyType, bool) {
@@ -365,7 +406,25 @@ func (st *tls12State) deriveKeys(peer []byte) bool {
 	if !ok {
 		return false
 	}
-	st.master = tls12MasterSecret(st.suite.newHash, shared, st.clientRandom[:], st.serverRandom[:])
+	if st.ems {
+		var sessionHashBuf [64]byte
+		st.master = tls12ExtendedMasterSecret(st.suite.newHash, shared, st.transcript.Sum(sessionHashBuf[:0]))
+	} else {
+		st.master = tls12MasterSecret(st.suite.newHash, shared, st.clientRandom[:], st.serverRandom[:])
+	}
+	return st.installKeys()
+}
+
+func (st *tls12State) newServerRandom() bool {
+	sentinelAt := tls12RandomLen - len(tls13DowngradeSentinel)
+	if _, err := rand.Read(st.serverRandom[:sentinelAt]); err != nil {
+		return false
+	}
+	copy(st.serverRandom[sentinelAt:], tls13DowngradeSentinel)
+	return true
+}
+
+func (st *tls12State) installKeys() bool {
 	cwk, swk, civ, siv := tls12KeyBlock(st.suite.newHash, st.master, st.clientRandom[:], st.serverRandom[:], st.suite.keyLen, st.suite.ivLen)
 	rAead, err := st.suite.aead(cwk)
 	if err != nil {
@@ -381,21 +440,38 @@ func (st *tls12State) deriveKeys(peer []byte) bool {
 }
 
 func buildTLS12AppDataRecords(dst []byte, w *tls12AEAD, payload []byte) []byte {
-	if w == nil || len(payload) == 0 {
+	return buildTLS12AppDataRecordsParts(dst, w, nil, payload)
+}
+
+func buildTLS12AppDataRecordsParts(dst []byte, w *tls12AEAD, head, body []byte) []byte {
+	total := len(head) + len(body)
+	if w == nil || total == 0 {
 		return dst
 	}
 	perRecord := tls12RecordHeaderLen + w.aead.Overhead()
 	if !w.isChaCha {
 		perRecord += tls12ExplicitNonceLen
 	}
-	records := (len(payload) + MaxRecordPayload - 1) / MaxRecordPayload
-	dst = ensureTailCap(dst, len(payload)+records*perRecord)
-	for len(payload) > 0 {
-		chunk := payload
-		if len(chunk) > MaxRecordPayload {
-			chunk = chunk[:MaxRecordPayload]
+	records := (total + MaxRecordPayload - 1) / MaxRecordPayload
+	dst = ensureTailCap(dst, total+records*perRecord)
+	if len(head) > 0 {
+		scratch := acquirePooledBuf(&tlsScratchPool)
+		if cap(scratch) < MaxRecordPayload {
+			scratch = make([]byte, 0, MaxRecordPayload)
 		}
-		payload = payload[len(chunk):]
+		record := scratch[:MaxRecordPayload]
+		for len(head) > 0 {
+			n := copy(record, head)
+			head = head[n:]
+			m := copy(record[n:], body)
+			body = body[m:]
+			dst = w.sealTo(dst, 0x17, record[:n+m])
+		}
+		releasePooledBuf(&tlsScratchPool, scratch, MaxRecordSize)
+	}
+	for len(body) > 0 {
+		chunk := body[:min(len(body), MaxRecordPayload)]
+		body = body[len(chunk):]
 		dst = w.sealTo(dst, 0x17, chunk)
 	}
 	return dst

@@ -1,10 +1,11 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"crypto/ecdsa"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 )
 
@@ -27,7 +28,7 @@ func TestACMEAccountKeyPersistsAcrossRestarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0077 != 0 {
+	if info.Mode().Perm()&0077 != 0 {
 		t.Fatalf("account key mode %v is readable by others", info.Mode().Perm())
 	}
 }

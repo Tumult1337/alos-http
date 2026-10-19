@@ -1,36 +1,44 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
 	"errors"
+	"io"
+	"net/netip"
+	"sync/atomic"
 	"time"
 )
 
 var (
-	fpErrTimeout        = errors.New("outbound: request timeout")
-	fpErrConnClosed     = errors.New("outbound: backend connection closed")
-	fpErrDialFailed     = errors.New("outbound: dial failed")
-	fpErrBadResponse    = errors.New("outbound: malformed response")
-	fpErrBodyTooLarge   = errors.New("outbound: response body too large")
-	fpErrHeaderTooLarge = errors.New("outbound: response headers too large")
-	fpErrClientClosed   = errors.New("outbound: client closed")
-	fpErrBadAuthority   = errors.New("outbound: bad authority")
-	fpErrDNSFailed      = errors.New("outbound: dns lookup failed")
-	fpErrTooManyConns   = errors.New("outbound: backend connection limit reached")
+	errFPTimeout        = errors.New("outbound: request timeout")
+	errFPConnClosed     = errors.New("outbound: backend connection closed")
+	errFPDialFailed     = errors.New("outbound: dial failed")
+	errFPBadResponse    = errors.New("outbound: malformed response")
+	errFPBodyTooLarge   = errors.New("outbound: response body too large")
+	errFPHeaderTooLarge = errors.New("outbound: response headers too large")
+	errFPClientClosed   = errors.New("outbound: client closed")
+	errFPBadAuthority   = errors.New("outbound: bad authority")
+	errFPDNSFailed      = errors.New("outbound: dns lookup failed")
+	errFPTooManyConns   = errors.New("outbound: backend connection limit reached")
 )
 
 type fpRequest struct {
-	Scheme     string
-	Authority  string
-	Method     string
-	Path       string
-	HostHeader string
-	Headers    [][2]string
-	Body       []byte
-	Upgrade    string
-	SkipVerify bool
-	H2         bool
+	Scheme      string
+	Authority   string
+	Method      string
+	Path        string
+	HostHeader  string
+	Headers     [][2]string
+	Body        []byte
+	BodySource  io.Reader
+	BodyLength  int64
+	Upgrade     string
+	SkipVerify  bool
+	trust       *upstreamTrust
+	H2          bool
+	DialTimeout time.Duration
+	ReadTimeout time.Duration
 }
 
 type fpResponse struct {
@@ -58,6 +66,7 @@ type poolKey struct {
 	tls        bool
 	h2         bool
 	skipVerify bool
+	trust      *upstreamTrust
 }
 
 // Exchange represents a single outbound request/response cycle as it is
@@ -70,7 +79,7 @@ type Exchange struct {
 	err      error
 	done     chan struct{}
 	deadline int64
-	ip       [4]byte
+	ip       netip.Addr
 	// rawRequest is a fully serialised request line, headers and body. When it
 	// is set the H1 protocol writes it verbatim instead of building one from
 	// req, which lets the caller own header filtering and sanitisation.
@@ -85,9 +94,20 @@ type Exchange struct {
 	port               uint16
 	key                poolKey
 	sink               *UpstreamStream
+	body               *upstreamBody
+	pipe               *respPipe
+	h2st               *h2Stream
 	pnext              *Exchange
 	retried            bool
 	finished           bool
+	started            bool
+	wroteRequest       bool
+	replayable         bool
+
+	queued       atomic.Bool
+	bodyReady    atomic.Bool
+	resumeWanted atomic.Bool
+	abortWanted  atomic.Bool
 }
 
 type fpConfig struct {

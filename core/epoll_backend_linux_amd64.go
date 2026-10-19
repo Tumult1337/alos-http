@@ -3,8 +3,8 @@
 package core
 
 import (
+	"crypto/x509"
 	"fmt"
-	"log"
 	"net"
 	"runtime"
 	"runtime/debug"
@@ -43,8 +43,11 @@ type epollConn struct {
 	closeAfter  bool
 	outArmed    bool
 	tls         bool
+	tlsVersion  uint16
 	dispatching bool
 	readPending bool
+	peerHup     bool
+	inputEOF    bool
 	flushQueued bool
 	ipHeld      bool
 	inFlight    int
@@ -57,9 +60,33 @@ type epollConn struct {
 	remoteAddr  string
 	ipKey       string
 	req         Request
+	h1Cancel    cancelSlot
 	resp        Response
 	h2          tlsWorkerH2State
 	slab        *epollSlab
+
+	h2Streaming     map[uint32]*epollH2StreamWriter
+	h2Draining      int
+	h2EndedInFlight int
+	h2PumpDue       bool
+	inTLSFrameDrain bool
+	h2BodyIn        map[uint32]*h2BodyIn
+
+	h1DispatchGen   uint32
+	h1ContinueSent  bool
+	h1DispatchClose bool
+	h1DispatchFast  bool
+	h1AsyncFn       func()
+	h1DoneNext      *epollConn
+	h1Body          []byte
+	h1BodyOff       int
+	h1Stream        *epollH1StreamWriter
+	h1OutKeepAlive  bool
+	h1OutComplete   bool
+	h1ResumeDue     bool
+	h1In            *h1BodyIn
+	lingering       bool
+	lingerLeft      int
 
 	phase        uint8
 	selectedALPN string
@@ -73,14 +100,30 @@ type epollConn struct {
 	expectedFin  [64]byte
 	expectedFinN int
 	tls12        *tls12State
+	tlsRetry     *tls13Retry
+	ticket       *pendingTicket
+	clientAuth   *tls13ClientAuth
+	tlsAlertSent bool
+	peerCerts    []*x509.Certificate
+	tlsCertEntry *CertEntry
+
+	tlsPeerClosed     bool
+	tlsUselessRecords uint8
+	cipherOff         int
 
 	reqBodyCopy     []byte
 	h1BodyAccounted int64
+	h1BodyDeadline  int64
 	chunkScanPos    int
+	h2GoingAway     bool
 
 	h1AttacherFn     func(*Request) net.Conn
 	h1AttacherGen    uint32
 	h1AttacherInline bool
+	takeoverPinned   bool
+	takeoverParked   bool
+	unpinNext        *epollConn
+	connLimiter      *ConnectionLimiter
 
 	// proxyEx is the in-flight upstream exchange for this connection, and
 	// pausedBackend the backend socket whose reads were disarmed because this
@@ -88,6 +131,9 @@ type epollConn struct {
 	proxyEx       *proxyExchange
 	pausedBackend *backendConn
 	tunnelBE      *backendConn
+
+	h2ProxyBuffered int64
+	tunnelPaused    bool
 
 	worker *epollWorker
 }
@@ -102,6 +148,7 @@ type epollConnPool struct {
 	free       []*epollConn
 	floorSlabs int
 	batchSize  int
+	parked     int
 	server     *Server
 }
 
@@ -148,6 +195,10 @@ func (p *epollConnPool) get() *epollConn {
 	return c
 }
 
+func (p *epollConnPool) slotsHeld() int {
+	return len(p.slabs)*p.slabSize() - len(p.free) - p.parked
+}
+
 func shrinkEpollBuf(b []byte) []byte {
 	if cap(b) > epollBufShrinkThreshold {
 		return nil
@@ -164,13 +215,21 @@ func (c *epollConn) releaseClientHello() {
 }
 
 func (p *epollConnPool) put(c *epollConn) {
+	p.releaseConnSlot()
+	p.recycle(c)
+}
+
+func (p *epollConnPool) releaseConnSlot() {
 	if p.server != nil {
 		p.server.releaseTrackedConn()
 		Stats.ActiveConns.Add(-1)
 	}
+}
+
+func (p *epollConnPool) recycle(c *epollConn) {
 	if c.ipHeld {
-		if p.server != nil && p.server.perIPConnLimiter != nil {
-			p.server.perIPConnLimiter.release(c.ipKey)
+		if p.server != nil {
+			p.server.perIPConnLimiter.Load().release(c.ipKey)
 		}
 		c.ipHeld = false
 		c.ipKey = ""
@@ -223,8 +282,8 @@ func (c *epollConn) releaseH1BodyBudget() {
 
 func h1ChunkedBodyReservation(srv *Server) int {
 	limit := srv.effectiveReadCap()
-	if srv.config.MaxBodySize > 0 && (limit == readCapUnlimited || srv.config.MaxBodySize < int64(limit)) {
-		limit = int(srv.config.MaxBodySize)
+	if maxBody := srv.limits.Load().MaxBodySize; maxBody > 0 && (limit == readCapUnlimited || maxBody < int64(limit)) {
+		limit = int(maxBody)
 	}
 	return limit
 }
@@ -257,6 +316,8 @@ func (p *epollConnPool) shrinkOne() {
 
 type epollWorker struct {
 	server          *Server
+	bytesIn         uint64
+	bytesOut        uint64
 	epfd            int
 	listenerFD      int
 	wakeFd          int
@@ -267,7 +328,10 @@ type epollWorker struct {
 	pool            epollConnPool
 	events          []unix.EpollEvent
 	taskCh          chan func(*epollWorker)
+	handlers        *handlerPool
 	taskPending     atomic.Bool
+	h1Done          atomic.Pointer[epollConn]
+	takeoverUnpins  atomic.Pointer[epollConn]
 	parked          atomic.Bool
 	wakeBuf         [8]byte
 	flushList       []*epollConn
@@ -277,8 +341,17 @@ type epollWorker struct {
 	handshakeTO     int64
 	writeTO         int64
 	idleTO          int64
+	maxHeaderSize   int
+	maxBodySize     int64
+	streamBodyAbove int64
+	limitsGen       uint64
+	discardBuf      []byte
 	maxPendingWrite int
 	lastSweep       int64
+	acceptResumeAt  int64
+	acceptBackoff   time.Duration
+	draining        bool
+	drainExpired    bool
 	be              beLoop
 	beCfg           fpConfig
 	exFree          *Exchange
@@ -309,6 +382,7 @@ func (s *Server) epollListenerCount() int {
 }
 
 func (s *Server) serveEpoll(addr string, tlsMode bool) error {
+	s.adoptAssignedEngines()
 	s.Router.Build()
 	s.computeFastDispatch()
 	workers := s.epollListenerCount()
@@ -427,15 +501,12 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 		conns:      make([]*epollConn, 1024),
 		events:     make([]unix.EpollEvent, epollEventBatch),
 		taskCh:     make(chan func(*epollWorker), epollTaskQueueSize),
+		handlers:   newHandlerPool(handlerPoolWorkersPerLoop),
 		flushList:  make([]*epollConn, 0, 64),
 	}
 	w.pool.server = s
 	w.pool.batchSize = s.preallocBatch()
-	w.readTO = int64(s.config.ReadTimeout)
-	w.headerTO = int64(s.readHeaderTimeout())
-	w.handshakeTO = int64(optionalDuration(s.config.HandshakeTimeout, 30*time.Second))
-	w.writeTO = int64(s.config.WriteTimeout)
-	w.idleTO = int64(s.config.IdleTimeout)
+	w.refreshLimits()
 	w.maxPendingWrite = epollMaxPendingWriteDefault
 	if s.config.MaxPendingWriteBytes > 0 {
 		w.maxPendingWrite = int(s.config.MaxPendingWriteBytes)
@@ -449,6 +520,28 @@ func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, erro
 func (w *epollWorker) wakeForShutdown() {
 	var one uint64 = 1
 	_, _ = unix.Write(w.wakeFd, (*[8]byte)(unsafe.Pointer(&one))[:])
+}
+
+func (c *epollConn) cancelH1(cause error) {
+	if s := c.req.cancelSrc; s != nil {
+		s.cancel(cause)
+	}
+}
+
+func (c *epollConn) cancelInFlight(cause error) {
+	c.cancelH1(cause)
+	c.h2.cancelBusy(cause)
+}
+
+func (w *epollWorker) cancelInFlight(cause error) {
+	w.postTask(func(w *epollWorker) {
+		w.drainExpired = true
+		for _, c := range w.conns {
+			if c != nil && c.fd >= 0 {
+				c.cancelInFlight(cause)
+			}
+		}
+	})
 }
 
 func (s *Server) preallocBatch() int {
@@ -469,22 +562,67 @@ func (w *epollWorker) postTask(fn func(*epollWorker)) {
 	}
 }
 
+func (w *epollWorker) pushH1Done(c *epollConn) {
+	for {
+		head := w.h1Done.Load()
+		c.h1DoneNext = head
+		if w.h1Done.CompareAndSwap(head, c) {
+			break
+		}
+	}
+	w.taskPending.Store(true)
+	if w.parked.Load() {
+		var one uint64 = 1
+		_, _ = unix.Write(w.wakeFd, (*[8]byte)(unsafe.Pointer(&one))[:])
+	}
+}
+
 func (w *epollWorker) drainTasks() {
 	w.taskPending.Store(false)
+	done := w.h1Done.Swap(nil)
 	for {
 		select {
 		case fn := <-w.taskCh:
 			w.runTask(fn)
 		default:
+			w.finishH1Done(done)
+			if w.takeoverUnpins.Load() != nil {
+				w.runTakeoverUnpins()
+			}
 			return
 		}
 	}
 }
 
+func (w *epollWorker) finishH1Done(head *epollConn) {
+	var ordered *epollConn
+	for c := head; c != nil; {
+		next := c.h1DoneNext
+		c.h1DoneNext = ordered
+		ordered = c
+		c = next
+	}
+	for ordered != nil {
+		c := ordered
+		ordered = c.h1DoneNext
+		c.h1DoneNext = nil
+		w.runH1Finish(c)
+	}
+}
+
+func (w *epollWorker) runH1Finish(c *epollConn) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.server.reportPanic(nil, r)
+		}
+	}()
+	c.finishH1Dispatch(w, c.h1DispatchGen, c.h1DispatchClose)
+}
+
 func (w *epollWorker) runTask(fn func(*epollWorker)) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[EPOLL-PANIC] worker %d task recovered: %v", w.coreID, r)
+			w.server.reportPanic(nil, r)
 		}
 	}()
 	fn(w)
@@ -493,7 +631,7 @@ func (w *epollWorker) runTask(fn func(*epollWorker)) {
 func (w *epollWorker) serviceConn(c *epollConn, evs uint32) {
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("[EPOLL-PANIC] worker %d conn recovered: %v", w.coreID, r)
+			w.server.reportPanic(nil, r)
 			w.closeConn(c)
 		}
 	}()
@@ -543,6 +681,7 @@ func (w *epollWorker) run() error {
 	defer unix.Close(w.epfd)
 	defer unix.Close(w.wakeFd)
 	defer w.server.removeShutdownWaker(w)
+	defer w.handlers.close()
 	accepting := true
 	for {
 		if accepting {
@@ -552,12 +691,14 @@ func (w *epollWorker) run() error {
 				_ = unix.Close(w.listenerFD)
 				w.listenerFD = -1
 				accepting = false
+				w.draining = true
 			default:
 			}
 		}
+		w.flushByteCounters()
 		if !accepting {
-			w.closeIdleConns()
-			if !w.hasClientConns() {
+			w.drainForShutdown()
+			if !w.hasClientConns() && w.pool.slotsHeld() == 0 {
 				return nil
 			}
 		}
@@ -569,6 +710,7 @@ func (w *epollWorker) run() error {
 			}
 			return fmt.Errorf("epoll wait: %w", err)
 		}
+		w.refreshLimits()
 		acceptPending := false
 		tasksPending := false
 		for i := 0; i < n; i++ {
@@ -610,6 +752,9 @@ func (w *epollWorker) run() error {
 		if len(w.flushList) > 0 {
 			w.flushPending()
 		}
+		if w.acceptResumeAt != 0 && w.resumeAcceptIfDue(turbo.UnixNano()) {
+			acceptPending = true
+		}
 		if acceptPending {
 			w.acceptLoop()
 		}
@@ -621,6 +766,15 @@ func (w *epollWorker) run() error {
 // eventfd wake whenever the worker is not actually inside epoll_wait.
 func (w *epollWorker) waitEvents() (int, error) {
 	waitMs := epollSweepIntervalMs
+	if w.be.liveConns > 0 {
+		waitMs = min(waitMs, w.be.nextTimeoutMs())
+	}
+	if w.acceptResumeAt != 0 {
+		waitMs = min(waitMs, w.msUntilAcceptResume(turbo.UnixNano()))
+	}
+	if w.draining {
+		waitMs = min(waitMs, epollDrainPollMs)
+	}
 	w.parked.Store(true)
 	if w.taskPending.Load() {
 		waitMs = 0
@@ -644,26 +798,75 @@ func (c *epollConn) unparsedInput() bool {
 	return c.readN != 0
 }
 
+func (c *epollConn) bufferedInput() int {
+	switch {
+	case c.tls:
+		return c.readN
+	case c.speaksH2():
+		return c.readN - c.h2.appBufOff
+	default:
+		return c.readN - c.h1Off
+	}
+}
+
 func (c *epollConn) idle() bool {
 	return c.fd >= 0 && c.inFlight == 0 && !c.dispatching && c.proxyEx == nil && c.tunnelBE == nil &&
 		!c.unparsedInput() && !c.outArmed && c.writeSent == len(c.writeBuf) &&
 		len(c.h2.streams) == 0 && len(c.h2.sending) == 0
 }
 
-func (w *epollWorker) closeIdleConns() {
+func (w *epollWorker) drainForShutdown() {
+	now := turbo.UnixNano()
 	for _, c := range w.conns {
-		if c == nil || !c.idle() {
+		if c == nil || c.fd < 0 {
 			continue
 		}
-		if !c.speaksH2() {
+		switch {
+		case c.lingering:
+			c.deadline = min(c.deadline, now+int64(epollShutdownLingerTimeout))
+			if w.drainExpired || now > c.deadline {
+				w.closeConn(c)
+			}
+		case w.drainExpired && !c.runsHandler():
 			w.closeConn(c)
-			continue
+		case c.speaksH2():
+			w.goAwayForShutdown(c)
+		case c.idle():
+			w.closeAfterResponse(c)
 		}
+	}
+}
+
+func (c *epollConn) runsHandler() bool {
+	return c.inFlight > 0 || c.dispatching
+}
+
+func (w *epollWorker) goAwayForShutdown(c *epollConn) {
+	idle := c.idle()
+	if c.h2GoingAway && !idle {
+		return
+	}
+	if !c.h2GoingAway {
+		c.h2GoingAway = true
 		var goAway [h2FrameHeaderSize + 8]byte
 		w.clientAppend(c, appendH2GoAwayFrame(goAway[:0], c.h2.lastStreamID, H2ErrNoError))
-		c.closeAfter = true
-		w.flush(c)
 	}
+	if idle {
+		c.closeAfter = true
+	}
+	w.flush(c)
+}
+
+func (c *epollConn) refuseH2StreamGoingAway(streamID uint32, headerBlock []byte) bool {
+	st := &c.h2
+	headers, _, _, err := st.decoder.DecodeRequest(st.headersBuf[:0], headerBlock)
+	st.headersBuf = headers[:0]
+	if err != nil && err != errH2MalformedRequest && err != errH2HeaderListTooLarge {
+		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrCompression)
+		return true
+	}
+	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrRefusedStream)
+	return false
 }
 
 func (w *epollWorker) hasClientConns() bool {
@@ -680,21 +883,51 @@ const (
 	epollDispatchRounds  = 64
 )
 
+func (w *epollWorker) flushByteCounters() {
+	if w.bytesIn != 0 {
+		Stats.BytesIn.Add(w.bytesIn)
+		w.bytesIn = 0
+	}
+	if w.bytesOut != 0 {
+		Stats.BytesOut.Add(w.bytesOut)
+		w.bytesOut = 0
+	}
+}
+
+func (w *epollWorker) refreshLimits() {
+	gen := w.server.limitsGen.Load()
+	if gen == w.limitsGen && w.maxHeaderSize != 0 {
+		return
+	}
+	l := w.server.limits.Load()
+	w.readTO = int64(l.ReadTimeout)
+	w.headerTO = int64(l.headerTimeout())
+	w.handshakeTO = int64(l.handshakeTimeout())
+	w.writeTO = int64(l.WriteTimeout)
+	w.idleTO = int64(l.IdleTimeout)
+	w.maxHeaderSize = l.MaxHeaderSize
+	w.maxBodySize = l.MaxBodySize
+	w.streamBodyAbove = l.StreamBodyAbove
+	w.limitsGen = gen
+}
+
+func (w *epollWorker) bodyTooLarge(n int64) bool {
+	return w.maxBodySize > 0 && n > w.maxBodySize
+}
+
 func (w *epollWorker) sweepDeadlines() {
 	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 && w.be.liveConns == 0 {
 		return
 	}
 	now := turbo.UnixNano()
+	w.be.maybeSweep(now)
+	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 {
+		return
+	}
 	if now-w.lastSweep < int64(epollSweepIntervalMs)*1_000_000 {
 		return
 	}
 	w.lastSweep = now
-	if w.be.liveConns > 0 {
-		w.be.sweepBackends(now)
-	}
-	if w.readTO == 0 && w.writeTO == 0 && w.idleTO == 0 {
-		return
-	}
 	for fd := 0; fd < len(w.conns); fd++ {
 		c := w.conns[fd]
 		if c == nil || c.fd < 0 {
@@ -738,11 +971,23 @@ func (w *epollWorker) markFlush(c *epollConn) {
 }
 
 func (w *epollWorker) flushPending() {
-	for i, c := range w.flushList {
+	for i := 0; i < len(w.flushList); i++ {
+		c := w.flushList[i]
 		w.flushList[i] = nil
 		c.flushQueued = false
-		if c.fd >= 0 {
-			w.flush(c)
+		if c.fd < 0 {
+			continue
+		}
+		if c.h2PumpDue {
+			c.h2PumpDue = false
+			c.h2PumpAll(w)
+		}
+		if !w.flush(c) {
+			continue
+		}
+		if c.h1ResumeDue {
+			c.h1ResumeDue = false
+			w.resumeConn(c)
 		}
 	}
 	w.flushList = w.flushList[:0]
@@ -758,19 +1003,26 @@ func (w *epollWorker) acceptLoop() {
 			if err == unix.EINTR {
 				continue
 			}
+			if acceptResourceExhausted(err) {
+				w.pauseAccept(turbo.UnixNano())
+			}
 			return
 		}
+		w.acceptBackoff = 0
 		active := w.server.activeConns.Add(1)
 		Stats.ActiveConns.Add(1)
-		if lim := w.server.config.MaxConns; lim > 0 && active > lim {
+		limits := w.server.limits.Load()
+		if lim := limits.MaxConns; lim > 0 && active > lim {
 			w.server.releaseTrackedConn()
 			Stats.ActiveConns.Add(-1)
 			_ = unix.Close(nfd)
 			continue
 		}
+		Stats.TotalConns.Add(1)
 		_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1)
 		_ = unix.SetsockoptInt(nfd, unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, 8192)
 		c := w.pool.get()
+		c.req.resetConnIdentity()
 		c.fd = nfd
 		c.worker = w
 		c.protocol = plainConnProtoUnknown
@@ -778,22 +1030,28 @@ func (w *epollWorker) acceptLoop() {
 		c.outArmed = false
 		c.dispatching = false
 		c.readPending = false
+		c.peerHup = false
+		c.inputEOF = false
 		c.flushQueued = false
+		c.h1ContinueSent = false
 		c.readN = 0
 		c.writeSent = 0
 		c.h1Off = 0
 		c.chunkScanPos = 0
+		c.h1BodyDeadline = 0
+		c.h2GoingAway = false
 		if w.tlsMode {
 			c.deadline = deadlineFrom(w.handshakeTO)
 		} else {
 			c.deadline = deadlineFrom(w.headerTO)
 		}
 		c.remoteAddr = epollRemoteAddr(sa)
+		c.connLimiter = w.server.newConnLimiter()
 		c.ipHeld = false
 		c.ipKey = ""
-		if w.server.perIPConnLimiter != nil && !w.server.trustedProxies.active {
+		if limiter := w.server.perIPConnLimiter.Load(); limiter != nil && limits.MaxConnsPerIP > 0 && !w.server.trustedProxies.active {
 			key := extractIP(c.remoteAddr)
-			if !w.server.perIPConnLimiter.acquire(key, w.server.maxConnsPerIP) {
+			if !limiter.acquire(key, limits.MaxConnsPerIP) {
 				c.fd = -1
 				_ = unix.Close(nfd)
 				w.pool.put(c)
@@ -805,6 +1063,7 @@ func (w *epollWorker) acceptLoop() {
 		c.writeBuf = c.writeBuf[:0]
 		c.h2.appBufOff = 0
 		c.tls = w.tlsMode
+		c.tlsVersion = 0
 		c.appBufOff = 0
 		if c.appBuf != nil {
 			c.appBuf = c.appBuf[:0]
@@ -815,6 +1074,15 @@ func (w *epollWorker) acceptLoop() {
 			c.appReader = nil
 			c.appWriter = nil
 			c.tls12 = nil
+			c.tlsRetry = nil
+			c.ticket = nil
+			c.clientAuth = nil
+			c.tlsAlertSent = false
+			c.peerCerts = nil
+			c.tlsCertEntry = nil
+			c.tlsPeerClosed = false
+			c.tlsUselessRecords = 0
+			c.cipherOff = 0
 			c.selectedALPN = ""
 		}
 		for nfd >= len(w.conns) {
@@ -830,6 +1098,42 @@ func (w *epollWorker) acceptLoop() {
 	}
 }
 
+const (
+	acceptBackoffMin = 5 * time.Millisecond
+	acceptBackoffMax = time.Second
+)
+
+func acceptResourceExhausted(err error) bool {
+	return err == unix.EMFILE || err == unix.ENFILE || err == unix.ENOBUFS || err == unix.ENOMEM
+}
+
+func (w *epollWorker) pauseAccept(now int64) {
+	w.acceptBackoff = min(max(2*w.acceptBackoff, acceptBackoffMin), acceptBackoffMax)
+	w.acceptResumeAt = now + int64(w.acceptBackoff)
+	ev := unix.EpollEvent{Fd: int32(w.listenerFD)}
+	_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_MOD, w.listenerFD, &ev)
+}
+
+func (w *epollWorker) resumeAcceptIfDue(now int64) bool {
+	if now < w.acceptResumeAt {
+		return false
+	}
+	w.acceptResumeAt = 0
+	if w.listenerFD < 0 {
+		return false
+	}
+	ev := unix.EpollEvent{Events: unix.EPOLLIN, Fd: int32(w.listenerFD)}
+	_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_MOD, w.listenerFD, &ev)
+	return true
+}
+
+func (w *epollWorker) msUntilAcceptResume(now int64) int {
+	if now >= w.acceptResumeAt {
+		return 0
+	}
+	return int((w.acceptResumeAt-now)/int64(time.Millisecond)) + 1
+}
+
 func epollRemoteAddr(sa unix.Sockaddr) string {
 	sa4, ok := sa.(*unix.SockaddrInet4)
 	if !ok {
@@ -839,9 +1143,32 @@ func epollRemoteAddr(sa unix.Sockaddr) string {
 }
 
 func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
-	if c.dispatching {
+	for w.readOnce(c, peerClosed) {
+	}
+}
+
+func (w *epollWorker) readOnce(c *epollConn, peerClosed bool) (readAgain bool) {
+	if c.lingering {
+		w.discardLingering(c)
+		return false
+	}
+	if peerClosed {
+		c.peerHup = true
+	}
+	if c.tunnelPaused {
+		if peerClosed {
+			w.closeConn(c)
+			return false
+		}
 		c.readPending = true
-		return
+		return false
+	}
+	if c.dispatching && !c.h1BodyWantsInput() {
+		c.readPending = true
+		if peerClosed {
+			c.cancelH1(ErrClientGone)
+		}
+		return false
 	}
 	c.readPending = false
 	if c.readBuf == nil {
@@ -853,14 +1180,15 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 	maxRead := w.server.effectiveReadCap()
 	prevReadN := c.readN
 	closed := false
+	bufferFull := false
 	for {
 		if cap(c.readBuf)-c.readN < plainReadMinFree {
 			c.compactH2ReadBuffer(true)
 			if cap(c.readBuf)-c.readN < plainReadMinFree {
 				grown, ok := growPlainReadBuffer(c.readBuf[:c.readN], plainReadMinFree, maxRead)
 				if !ok {
-					w.closeConn(c)
-					return
+					bufferFull = true
+					break
 				}
 				c.readBuf = grown[:cap(grown)]
 			}
@@ -868,13 +1196,22 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 		reqLen := cap(c.readBuf) - c.readN
 		n, err := socketRecv(c.fd, c.readBuf[c.readN:cap(c.readBuf)])
 		if n > 0 {
+			w.bytesIn += uint64(n)
 			c.readN += n
-			if n < reqLen {
+			if n < reqLen && !c.h1BodyDrainsToEOF() {
+				break
+			}
+			if c.h1In != nil && c.readN >= h1BodyReadAhead {
+				c.readPending = true
 				break
 			}
 			continue
 		}
 		if n == 0 && err == nil {
+			if c.h1BodyStreaming() {
+				c.inputEOF = true
+				break
+			}
 			closed = true
 			break
 		}
@@ -885,7 +1222,7 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 			break
 		}
 		w.closeConn(c)
-		return
+		return false
 	}
 	if prevReadN == 0 && c.readN > 0 {
 		keepDeadline := c.tls && c.deadline != 0 && (c.phase != tlsConnPhaseApplication && c.phase != tlsConnPhaseH2Native || len(c.appBuf) > 0)
@@ -893,7 +1230,23 @@ func (w *epollWorker) readable(c *epollConn, peerClosed bool) {
 			c.deadline = deadlineFrom(w.nextReadTimeout(c))
 		}
 	}
+	fullAt := c.bufferedInput()
 	w.serviceBuffered(c, closed, peerClosed)
+	if w.abortStarvedBody(c) {
+		return false
+	}
+	if !bufferFull || closed || c.fd < 0 || c.lingering {
+		return false
+	}
+	if c.dispatching {
+		c.readPending = true
+		return false
+	}
+	if c.bufferedInput() < fullAt {
+		return true
+	}
+	w.closeConn(c)
+	return false
 }
 
 // resumeConn continues a connection after an asynchronous dispatch. A read
@@ -924,7 +1277,7 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		}
 		if action == epollActionDetached {
 			if c.inFlight == 0 {
-				w.pool.put(c)
+				w.putTakenOver(c)
 			}
 			return
 		}
@@ -958,9 +1311,12 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 	}
 	if c.inFlight > 0 || c.dispatching {
 		c.deadline = 0
+		if c.h1BodyWantsInput() {
+			c.deadline = deadlineFrom(w.readTO)
+		}
 		return
 	}
-	if peerClosed {
+	if peerClosed || c.inputEOF {
 		if !c.outArmed && c.writeSent == len(c.writeBuf) {
 			w.closeConn(c)
 			return
@@ -980,13 +1336,15 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 			releaseIOBuf(c.plainBuf)
 			c.plainBuf = nil
 		}
+		c.reqBodyCopy = shrinkEpollBuf(c.reqBodyCopy)
+		c.req.Body = nil
 		c.resp.resetFastH1()
 		c.deadline = deadlineFrom(w.idleTO)
 	}
 }
 
 func (c *epollConn) tlsAppPending() bool {
-	return c.tls && c.appBufOff < len(c.appBuf)
+	return c.tls && (c.appBufOff < len(c.appBuf) || c.tlsPeerClosed)
 }
 
 func (c *epollConn) epollProcess(srv *Server) int {
@@ -1008,7 +1366,7 @@ func (c *epollConn) epollProcess(srv *Server) int {
 				return epollActionNeedRead
 			}
 			c.protocol = plainConnProtoH2
-			c.h2.init(srv.h2HeaderTableSize())
+			c.h2.init(srv.h2HeaderTableSize(), srv.h2HeaderListLimit())
 			c.deadline = deadlineFrom(c.worker.readTO)
 			c.writeBuf = appendH2ServerSettingsFlight(c.writeBuf, srv)
 			Stats.H2Conns.Add(1)
@@ -1030,10 +1388,17 @@ func (c *epollConn) epollProcess(srv *Server) int {
 const epollMaxPendingWriteDefault = 8 << 20
 
 func (w *epollWorker) flush(c *epollConn) bool {
+	if c.lingering {
+		return false
+	}
+	progressed := false
+drain:
 	for c.writeSent < len(c.writeBuf) {
 		n, err := socketSend(c.fd, c.writeBuf[c.writeSent:])
 		if n > 0 {
+			w.bytesOut += uint64(n)
 			c.writeSent += n
+			progressed = true
 			continue
 		}
 		if err == unix.EINTR {
@@ -1048,6 +1413,9 @@ func (w *epollWorker) flush(c *epollConn) bool {
 			if c.fd < 0 {
 				return false
 			}
+			if progressed && c.outArmed && w.writeTO > 0 {
+				c.deadline = deadlineFrom(w.writeTO)
+			}
 			w.armOut(c)
 			return true
 		}
@@ -1056,6 +1424,9 @@ func (w *epollWorker) flush(c *epollConn) bool {
 	}
 	c.writeBuf = c.writeBuf[:0]
 	c.writeSent = 0
+	if c.h2PumpAll(w) || c.h1PumpOut(w) {
+		goto drain
+	}
 	if c.outArmed {
 		w.disarmOut(c)
 	}
@@ -1067,7 +1438,7 @@ func (w *epollWorker) flush(c *epollConn) bool {
 		return true
 	}
 	if c.closeAfter {
-		w.closeConn(c)
+		w.closeAfterResponse(c)
 		return false
 	}
 	return true
@@ -1087,7 +1458,9 @@ func (w *epollWorker) armOut(c *epollConn) {
 
 func (w *epollWorker) disarmOut(c *epollConn) {
 	c.outArmed = false
-	if w.idleTO > 0 {
+	if c.inFlight > 0 || c.dispatching {
+		c.deadline = 0
+	} else if w.idleTO > 0 {
 		c.deadline = deadlineFrom(w.idleTO)
 	}
 	ev := unix.EpollEvent{Events: uint32(unix.EPOLLIN|unix.EPOLLRDHUP) | uint32(unix.EPOLLET&0xffffffff), Fd: int32(c.fd)}
@@ -1098,6 +1471,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	if c.fd < 0 {
 		return
 	}
+	c.cancelInFlight(ErrClientGone)
 	_ = unix.EpollCtl(w.epfd, unix.EPOLL_CTL_DEL, c.fd, nil)
 	_ = unix.Close(c.fd)
 	if c.fd < len(w.conns) {
@@ -1111,6 +1485,11 @@ func (w *epollWorker) closeConn(c *epollConn) {
 		w.closeTunnelFromClient(c)
 	}
 	c.flushQueued = false
+	c.h2AbortAllStreaming()
+	c.h1AbortOut()
+	c.h1AbortIn()
+	c.h2AbortAllBodyIn()
+	c.lingering = false
 	for id, stream := range c.h2.streams {
 		if stream.asyncBusy {
 			continue
@@ -1135,19 +1514,33 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.outArmed = false
 	c.dispatching = false
 	c.readPending = false
+	c.peerHup = false
+	c.inputEOF = false
+	c.h1ContinueSent = false
 	c.hsReader = nil
 	c.appReader = nil
 	c.appWriter = nil
 	c.tls12 = nil
+	c.tlsRetry = nil
+	c.ticket = nil
+	c.clientAuth = nil
+	c.tlsAlertSent = false
+	c.peerCerts = nil
+	c.tlsCertEntry = nil
+	c.tlsPeerClosed = false
+	c.tlsUselessRecords = 0
+	c.cipherOff = 0
+	c.h2GoingAway = false
 	c.appBufOff = 0
 	if c.appBuf != nil {
 		c.appBuf = c.appBuf[:0]
 	}
 	c.tls = false
+	c.tlsVersion = 0
 	releaseEpollReadBuf(c.readBuf)
 	c.readBuf = nil
 	if c.ipHeld {
-		w.server.perIPConnLimiter.release(c.ipKey)
+		w.server.perIPConnLimiter.Load().release(c.ipKey)
 		c.ipHeld = false
 		c.ipKey = ""
 	}

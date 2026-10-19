@@ -7,14 +7,22 @@ import (
 	"unsafe"
 )
 
-func TestZZZSizeof(t *testing.T) {
-	t.Logf("epollConn=%d", unsafe.Sizeof(epollConn{}))
-	t.Logf("Request=%d", unsafe.Sizeof(Request{}))
-	t.Logf("Response=%d", unsafe.Sizeof(Response{}))
-	t.Logf("tlsWorkerH2State=%d", unsafe.Sizeof(tlsWorkerH2State{}))
-	t.Logf("epollSlab(header only, conns field)=%d", unsafe.Sizeof(epollSlab{}))
-	t.Logf("H2Stream=%d", unsafe.Sizeof(H2Stream{}))
-	t.Logf("TrafficAEAD=%d", unsafe.Sizeof(TrafficAEAD{}))
-	t.Logf("tls12State=%d", unsafe.Sizeof(tls12State{}))
-	t.Logf("ParsedClientHello=%d", unsafe.Sizeof(ParsedClientHello{}))
+func BenchmarkAppFixStructSizes(b *testing.B) {
+	sizes := []struct {
+		name  string
+		bytes uintptr
+	}{
+		{"epollConn", unsafe.Sizeof(epollConn{})},
+		{"Request", unsafe.Sizeof(Request{})},
+		{"Response", unsafe.Sizeof(Response{})},
+		{"tlsWorkerH2State", unsafe.Sizeof(tlsWorkerH2State{})},
+		{"epollSlab", unsafe.Sizeof(epollSlab{})},
+		{"H2Stream", unsafe.Sizeof(H2Stream{})},
+		{"TrafficAEAD", unsafe.Sizeof(TrafficAEAD{})},
+		{"tls12State", unsafe.Sizeof(tls12State{})},
+		{"ParsedClientHello", unsafe.Sizeof(ParsedClientHello{})},
+	}
+	for _, s := range sizes {
+		b.ReportMetric(float64(s.bytes), s.name+"-bytes")
+	}
 }

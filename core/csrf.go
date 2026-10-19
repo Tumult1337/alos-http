@@ -1,8 +1,13 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"net/url"
+	"strings"
 )
 
 func constantTimeEqualString(a, b string) bool {
@@ -52,14 +57,15 @@ func constantTimeEqualString(a, b string) bool {
 //
 //	Example: ErrorHandler: func(req *Request, resp *Response) { resp.Status(403).JSON([]byte(`{"error":"csrf"}`)) }.
 type CSRFConfig struct {
-	TokenLength  int
-	CookieName   string
-	HeaderName   string
-	FormField    string
-	Secure       bool
-	SameSite     SameSite
-	MaxAge       int
-	ErrorHandler func(*Request, *Response)
+	TokenLength    int
+	CookieName     string
+	HeaderName     string
+	FormField      string
+	Secure         bool
+	SameSite       SameSite
+	MaxAge         int
+	ErrorHandler   func(*Request, *Response)
+	TrustedOrigins []string
 }
 
 // CSRF returns middleware implementing the double-submit-cookie pattern: it issues a random token cookie, stores the token on the request (retrievable with CSRFToken), and on unsafe methods (POST, PUT, PATCH, DELETE, etc.) requires a matching token in the configured header or form field. Zero-valued CSRFConfig fields take their defaults.
@@ -92,6 +98,7 @@ func CSRF(cfg CSRFConfig) MiddlewareFunc {
 	sameSite := cfg.SameSite
 	maxAge := cfg.MaxAge
 	errorHandler := cfg.ErrorHandler
+	trusted := newCSRFTrustedOrigins(cfg.TrustedOrigins)
 
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
@@ -117,6 +124,14 @@ func CSRF(cfg CSRFConfig) MiddlewareFunc {
 			req.Set("csrf_token", token)
 
 			if isUnsafeMethod(req.Method) {
+				if !trusted.allowsRequest(req) {
+					if errorHandler != nil {
+						errorHandler(req, resp)
+					} else {
+						resp.Status(403).String("cross-site request rejected")
+					}
+					return
+				}
 				clientToken := req.Header(headerName)
 				if clientToken == "" {
 					clientToken = extractFormField(req, formField)
@@ -135,6 +150,88 @@ func CSRF(cfg CSRFConfig) MiddlewareFunc {
 			next(req, resp)
 		}
 	}
+}
+
+type csrfTrustedOrigins map[string]struct{}
+
+func newCSRFTrustedOrigins(origins []string) csrfTrustedOrigins {
+	trusted := make(csrfTrustedOrigins, len(origins))
+	for _, o := range origins {
+		normalized, ok := normalizeOrigin(o)
+		if !ok {
+			panic(fmt.Sprintf("core: invalid CSRF trusted origin %q (want scheme://host[:port])", o))
+		}
+		trusted[normalized] = struct{}{}
+	}
+	return trusted
+}
+
+func (t csrfTrustedOrigins) contains(origin string) bool {
+	if len(t) == 0 {
+		return false
+	}
+	normalized, ok := normalizeOrigin(origin)
+	if !ok {
+		return false
+	}
+	_, found := t[normalized]
+	return found
+}
+
+func (t csrfTrustedOrigins) allowsRequest(req *Request) bool {
+	origin := req.Header("origin")
+	switch req.Header("sec-fetch-site") {
+	case "cross-site":
+		return false
+	case "same-site":
+		return t.contains(origin)
+	}
+	scheme := requestScheme(req)
+	self, _ := normalizeOrigin(scheme + "://" + req.Host)
+	if origin != "" {
+		normalized, ok := normalizeOrigin(origin)
+		return ok && normalized == self || t.contains(origin)
+	}
+	if scheme == "https" {
+		if referer := req.Header("referer"); referer != "" {
+			u, err := url.Parse(referer)
+			if err != nil {
+				return false
+			}
+			refOrigin := u.Scheme + "://" + u.Host
+			normalized, ok := normalizeOrigin(refOrigin)
+			return ok && normalized == self || t.contains(refOrigin)
+		}
+	}
+	return true
+}
+
+func requestScheme(req *Request) string {
+	if req.IsTLS {
+		return "https"
+	}
+	if req.peerAddr != "" {
+		proto, _, _ := strings.Cut(req.Header("x-forwarded-proto"), ",")
+		if EqualFoldASCII(trimASCIISpace(proto), "https") {
+			return "https"
+		}
+	}
+	return "http"
+}
+
+func normalizeOrigin(origin string) (string, bool) {
+	scheme, hostport, ok := strings.Cut(origin, "://")
+	if !ok || scheme == "" || hostport == "" || strings.ContainsAny(hostport, "/?#@ \t") {
+		return "", false
+	}
+	scheme, hostport = strings.ToLower(scheme), strings.ToLower(hostport)
+	switch {
+	case scheme == "http" && strings.HasSuffix(hostport, ":80"):
+		hostport = hostport[:len(hostport)-len(":80")]
+	case scheme == "https" && strings.HasSuffix(hostport, ":443"):
+		hostport = hostport[:len(hostport)-len(":443")]
+	}
+	return scheme + "://" + hostport, true
 }
 
 func isUnsafeMethod(method string) bool {

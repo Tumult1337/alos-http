@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -38,6 +40,22 @@ type quicPacketHeader struct {
 	pnOffset   int
 	payloadOff int
 	payloadLen int
+}
+
+func quicPacketDCID(data []byte, shortDCIDLen int) []byte {
+	if len(data) == 0 {
+		return nil
+	}
+	if data[0]&quicLongHeaderBit == 0 {
+		if len(data) < 1+shortDCIDLen {
+			return nil
+		}
+		return data[1 : 1+shortDCIDLen]
+	}
+	if len(data) < 6 || len(data) < 6+int(data[5]) {
+		return nil
+	}
+	return data[6 : 6+int(data[5])]
 }
 
 func quicParseLongHeader(data []byte) (hdr quicPacketHeader, total int, err error) {
@@ -183,8 +201,19 @@ func quicReadPacketNumber(data []byte, pnLen int) uint64 {
 	return pn
 }
 
+const quicHPMinPNAndPayload = 4
+
+func quicPadForHeaderProtection(payload []byte, pnLen int) []byte {
+	padded := make([]byte, quicHPMinPNAndPayload-pnLen)
+	copy(padded, payload)
+	return padded
+}
+
 func quicBuildInitialPacket(dst []byte, dcid, scid, token, payload []byte, pn uint64, largestAcked int64, keys *quicKeys) []byte {
 	truncatedPN, pnLen := quicEncodePacketNumber(pn, largestAcked)
+	if pnLen+len(payload) < quicHPMinPNAndPayload {
+		payload = quicPadForHeaderProtection(payload, pnLen)
+	}
 
 	headerStart := len(dst)
 	dst = quicBuildLongHeader(dst, quicInitialType, quicVersion1, dcid, scid, token, pnLen)
@@ -195,7 +224,7 @@ func quicBuildInitialPacket(dst []byte, dcid, scid, token, payload []byte, pn ui
 	pnOffset := len(dst)
 	dst = quicAppendPacketNumber(dst, truncatedPN, pnLen)
 
-	header := dst[headerStart:len(dst)]
+	header := dst[headerStart:]
 	hcp := quicHdrCopyPool.Get().(*[]byte)
 	headerCopy := append((*hcp)[:0], header...)
 
@@ -210,6 +239,9 @@ func quicBuildInitialPacket(dst []byte, dcid, scid, token, payload []byte, pn ui
 
 func quicBuildHandshakePacket(dst []byte, dcid, scid, payload []byte, pn uint64, largestAcked int64, keys *quicKeys) []byte {
 	truncatedPN, pnLen := quicEncodePacketNumber(pn, largestAcked)
+	if pnLen+len(payload) < quicHPMinPNAndPayload {
+		payload = quicPadForHeaderProtection(payload, pnLen)
+	}
 
 	headerStart := len(dst)
 	dst = quicBuildLongHeader(dst, quicHandshakeType, quicVersion1, dcid, scid, nil, pnLen)
@@ -220,7 +252,7 @@ func quicBuildHandshakePacket(dst []byte, dcid, scid, payload []byte, pn uint64,
 	pnOffset := len(dst)
 	dst = quicAppendPacketNumber(dst, truncatedPN, pnLen)
 
-	header := dst[headerStart:len(dst)]
+	header := dst[headerStart:]
 	hcp := quicHdrCopyPool.Get().(*[]byte)
 	headerCopy := append((*hcp)[:0], header...)
 
@@ -235,13 +267,16 @@ func quicBuildHandshakePacket(dst []byte, dcid, scid, payload []byte, pn uint64,
 
 func quicBuildShortPacket(dst []byte, dcid, payload []byte, pn uint64, largestAcked int64, keys *quicKeys, keyPhase uint32) []byte {
 	truncatedPN, pnLen := quicEncodePacketNumber(pn, largestAcked)
+	if pnLen+len(payload) < quicHPMinPNAndPayload {
+		payload = quicPadForHeaderProtection(payload, pnLen)
+	}
 
 	headerStart := len(dst)
 	dst = quicBuildShortHeader(dst, dcid, truncatedPN, pnLen, keyPhase)
 
 	pnOffset := headerStart + 1 + len(dcid)
 
-	header := dst[headerStart:len(dst)]
+	header := dst[headerStart:]
 	hcp := quicHdrCopyPool.Get().(*[]byte)
 	headerCopy := append((*hcp)[:0], header...)
 

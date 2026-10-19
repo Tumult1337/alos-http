@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -5,8 +7,16 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/guno1928/turbo"
+)
+
+const (
+	healthProbeWaitCeiling  = 8 * time.Second
+	healthProbePollInterval = 15 * time.Millisecond
 )
 
 // The health-transition tests below each take a second or more, which is
@@ -31,6 +41,13 @@ func freeAddr(t *testing.T) string {
 // statusOrigin answers every request with the given status line.
 func statusOrigin(t *testing.T, status string) string {
 	t.Helper()
+	addr, _ := countingStatusOrigin(t, status)
+	return addr
+}
+
+func countingStatusOrigin(t *testing.T, status string) (string, *atomic.Int32) {
+	t.Helper()
+	var probes atomic.Int32
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("listen: %v", err)
@@ -41,6 +58,7 @@ func statusOrigin(t *testing.T, status string) string {
 			if aerr != nil {
 				return
 			}
+			probes.Add(1)
 			go func(c net.Conn) {
 				defer c.Close()
 				buf := make([]byte, 1024)
@@ -50,17 +68,28 @@ func statusOrigin(t *testing.T, status string) string {
 		}
 	}()
 	t.Cleanup(func() { _ = ln.Close() })
-	return ln.Addr().String()
+	return ln.Addr().String(), &probes
+}
+
+func waitForHealthProbes(t *testing.T, probes *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := turbo.Deadline(healthProbeWaitCeiling)
+	for probes.Load() < want {
+		if turbo.Until(deadline) <= 0 {
+			t.Fatalf("health checker sent %d probes within %v, want %d", probes.Load(), healthProbeWaitCeiling, want)
+		}
+		turbo.Sleep(healthProbePollInterval)
+	}
 }
 
 func TestProbeBackendTCPDetectsReachability(t *testing.T) {
 	up := statusOrigin(t, "200 OK")
 	cfg := HealthCheckConfig{Timeout: 2 * time.Second}
 
-	if !probeBackendHealth(up, false, false, cfg) {
+	if !probeBackendHealth(up, false, false, nil, cfg) {
 		t.Error("a listening backend was reported unhealthy")
 	}
-	if probeBackendHealth(freeAddr(t), false, false, cfg) {
+	if probeBackendHealth(freeAddr(t), false, false, nil, cfg) {
 		t.Error("a backend refusing connections was reported healthy")
 	}
 }
@@ -85,7 +114,7 @@ func TestProbeBackendHTTPJudgesStatusCode(t *testing.T) {
 	}
 	for _, tc := range cases {
 		addr := statusOrigin(t, tc.status)
-		got := probeBackendHealth(addr, false, false, cfg)
+		got := probeBackendHealth(addr, false, false, nil, cfg)
 		if got != tc.want {
 			t.Errorf("status %q reported healthy=%v, want %v (%s)", tc.status, got, tc.want, tc.why)
 		}
@@ -94,7 +123,7 @@ func TestProbeBackendHTTPJudgesStatusCode(t *testing.T) {
 
 func TestProbeBackendHTTPUnreachableIsUnhealthy(t *testing.T) {
 	cfg := HealthCheckConfig{Path: "/healthz", Timeout: 2 * time.Second}
-	if probeBackendHealth(freeAddr(t), false, false, cfg) {
+	if probeBackendHealth(freeAddr(t), false, false, nil, cfg) {
 		t.Error("an unreachable backend was reported healthy by the HTTP probe")
 	}
 }
@@ -132,27 +161,32 @@ func TestHealthCheckerEjectsDeadBackend(t *testing.T) {
 
 // A backend must not be ejected until FailThreshold consecutive probes fail.
 func TestHealthCheckerHonoursFailThreshold(t *testing.T) {
-	dead := &backend{Addr: freeAddr(t)}
+	const failThreshold = 3
+	addr, probes := countingStatusOrigin(t, "503 Service Unavailable")
+	dead := &backend{Addr: addr}
 	dead.Healthy.Store(true)
 
 	hc := newHealthChecker([]*backend{dead}, HealthCheckConfig{
+		Path:             "/health",
 		Interval:         time.Second,
 		Timeout:          300 * time.Millisecond,
-		FailThreshold:    3,
+		FailThreshold:    failThreshold,
 		SuccessThreshold: 1,
 	}, nil)
 	hc.start()
 	defer hc.stop()
 
-	// One tick in it must still be considered healthy.
-	time.Sleep(1500 * time.Millisecond)
+	waitForHealthProbes(t, probes, failThreshold-1)
 	if !dead.Healthy.Load() {
-		t.Fatal("backend ejected after a single failure despite FailThreshold=3")
+		t.Fatalf("backend ejected after %d failed probes despite FailThreshold=%d", probes.Load(), failThreshold)
 	}
 
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
 		if !dead.Healthy.Load() {
+			if got := probes.Load(); got < failThreshold {
+				t.Fatalf("backend ejected after %d failed probes, want %d", got, failThreshold)
+			}
 			return
 		}
 		time.Sleep(15 * time.Millisecond)

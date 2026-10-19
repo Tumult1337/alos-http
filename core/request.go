@@ -1,7 +1,10 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"context"
+	"crypto/x509"
 	"io"
 	"net"
 	"sync"
@@ -58,19 +61,30 @@ type Request struct {
 	StreamWriter StreamWriter
 	conn         net.Conn
 	ctx          context.Context
+	cancelSrc    *cancelSlot
+	swFactory    streamWriterFactory
+	streamCORS   streamCORSPolicy
+	h2Stream     *H2Stream
+	h2Tunnel     *h2StreamConn
+	bodyStream   *BodyReader
 
 	tlsReader  *TrafficAEAD
 	tlsWriter  *TrafficAEAD
 	server     *Server
 	attachConn func(*Request) net.Conn
 
+	loopRateLimitRefusal rateLimitRefusal
+
 	hdrBuf        []byte
 	hijackReadBuf []byte
 	cookiesCache  []Cookie
+	trailers      [][2]string
+	allow         string
 
-	promoteBuf     []byte
-	promoteOff     int
-	aliasesReadBuf bool
+	promoteBuf      []byte
+	ownedRemoteAddr string
+	promoteOff      int
+	aliasesReadBuf  bool
 
 	store      map[string]any
 	queryCache map[string][]string
@@ -93,9 +107,15 @@ type Request struct {
 	StreamID        uint32
 	headerCacheMask uint32
 
+	TLSVersion uint16
+	expect     h1Expect
+	peerCerts  []*x509.Certificate
+	peerAddr   string
+
 	IsH2          bool
 	IsTLS         bool
 	hijacked      bool
+	h2WebSocket   bool
 	connTakenOver bool
 	queryParsed   bool
 	formParsed    bool
@@ -103,7 +123,8 @@ type Request struct {
 	cookiesParsed bool
 }
 
-// Context returns the request's context, or context.Background if none is set.
+// Context returns the request's context. Without SetContext it is cancelled
+// when the client goes away, the server shuts down, or the request finishes.
 // Middleware such as Timeout cancels this context to signal handlers that they
 // should abort; handlers can select on Context().Done() to return early.
 //
@@ -113,7 +134,7 @@ func (r *Request) Context() context.Context {
 	if r.ctx != nil {
 		return r.ctx
 	}
-	return context.Background()
+	return r.cancelSlot().state()
 }
 
 // SetContext sets the request context. It is primarily used by middleware to
@@ -140,6 +161,15 @@ const (
 	headerCacheWSVersion
 )
 
+type streamWriterFactory interface {
+	newStreamWriter(req *Request) StreamWriter
+}
+
+const (
+	TLSVersion12 uint16 = 0x0303
+	TLSVersion13 uint16 = 0x0304
+)
+
 // Reset clears the request to its zero state, including headers, body,
 // params, and cached lookups, so it can be reused from a connection pool.
 func (r *Request) Reset() {
@@ -160,19 +190,31 @@ func (r *Request) Reset() {
 	r.StreamID = 0
 	r.IsH2 = false
 	r.IsTLS = false
+	r.TLSVersion = 0
+	r.peerCerts = nil
+	r.peerAddr = ""
 	for i := 0; i < r.ParamCount && i < len(r.Params); i++ {
 		r.Params[i] = Param{}
 	}
 	r.ParamCount = 0
 	r.StreamWriter = nil
+	r.swFactory = nil
+	r.h2Stream = nil
+	r.bodyStream = nil
 	r.conn = nil
 	r.tlsReader = nil
 	r.tlsWriter = nil
 	r.hdrBuf = nil
 	r.aliasesReadBuf = false
+	r.ownedRemoteAddr = ""
 	r.promoteBuf = nil
 	r.promoteOff = 0
 	r.hijacked = false
+	r.h2WebSocket = false
+	r.h2Tunnel = nil
+	r.expect = h1ExpectNone
+	r.trailers = nil
+	r.allow = ""
 	r.cachedCL = ""
 	r.cachedConn = ""
 	r.cachedTE = ""
@@ -191,20 +233,30 @@ func (r *Request) Reset() {
 	r.connTakenOver = false
 	r.hijackReadBuf = nil
 	r.queryParsed = false
-	clear(r.queryCache)
+	if len(r.queryCache) > 0 {
+		clear(r.queryCache)
+	}
 	r.formParsed = false
-	clear(r.formCache)
+	if len(r.formCache) > 0 {
+		clear(r.formCache)
+	}
 	r.filesParsed = false
-	clear(r.filesCache)
+	if len(r.filesCache) > 0 {
+		clear(r.filesCache)
+	}
 	r.cookiesParsed = false
 	clear(r.cookiesCache)
 	r.cookiesCache = r.cookiesCache[:0]
 	r.ctx = nil
-	clear(r.store)
+	r.finishContext()
+	if len(r.store) > 0 {
+		clear(r.store)
+	}
 }
 
 func (r *Request) resetFastH1() {
 	r.aliasesReadBuf = false
+	r.peerAddr = ""
 	clear(r.Headers)
 	r.Headers = r.Headers[:0]
 	r.Body = shrinkBuffer(r.Body, 1024)
@@ -215,6 +267,11 @@ func (r *Request) resetFastH1() {
 	r.RawPath = ""
 	r.Query = ""
 	r.hijacked = false
+	r.h2WebSocket = false
+	r.h2Tunnel = nil
+	r.expect = h1ExpectNone
+	r.trailers = nil
+	r.allow = ""
 	if mask := r.headerCacheMask; mask != 0 {
 		if mask&headerCacheContentLength != 0 {
 			r.cachedCL = ""
@@ -258,16 +315,40 @@ func (r *Request) resetFastH1() {
 	r.connTakenOver = false
 	r.hijackReadBuf = nil
 	r.queryParsed = false
-	clear(r.queryCache)
+	if len(r.queryCache) > 0 {
+		clear(r.queryCache)
+	}
 	r.formParsed = false
-	clear(r.formCache)
+	if len(r.formCache) > 0 {
+		clear(r.formCache)
+	}
 	r.filesParsed = false
-	clear(r.filesCache)
+	if len(r.filesCache) > 0 {
+		clear(r.filesCache)
+	}
 	r.cookiesParsed = false
 	clear(r.cookiesCache)
 	r.cookiesCache = r.cookiesCache[:0]
 	r.ctx = nil
-	clear(r.store)
+	r.finishContext()
+	if len(r.store) > 0 {
+		clear(r.store)
+	}
+}
+
+func (r *Request) resetConnIdentity() {
+	r.resetFastH1()
+	r.Method = ""
+	r.Path = ""
+	r.Proto = ""
+	r.Host = ""
+	r.RemoteAddr = ""
+	r.ownedRemoteAddr = ""
+	r.peerCerts = nil
+	r.TLSVersion = 0
+	r.IsTLS = false
+	r.IsH2 = false
+	r.StreamID = 0
 }
 
 func (r *Request) ensureConn() net.Conn {
@@ -293,6 +374,18 @@ func (r *Request) cacheHeaderLookup(bit uint32, slot *string, name string) strin
 	}
 	r.headerCacheMask |= bit
 	return ""
+}
+
+func (r *Request) h1UpgradeFieldSeen() bool {
+	return r.headerCacheMask&headerCacheUpgrade != 0
+}
+
+func (r *Request) takeLoopRateLimitRefusal() rateLimitRefusal {
+	refusal := r.loopRateLimitRefusal
+	if refusal.refused() {
+		r.loopRateLimitRefusal = rateLimitRefusal{}
+	}
+	return refusal
 }
 
 // HijackConn hands the connection to the handler for protocols that need raw I/O.
@@ -389,8 +482,12 @@ func (c *aead13Conn) Read(p []byte) (int, error) {
 			return 0, io.EOF
 		}
 		if contentType != 0x17 {
+			err := c.handlePostHandshake(contentType, content)
 			*bp = (*bp)[:0]
 			RecordBufPool.Put(bp)
+			if err != nil {
+				return 0, err
+			}
 			continue
 		}
 		n := copy(p, content)
@@ -404,9 +501,38 @@ func (c *aead13Conn) Read(p []byte) (int, error) {
 	return 0, ErrTruncated
 }
 
+func (c *aead13Conn) handlePostHandshake(contentType byte, msg []byte) error {
+	if contentType != tlsRecHandshake {
+		return errTLSUnexpectedRecord
+	}
+	requested, _, ok := parseKeyUpdate(msg)
+	if !ok || !c.reader.advanceGeneration() {
+		return errTLSUnexpectedRecord
+	}
+	if !requested {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sendKeyUpdate()
+}
+
+func (c *aead13Conn) sendKeyUpdate() error {
+	rec, ok := appendKeyUpdateRecord(nil, c.writer)
+	if !ok {
+		return errTLSRekeyFailed
+	}
+	return writeFull(c.conn, rec)
+}
+
 func (c *aead13Conn) Write(p []byte) (int, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.writer.keyWornOut() {
+		if err := c.sendKeyUpdate(); err != nil {
+			return 0, err
+		}
+	}
 	err := WriteAppData(c.conn, c.writer, p)
 	if err != nil {
 		return 0, err
@@ -482,6 +608,8 @@ func (r *Request) Header(name string) string {
 	}
 	return ""
 }
+
+func (r *Request) LastEventID() string { return r.Header("last-event-id") }
 
 // ParamValue returns a named route parameter.
 //
@@ -575,11 +703,18 @@ func (r *Request) parseCookiesLazy() {
 		return
 	}
 	r.cookiesParsed = true
-	hdr := r.Header("Cookie")
-	if hdr == "" {
-		return
+	r.cookiesCache = r.cookiesCache[:0]
+	for i := range r.Headers {
+		if !EqualFoldASCII(r.Headers[i][0], "Cookie") {
+			continue
+		}
+		r.cookiesCache = append(r.cookiesCache, parseCookieHeader(r.Headers[i][1])...)
+		if len(r.cookiesCache) >= maxCookiePairs {
+			clear(r.cookiesCache[maxCookiePairs:])
+			r.cookiesCache = r.cookiesCache[:maxCookiePairs]
+			return
+		}
 	}
-	r.cookiesCache = append(r.cookiesCache[:0], parseCookieHeader(hdr)...)
 }
 
 // Cookie returns the value of the named request cookie, or "" if not present.
@@ -652,8 +787,13 @@ func (r *Request) parseFormLazy() {
 	if r.formParsed {
 		return
 	}
-	r.formParsed = true
 	ct := r.Header("Content-Type")
+	if hasPrefixFold(ct, "multipart/form-data") {
+		r.parseFilesLazy()
+		r.formParsed = true
+		return
+	}
+	r.formParsed = true
 	if hasPrefixFold(ct, "application/x-www-form-urlencoded") {
 		r.formCache = parseFormURLEncoded(r.Body)
 	}
@@ -664,15 +804,14 @@ func (r *Request) parseFilesLazy() {
 		return
 	}
 	r.filesParsed = true
-	ct := r.Header("Content-Type")
-	if !hasPrefixFold(ct, "multipart/form-data") {
-		return
-	}
-	boundary := extractBoundary(ct)
+	boundary := multipartBoundary(r.Header("Content-Type"))
 	if boundary == "" {
 		return
 	}
-	vals, files := parseMultipart(r.Body, boundary)
+	vals, files, err := parseMultipartInMem(r.Body, boundary)
+	if err != nil {
+		return
+	}
 	if !r.formParsed {
 		r.formParsed = true
 		r.formCache = vals

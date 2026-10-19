@@ -1,9 +1,13 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"compress/flate"
 	"compress/gzip"
+	"hash/maphash"
 	"io"
+	"runtime"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -135,14 +139,19 @@ type cacheEntry struct {
 }
 
 func (pc *ProxyCache) removeEntry(key string, entry *cacheEntry) {
-	if !entry.deleted.CompareAndSwap(false, true) {
+	if !pc.retireEntry(entry) {
 		return
 	}
-	if cur, ok := pc.entries.Load(key); ok && cur == entry {
-		pc.entries.Delete(key)
+	pc.entries.CompareAndDelete(key, entry)
+}
+
+func (pc *ProxyCache) retireEntry(entry *cacheEntry) bool {
+	if !entry.deleted.CompareAndSwap(false, true) {
+		return false
 	}
 	pc.totalBytes.Add(-int64(entry.bodyLen) - int64(entry.gzipLen))
 	pc.totalEntries.Add(-1)
+	return true
 }
 
 // ProxyCache stores and serves cached upstream responses keyed by method, host, and
@@ -160,6 +169,10 @@ type ProxyCache struct {
 	totalMisses  atomic.Uint64
 	stopCh       chan struct{}
 	evicting     atomic.Bool
+	transforms   atomic.Int32
+	purges       atomic.Uint64
+	widePurgedAt atomic.Uint64
+	keyPurgedAt  [cachePurgeStripes]atomic.Uint64
 	gzipPool     sync.Pool
 }
 
@@ -477,12 +490,50 @@ func (pc *ProxyCache) lookupEntry(method, host, path string, reqAllows bool) (*c
 // the default rule) permits it, subject to ProxyCacheConfig's size limits. It is a
 // no-op when no rule allows caching for this method/path/status combination.
 func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte) {
+	pc.put(method, host, path, statusCode, headers, contentType, body, cachePutOptions{generation: pc.purgeGeneration()})
+}
+
+type cachePutOptions struct {
+	generation uint64
+	offload    bool
+}
+
+func (pc *ProxyCache) purgeGeneration() uint64 {
+	if pc == nil {
+		return 0
+	}
+	return pc.purges.Load()
+}
+
+const cachePurgeStripes = 256
+
+var cachePurgeSeed = maphash.MakeSeed()
+
+func (pc *ProxyCache) keyPurgeStripe(key string) *atomic.Uint64 {
+	return &pc.keyPurgedAt[maphash.String(cachePurgeSeed, key)%cachePurgeStripes]
+}
+
+func (pc *ProxyCache) markPurged(stripe *atomic.Uint64) {
+	seq := pc.purges.Add(1)
+	for {
+		cur := stripe.Load()
+		if cur >= seq || stripe.CompareAndSwap(cur, seq) {
+			return
+		}
+	}
+}
+
+func (pc *ProxyCache) purgedSince(key string, generation uint64) bool {
+	return pc.widePurgedAt.Load() > generation || pc.keyPurgeStripe(key).Load() > generation
+}
+
+func (pc *ProxyCache) put(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, opts cachePutOptions) {
 	cfg := pc.config.Load()
 	ttl, ok := pc.shouldCache(cfg, method, path, statusCode)
 	if !ok {
 		return
 	}
-	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1, false)
+	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1, false, opts)
 }
 
 // PutManual stores body in the cache for method, host, and path with an explicit ttl,
@@ -490,16 +541,42 @@ func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][
 // used by Put. It backs ProxyResponse.CacheThis and is a no-op when body exceeds
 // ProxyCacheConfig.MaxEntrySize.
 func (pc *ProxyCache) PutManual(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int) {
-	cfg := pc.config.Load()
+	pc.putManual(method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen, cachePutOptions{generation: pc.purgeGeneration()})
+}
+
+func (pc *ProxyCache) putManual(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int, opts cachePutOptions) {
+	pc.putEntry(pc.config.Load(), method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen, true, opts)
+}
+
+const (
+	cacheMaxInflatedSize      = 64 << 20
+	cacheInlineTransformLimit = 16 << 10
+	cacheInflateChunk         = 8 << 10
+	cacheTransformCPUShare    = 2
+)
+
+func cacheInflateLimit(cfg *ProxyCacheConfig) int64 {
+	if cfg.MaxEntrySize > 0 && cfg.MaxEntrySize < cacheMaxInflatedSize {
+		return cfg.MaxEntrySize
+	}
+	return cacheMaxInflatedSize
+}
+
+func (pc *ProxyCache) acquireTransform() bool {
+	limit := max(1, runtime.GOMAXPROCS(0)/cacheTransformCPUShare)
+	if pc.transforms.Add(1) > int32(limit) {
+		pc.transforms.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int, manual bool, opts cachePutOptions) {
 	if cfg.MaxEntrySize > 0 && int64(len(body)) > cfg.MaxEntrySize {
 		return
 	}
-	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen, true)
-}
-
-func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int, manual bool) {
-	bodyLen := int64(len(body))
-	if cfg.MaxEntrySize > 0 && bodyLen > cfg.MaxEntrySize {
+	key := pc.buildKey(method, host, path)
+	if pc.purgedSince(key, opts.generation) {
 		return
 	}
 
@@ -507,6 +584,14 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 		go pc.evictOldest()
 		return
 	}
+
+	_, backendEncoding := detectBackendEncoding(headers)
+	compress := preCompress && isCompressibleType(contentType)
+	minLen := cfg.CompressMinLen
+	if compressMinLen > 0 {
+		minLen = compressMinLen
+	}
+	deferred := opts.offload && (backendEncoding != "" || compress && len(body) > cacheInlineTransformLimit)
 
 	now := CoarseNanotime()
 
@@ -528,22 +613,30 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 		bodyLen:     int32(len(bodyCopy)),
 	}
 
-	needsDecompress, backendEncoding := detectBackendEncoding(headers)
-	if needsDecompress {
-		raw, err := decompressBody(bodyCopy, backendEncoding)
-		if err == nil {
-			entry.body = raw
-			entry.bodyLen = int32(len(raw))
-			bodyLen = int64(len(raw))
-			entry.headers = removeContentEncoding(entry.headers)
-		}
+	if deferred && backendEncoding != "" && len(body) <= cacheInlineTransformLimit &&
+		inflateCacheEntry(entry, backendEncoding, min(cacheInflateLimit(cfg), cacheInlineTransformLimit)) == nil {
+		backendEncoding, deferred = "", false
+	}
+	if deferred && !pc.acquireTransform() {
+		return
+	}
+	if !deferred {
+		pc.transformAndStore(cfg, key, entry, backendEncoding, compress, minLen, opts.generation)
+		return
+	}
+	go func() {
+		defer pc.transforms.Add(-1)
+		pc.transformAndStore(cfg, key, entry, backendEncoding, compress, minLen, opts.generation)
+	}()
+}
+
+func (pc *ProxyCache) transformAndStore(cfg *ProxyCacheConfig, key string, entry *cacheEntry, backendEncoding string, compress bool, minLen int, generation uint64) {
+	if backendEncoding != "" && inflateCacheEntry(entry, backendEncoding, cacheInflateLimit(cfg)) == ErrBodyTooLarge {
+		return
 	}
 
-	minLen := cfg.CompressMinLen
-	if compressMinLen > 0 {
-		minLen = compressMinLen
-	}
-	if preCompress && bodyLen >= int64(minLen) && isCompressibleType(contentType) {
+	bodyLen := int64(entry.bodyLen)
+	if compress && bodyLen >= int64(minLen) {
 		gz := pc.compressGzip(entry.body)
 		if len(gz) > 0 && len(gz) < len(entry.body) {
 			entry.gzipBody = gz
@@ -551,20 +644,30 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 			bodyLen += int64(len(gz))
 		}
 	}
+	pc.storeEntry(cfg, key, entry, bodyLen, generation)
+}
 
-	key := pc.buildKey(method, host, path)
-
-	if prev, loaded := pc.entries.LoadOrStore(key, entry); loaded {
-		if prev.deleted.CompareAndSwap(false, true) {
-			pc.totalBytes.Add(-int64(prev.bodyLen) - int64(prev.gzipLen))
-		} else {
-			pc.totalEntries.Add(1)
-		}
-		pc.entries.Store(key, entry)
-	} else {
-		pc.totalEntries.Add(1)
+func inflateCacheEntry(entry *cacheEntry, encoding string, limit int64) error {
+	raw, err := decompressBody(entry.body, encoding, limit)
+	if err != nil {
+		return err
 	}
+	entry.body = raw
+	entry.bodyLen = int32(len(raw))
+	entry.headers = removeContentEncoding(entry.headers)
+	return nil
+}
+
+func (pc *ProxyCache) storeEntry(cfg *ProxyCacheConfig, key string, entry *cacheEntry, bodyLen int64, generation uint64) {
+	pc.totalEntries.Add(1)
 	pc.totalBytes.Add(bodyLen)
+	if prev, loaded := pc.entries.Swap(key, entry); loaded {
+		pc.retireEntry(prev)
+	}
+	if pc.purgedSince(key, generation) {
+		pc.removeEntry(key, entry)
+		return
+	}
 
 	if cfg.MaxTotalBytes > 0 && pc.totalBytes.Load() > cfg.MaxTotalBytes {
 		go pc.evictOldest()
@@ -575,6 +678,7 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 // whether an entry was removed.
 func (pc *ProxyCache) Purge(method, host, path string) bool {
 	key := pc.buildKey(method, host, path)
+	pc.markPurged(pc.keyPurgeStripe(key))
 	if entry, ok := pc.entries.Load(key); ok {
 		pc.removeEntry(key, entry)
 		return true
@@ -584,14 +688,17 @@ func (pc *ProxyCache) Purge(method, host, path string) bool {
 
 // PurgeAll removes every cached entry and resets the cache's byte and entry counters.
 func (pc *ProxyCache) PurgeAll() {
-	pc.entries.Clear()
-	pc.totalBytes.Store(0)
-	pc.totalEntries.Store(0)
+	pc.markPurged(&pc.widePurgedAt)
+	pc.entries.Range(func(key string, entry *cacheEntry) bool {
+		pc.removeEntry(key, entry)
+		return true
+	})
 }
 
 // PurgeDomain removes every GET and HEAD entry cached for domain and returns the
 // number of entries removed.
 func (pc *ProxyCache) PurgeDomain(domain string) int64 {
+	pc.markPurged(&pc.widePurgedAt)
 	domain = normalizeCertDomain(domain)
 	prefix1 := "GET|" + domain + "|"
 	prefix2 := "HEAD|" + domain + "|"
@@ -626,14 +733,17 @@ func (pc *ProxyCache) ServeCached(entry *cacheEntry, req *Request, resp *Respons
 	var hitBuf [20]byte
 	resp.SetHeaderUnsafe("x-cache-hits", string(appendUint(hitBuf[:0], int64(entry.hits.Load()))))
 
-	if entry.gzipLen > 0 && acceptsGzip(req.Header("accept-encoding")) {
-		resp.SetHeaderUnsafe("content-encoding", "gzip")
-		resp.SetHeaderUnsafe("vary", "Accept-Encoding")
-		resp.SetBody(entry.gzipBody)
+	if entry.gzipLen == 0 {
+		resp.SetBody(entry.body)
 		return
 	}
-
-	resp.SetBody(entry.body)
+	if negotiateEncoding(req.Header("accept-encoding"), offerGzip) == encodingGzip {
+		resp.SetHeaderUnsafe("content-encoding", contentEncodingNames[encodingGzip])
+		resp.SetBody(entry.gzipBody)
+	} else {
+		resp.SetBody(entry.body)
+	}
+	addVaryAcceptEncoding(resp)
 }
 
 func (pc *ProxyCache) compressGzip(data []byte) []byte {
@@ -749,116 +859,50 @@ func detectBackendEncoding(headers [][2]string) (bool, string) {
 	return false, ""
 }
 
-func decompressBody(data []byte, encoding string) ([]byte, error) {
+func decompressBody(data []byte, encoding string, limit int64) ([]byte, error) {
 	switch encoding {
 	case "gzip":
-		return decompressGzip(data)
+		r, err := gzip.NewReader(newBytesReader(data))
+		if err != nil {
+			return nil, err
+		}
+		defer r.Close()
+		return inflateCapped(r, limit)
 	case "deflate":
-		return decompressDeflate(data)
+		r := flate.NewReader(newBytesReader(data))
+		defer r.Close()
+		return inflateCapped(r, limit)
 	case "br":
-		return decompressBrotli(data)
+		return inflateCapped(brotli.NewReader(newBytesReader(data)), limit)
 	}
 	return data, nil
 }
 
-func decompressGzip(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 64 << 20
-	r, err := gzip.NewReader(newBytesReader(data))
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
+func inflateCapped(r io.Reader, limit int64) ([]byte, error) {
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
-	tmp := make([]byte, 8192)
+	defer func() {
+		*bp = buf
+		putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
+	}()
+	tmp := make([]byte, cacheInflateChunk)
 	for {
 		n, rerr := r.Read(tmp)
 		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxDecompressedSize {
-				*bp = buf
-				putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
+			if int64(len(buf)+n) > limit {
 				return nil, ErrBodyTooLarge
 			}
+			buf = append(buf, tmp[:n]...)
+		}
+		if rerr == io.EOF {
+			break
 		}
 		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			*bp = buf
-			putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 			return nil, rerr
 		}
 	}
 	result := make([]byte, len(buf))
 	copy(result, buf)
-	*bp = buf
-	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
-	return result, nil
-}
-
-func decompressDeflate(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 64 << 20
-	r := flate.NewReader(newBytesReader(data))
-	defer r.Close()
-	bp := LargeBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	tmp := make([]byte, 8192)
-	for {
-		n, rerr := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxDecompressedSize {
-				*bp = buf
-				putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
-				return nil, ErrBodyTooLarge
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			*bp = buf
-			putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
-			return nil, rerr
-		}
-	}
-	result := make([]byte, len(buf))
-	copy(result, buf)
-	*bp = buf
-	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
-	return result, nil
-}
-
-func decompressBrotli(data []byte) ([]byte, error) {
-	const maxDecompressedSize = 64 << 20
-	r := brotli.NewReader(newBytesReader(data))
-	bp := LargeBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	tmp := make([]byte, 8192)
-	for {
-		n, rerr := r.Read(tmp)
-		if n > 0 {
-			buf = append(buf, tmp[:n]...)
-			if len(buf) > maxDecompressedSize {
-				*bp = buf
-				putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
-				return nil, ErrBodyTooLarge
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			*bp = buf
-			putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
-			return nil, rerr
-		}
-	}
-	result := make([]byte, len(buf))
-	copy(result, buf)
-	*bp = buf
-	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return result, nil
 }
 
@@ -885,36 +929,6 @@ func stripCacheUnsafeHeaders(headers [][2]string) [][2]string {
 		n++
 	}
 	return headers[:n]
-}
-
-func acceptsGzip(accept string) bool {
-	if accept == "" {
-		return false
-	}
-	for len(accept) > 0 {
-		end := indexByte(accept, ',')
-		var token string
-		if end < 0 {
-			token = accept
-			accept = ""
-		} else {
-			token = accept[:end]
-			accept = accept[end+1:]
-		}
-		token = trimASCIISpace(token)
-		qDisabled := false
-		if semi := indexByte(token, ';'); semi >= 0 {
-			params := trimASCIISpace(token[semi+1:])
-			token = token[:semi]
-			if len(params) >= 3 && (params[0] == 'q' || params[0] == 'Q') && params[1] == '=' {
-				qDisabled = params[2] == '0' && (len(params) == 3 || params[3] == ',' || params[3] == ' ')
-			}
-		}
-		if trimASCIISpace(token) == "gzip" {
-			return !qDisabled
-		}
-	}
-	return false
 }
 
 func isCompressibleType(ct string) bool {

@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -7,9 +9,10 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
+	"fmt"
 	"io"
-	"log"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,7 +25,7 @@ func Recovery() MiddlewareFunc {
 		return func(req *Request, resp *Response) {
 			defer func() {
 				if r := recover(); r != nil {
-					log.Printf("[PANIC] %s %s: %v", req.Method, req.Path, r)
+					req.server.reportPanic(req, r)
 					resp.Status(500).String("Internal Server Error")
 				}
 			}()
@@ -38,8 +41,7 @@ func Logger() MiddlewareFunc {
 			start := time.Now()
 			next(req, resp)
 			elapsed := time.Since(start)
-			log.Printf("[%s] %s %s %d %s",
-				req.Proto, req.Method, req.Path, resp.StatusCode, elapsed)
+			req.server.logger().Info("request", "proto", req.Proto, "method", req.Method, "path", req.Path, "status", resp.StatusCode, "elapsed", elapsed)
 		}
 	}
 }
@@ -155,9 +157,11 @@ func newTrustedProxyMatcher(trustedProxies []string, trustAllWhenEmpty bool) tru
 			matcher.nets = append(matcher.nets, cidr)
 			continue
 		}
-		if ip := net.ParseIP(p); ip != nil {
-			matcher.ips = append(matcher.ips, ip)
+		ip := net.ParseIP(p)
+		if ip == nil {
+			panic(fmt.Sprintf("core: invalid trusted proxy %q", p))
 		}
+		matcher.ips = append(matcher.ips, ip)
 	}
 	return matcher
 }
@@ -191,6 +195,7 @@ func applyTrustedRealIP(req *Request, matcher trustedProxyMatcher) {
 	if req == nil || !matcher.allows(req.RemoteAddr) {
 		return
 	}
+	req.peerAddr = req.RemoteAddr
 	if xff := req.Header("x-forwarded-for"); xff != "" {
 		ip := lastXFFEntry(xff)
 		if isValidIP(ip) {
@@ -260,10 +265,12 @@ func (ce *CORSEngine) Middleware() MiddlewareFunc {
 func (ce *CORSEngine) applyCORS(snap *corsSnapshot, req *Request, resp *Response) {
 	if snap.wildcard {
 		resp.SetHeaderUnsafe("access-control-allow-origin", "*")
-	} else if origin := req.Header("origin"); origin != "" {
-		if _, ok := snap.originMap[origin]; ok {
-			resp.SetHeaderUnsafe("access-control-allow-origin", cookieStripCTL(origin))
-			resp.SetHeaderUnsafe("vary", "Origin")
+	} else {
+		addVaryField(resp, "Origin")
+		if origin := req.Header("origin"); origin != "" {
+			if _, ok := snap.originMap[origin]; ok {
+				resp.SetHeaderUnsafe("access-control-allow-origin", cookieStripCTL(origin))
+			}
 		}
 	}
 	if snap.methods != "" {
@@ -341,25 +348,31 @@ func RequestID() MiddlewareFunc {
 //	Example: ReferrerPolicy: "strict-origin-when-cross-origin" sends the origin on cross-origin requests.
 //	Example: ReferrerPolicy: "no-referrer" never sends the Referer header.
 type SecurityHeadersConfig struct {
-	ContentTypeNosniff bool
-	XFrameOptions      string
-	XSSProtection      bool
-	HSTSMaxAge         int
-	HSTSSubdomains     bool
-	HSTSPreload        bool
-	ReferrerPolicy     string
+	ContentTypeNosniff        bool
+	XFrameOptions             string
+	XSSProtection             bool
+	HSTSMaxAge                int
+	HSTSSubdomains            bool
+	HSTSPreload               bool
+	ReferrerPolicy            string
+	ContentSecurityPolicy     string
+	PermissionsPolicy         string
+	CrossOriginOpenerPolicy   string
+	CrossOriginResourcePolicy string
+	CrossOriginEmbedderPolicy string
 }
 
-// DefaultSecurityHeaders returns a SecurityHeadersConfig with nosniff, X-Frame-Options DENY, the XSS filter, two-year HSTS with includeSubDomains and preload, and a strict-origin-when-cross-origin referrer policy.
+// DefaultSecurityHeaders returns a SecurityHeadersConfig with nosniff, X-Frame-Options DENY, the XSS filter, two-year HSTS with includeSubDomains and preload, a strict-origin-when-cross-origin referrer policy, and Cross-Origin-Opener-Policy same-origin.
 func DefaultSecurityHeaders() SecurityHeadersConfig {
 	return SecurityHeadersConfig{
-		ContentTypeNosniff: true,
-		XFrameOptions:      "DENY",
-		XSSProtection:      true,
-		HSTSMaxAge:         63072000,
-		HSTSSubdomains:     true,
-		HSTSPreload:        true,
-		ReferrerPolicy:     "strict-origin-when-cross-origin",
+		ContentTypeNosniff:      true,
+		XFrameOptions:           "DENY",
+		XSSProtection:           true,
+		HSTSMaxAge:              63072000,
+		HSTSSubdomains:          true,
+		HSTSPreload:             true,
+		ReferrerPolicy:          "strict-origin-when-cross-origin",
+		CrossOriginOpenerPolicy: "same-origin",
 	}
 }
 
@@ -388,17 +401,24 @@ func SecurityHeaders(cfg SecurityHeadersConfig) MiddlewareFunc {
 	if cfg.ContentTypeNosniff {
 		staticHeaders = append(staticHeaders, [2]string{"x-content-type-options", "nosniff"})
 	}
-	if cfg.XFrameOptions != "" {
-		staticHeaders = append(staticHeaders, [2]string{"x-frame-options", cfg.XFrameOptions})
-	}
 	if cfg.XSSProtection {
 		staticHeaders = append(staticHeaders, [2]string{"x-xss-protection", "1; mode=block"})
 	}
 	if hsts != "" {
 		staticHeaders = append(staticHeaders, [2]string{"strict-transport-security", hsts})
 	}
-	if cfg.ReferrerPolicy != "" {
-		staticHeaders = append(staticHeaders, [2]string{"referrer-policy", cfg.ReferrerPolicy})
+	for _, h := range [...][2]string{
+		{"x-frame-options", cfg.XFrameOptions},
+		{"referrer-policy", cfg.ReferrerPolicy},
+		{"content-security-policy", cfg.ContentSecurityPolicy},
+		{"permissions-policy", cfg.PermissionsPolicy},
+		{"cross-origin-opener-policy", cfg.CrossOriginOpenerPolicy},
+		{"cross-origin-resource-policy", cfg.CrossOriginResourcePolicy},
+		{"cross-origin-embedder-policy", cfg.CrossOriginEmbedderPolicy},
+	} {
+		if value := sanitizeHeaderValue(h[1]); value != "" {
+			staticHeaders = append(staticHeaders, [2]string{h[0], value})
+		}
 	}
 
 	return func(next HandlerFunc) HandlerFunc {
@@ -422,8 +442,9 @@ func SecurityHeaders(cfg SecurityHeadersConfig) MiddlewareFunc {
 //	Example: MinSize: 512 skips compression for bodies under 512 bytes.
 //	Example: MinSize: 0 uses the default of 256.
 type CompressConfig struct {
-	Level   int
-	MinSize int
+	Level       int
+	MinSize     int
+	BrotliLevel int
 }
 
 var gzipWriterPool = [10]sync.Pool{}
@@ -447,7 +468,7 @@ func init() {
 	}
 }
 
-// Compress returns middleware that gzip- or deflate-compresses response bodies per the request's Accept-Encoding header, leaving streamed responses and bodies below cfg.MinSize untouched. See CompressConfig for defaults.
+// Compress returns middleware that brotli-, gzip- or deflate-compresses response bodies per the request's Accept-Encoding header, leaving streamed responses and bodies below cfg.MinSize untouched. See CompressConfig for defaults.
 //
 // Example: app.Use(Compress(CompressConfig{}))
 // Example: app.Use(Compress(CompressConfig{Level: 6, MinSize: 512}))
@@ -471,56 +492,48 @@ func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig
 		minSize = 256
 	}
 
-	if resp == nil || req == nil || resp.IsStreamed() || resp.transmittedBodyLen() < minSize {
+	if resp == nil || req == nil || resp.IsStreamed() || resp.StatusCode == http.StatusPartialContent {
 		return
 	}
-	if responseHasHeader(resp.Headers, "content-encoding") {
-		return
-	}
-
-	enc := negotiateEncoding(req.Header("accept-encoding"))
-	if enc == encodingNone {
-		return
-	}
-
 	body := resp.transmittedBodyBytes()
-	bp := LargeBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-
-	switch enc {
-	case encodingGzip:
-		gw := gzipWriterPool[level].Get().(*gzip.Writer)
-		w := newBytesWriter(&buf)
-		gw.Reset(w)
-		_, _ = gw.Write(body)
-		_ = gw.Close()
-		gzipWriterPool[level].Put(gw)
-		w.buf = nil
-		bytesWriterPool.Put(w)
-	case encodingDeflate:
-		fw := deflateWriterPool[level].Get().(*flate.Writer)
-		w := newBytesWriter(&buf)
-		fw.Reset(w)
-		_, _ = fw.Write(body)
-		_ = fw.Close()
-		deflateWriterPool[level].Put(fw)
-		w.buf = nil
-		bytesWriterPool.Put(w)
+	if req.Method == "HEAD" {
+		body = resp.bodyBytesUnsafe()
+	}
+	if len(body) < minSize {
+		return
+	}
+	if responseHasHeader(resp.Headers, "content-encoding") || responseHasHeader(resp.Headers, "content-range") {
+		return
 	}
 
+	enc := negotiateEncoding(req.Header("accept-encoding"), offerAllEncodings)
+	if enc == encodingNone {
+		addVaryAcceptEncoding(resp)
+		return
+	}
+	if enc == encodingBrotli {
+		level = normalizeBrotliLevel(cfg.BrotliLevel)
+	}
+
+	bp := LargeBufPool.Get().(*[]byte)
+	buf := appendCompressed((*bp)[:0], body, enc, level)
 	if len(buf) > 0 && len(buf) < len(body) {
 		resp.SetBody(buf)
-		switch enc {
-		case encodingGzip:
-			resp.SetHeaderUnsafe("Content-Encoding", "gzip")
-		case encodingDeflate:
-			resp.SetHeaderUnsafe("Content-Encoding", "deflate")
-		}
-		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
+		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
+		weakenStrongETag(resp.Headers)
 	}
+	addVaryAcceptEncoding(resp)
 
 	*bp = buf
 	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
+}
+
+func weakenStrongETag(headers [][2]string) {
+	for i := range headers {
+		if EqualFoldASCII(headers[i][0], "etag") && strings.HasPrefix(headers[i][1], `"`) {
+			headers[i][1] = "W/" + headers[i][1]
+		}
+	}
 }
 
 func responseHasHeader(headers [][2]string, name string) bool {
@@ -541,76 +554,6 @@ func responseHasHeader(headers [][2]string, name string) bool {
 		}
 		return false
 	}
-}
-
-type encodingType uint8
-
-const (
-	encodingNone    encodingType = 0
-	encodingGzip    encodingType = 1
-	encodingDeflate encodingType = 2
-)
-
-func negotiateEncoding(accept string) encodingType {
-	if accept == "" {
-		return encodingNone
-	}
-	var bestGzip, bestDeflate int8
-	bestGzip = -1
-	bestDeflate = -1
-	for i := 0; i < len(accept); {
-		for i < len(accept) && (accept[i] == ' ' || accept[i] == ',') {
-			i++
-		}
-		tokenStart := i
-		for i < len(accept) && accept[i] != ',' && accept[i] != ';' {
-			i++
-		}
-		tokenEnd := i
-		for tokenEnd > tokenStart && accept[tokenEnd-1] == ' ' {
-			tokenEnd--
-		}
-		token := accept[tokenStart:tokenEnd]
-		q := int8(1)
-		if i < len(accept) && accept[i] == ';' {
-			i++
-			for i < len(accept) && accept[i] == ' ' {
-				i++
-			}
-			if i+2 <= len(accept) && (accept[i] == 'q' || accept[i] == 'Q') && accept[i+1] == '=' {
-				i += 2
-				if i < len(accept) && accept[i] == '0' {
-					isZero := true
-					if i+1 < len(accept) && accept[i+1] != ',' && accept[i+1] != ' ' && accept[i+1] != ';' {
-						isZero = false
-					}
-					if isZero {
-						q = 0
-					}
-				}
-			}
-			for i < len(accept) && accept[i] != ',' {
-				i++
-			}
-		}
-		switch {
-		case len(token) == 4 && (token[0] == 'g' || token[0] == 'G') &&
-			(token[1] == 'z' || token[1] == 'Z') &&
-			(token[2] == 'i' || token[2] == 'I') &&
-			(token[3] == 'p' || token[3] == 'P'):
-			bestGzip = q
-		case len(token) == 7 && (token[0] == 'd' || token[0] == 'D') &&
-			EqualFoldASCII(token, "deflate"):
-			bestDeflate = q
-		}
-	}
-	if bestGzip > 0 {
-		return encodingGzip
-	}
-	if bestDeflate > 0 {
-		return encodingDeflate
-	}
-	return encodingNone
 }
 
 var bytesWriterPool = sync.Pool{
@@ -697,6 +640,9 @@ func Timeout(d time.Duration) MiddlewareFunc {
 				tmpReq.store = nil
 			}
 			tmpReq.StreamWriter = nil
+			tmpReq.swFactory = nil
+			tmpReq.h2Stream = nil
+			tmpReq.h2Tunnel = nil
 			tmpReq.conn = nil
 			tmpReq.tlsReader = nil
 			tmpReq.tlsWriter = nil
@@ -715,7 +661,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 			go func() {
 				defer func() {
 					if r := recover(); r != nil {
-						log.Printf("[PANIC] timeout handler: %v", r)
+						tmpReq.server.reportPanic(&tmpReq, r)
 					}
 					done <- struct{}{}
 				}()
@@ -729,9 +675,6 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					resp.SetBody(tmpResp.GetBody())
 					for i := range tmpResp.Headers {
 						resp.SetHeader(tmpResp.Headers[i][0], tmpResp.Headers[i][1])
-					}
-					if tmpResp.IsStreamed() {
-						resp.SetStreamer(tmpResp.Streamer())
 					}
 					tmpResp.Reset()
 					releaseResponseToPool(tmpResp)
@@ -782,42 +725,14 @@ func BodyLimit(maxBytes int64) MiddlewareFunc {
 // Example: app.Use(RealIP("10.0.0.0/8"))
 // Example: app.Use(RealIP("172.16.0.0/12", "192.168.1.1"))
 func RealIP(trustedProxies ...string) MiddlewareFunc {
-	var nets []*net.IPNet
-	var ips []net.IP
-	for _, p := range trustedProxies {
-		if _, cidr, err := net.ParseCIDR(p); err == nil {
-			nets = append(nets, cidr)
-		} else if ip := net.ParseIP(p); ip != nil {
-			ips = append(ips, ip)
-		}
-	}
-	hasTrust := len(nets) > 0 || len(ips) > 0
-
-	isTrusted := func(remoteAddr string) bool {
-		if !hasTrust {
-			return true
-		}
-		host := extractIP(remoteAddr)
-		ip := net.ParseIP(host)
-		if ip == nil {
-			return false
-		}
-		for _, n := range nets {
-			if n.Contains(ip) {
-				return true
-			}
-		}
-		for _, tip := range ips {
-			if tip.Equal(ip) {
-				return true
-			}
-		}
-		return false
-	}
+	trusted := newTrustedProxyMatcher(trustedProxies, true)
 
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
-			if isTrusted(req.RemoteAddr) {
+			if trusted.allows(req.RemoteAddr) {
+				if req.peerAddr == "" {
+					req.peerAddr = req.RemoteAddr
+				}
 				if xff := req.Header("x-forwarded-for"); xff != "" {
 					ip := lastXFFEntry(xff)
 					if isValidIP(ip) {

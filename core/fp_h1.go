@@ -1,10 +1,11 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
 	"bytes"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -17,7 +18,65 @@ const (
 	h1PhaseBodyEOF
 )
 
-var fpCrlfcrlf = []byte("\r\n\r\n")
+var (
+	fpCrlfcrlf = []byte("\r\n\r\n")
+	fpCRLF     = []byte("\r\n")
+	fpColon    = []byte(":")
+	fpComma    = []byte(",")
+)
+
+const (
+	fpNameByteToken = iota
+	fpNameByteUpper
+	fpNameByteOther
+)
+
+var fpFieldNameClass = func() (table [256]byte) {
+	for ch := range table {
+		switch {
+		case !h1TokenChar[ch]:
+			table[ch] = fpNameByteOther
+		case ch >= 'A' && ch <= 'Z':
+			table[ch] = fpNameByteUpper
+		}
+	}
+	return table
+}()
+
+func lowerFieldNameUntilColon(line []byte) (nameEnd, colon int) {
+	for i, ch := range line {
+		class := fpFieldNameClass[ch]
+		if class == fpNameByteToken {
+			continue
+		}
+		if class == fpNameByteUpper {
+			line[i] = ch + 'a' - 'A'
+			continue
+		}
+		if ch == ':' {
+			return i, i
+		}
+		if ch == ' ' || ch == '\t' {
+			if colon = colonAfterWhitespace(line[i:]); colon >= 0 {
+				return i, i + colon
+			}
+		}
+		return -1, -1
+	}
+	return -1, -1
+}
+
+func colonAfterWhitespace(rest []byte) int {
+	for j, ch := range rest {
+		if ch == ':' {
+			return j
+		}
+		if ch != ' ' && ch != '\t' {
+			return -1
+		}
+	}
+	return -1
+}
 
 type h1Parser struct {
 	phase     int8
@@ -87,13 +146,16 @@ func (h *h1Proto) attach(c *backendConn) error {
 	if ex := c.cur; ex != nil && ex.readTimeoutNano > 0 {
 		ex.deadline = l.nowNano() + ex.readTimeoutNano
 	}
+	if ex := c.cur; ex != nil && ex.body != nil && c.state != connClosed {
+		l.requestBody(c, ex)
+	}
 	return nil
 }
 
 func (h *h1Proto) onData(c *backendConn, data []byte) error {
 	c.rbuf.write(data)
 	if c.cur == nil {
-		return fpErrBadResponse
+		return errFPBadResponse
 	}
 	done, err := c.h1.advance(c)
 	if err != nil {
@@ -141,13 +203,22 @@ func appendH1Request(dst []byte, req *fpRequest) []byte {
 		dst = append(dst, req.Upgrade...)
 		dst = append(dst, '\r', '\n')
 	}
-	if len(req.Body) > 0 || req.Method == "POST" || req.Method == "PUT" || req.Method == "PATCH" {
+	switch {
+	case req.BodySource != nil && req.BodyLength > 0:
+		dst = append(dst, "content-length: "...)
+		dst = strconv.AppendInt(dst, req.BodyLength, 10)
+		dst = append(dst, '\r', '\n')
+	case req.BodySource != nil:
+		dst = append(dst, "transfer-encoding: chunked\r\n"...)
+	case len(req.Body) > 0 || req.Method == "POST" || req.Method == "PUT" || req.Method == "PATCH":
 		dst = append(dst, "content-length: "...)
 		dst = strconv.AppendInt(dst, int64(len(req.Body)), 10)
 		dst = append(dst, '\r', '\n')
 	}
 	dst = append(dst, '\r', '\n')
-	dst = append(dst, req.Body...)
+	if req.BodySource == nil {
+		dst = append(dst, req.Body...)
+	}
 	return dst
 }
 
@@ -160,7 +231,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 			idx := bytes.Index(data, fpCrlfcrlf)
 			if idx < 0 {
 				if len(data) > cfg.MaxHeaderBytes {
-					return false, fpErrHeaderTooLarge
+					return false, errFPHeaderTooLarge
 				}
 				return false, nil
 			}
@@ -170,10 +241,10 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 			}
 			c.rbuf.consume(idx + 4)
 			if p.status == 101 {
-				if c.be.sink.beginTunnel(c, p) {
-					return false, nil
+				if !p.upgradeGranted(c.cur) || !c.be.sink.beginTunnel(c, p) {
+					return false, errFPBadResponse
 				}
-				return false, fpErrBadResponse
+				return false, nil
 			}
 			if p.status >= 100 && p.status < 200 {
 				p.hdr = p.hdr[:0]
@@ -195,7 +266,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 					return true, nil
 				}
 				if !p.stream && contentLen > int64(cfg.MaxResponseBody) {
-					return false, fpErrBodyTooLarge
+					return false, errFPBodyTooLarge
 				}
 				p.remaining = contentLen
 				p.phase = h1PhaseBodyCL
@@ -227,7 +298,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 			idx := bytes.IndexByte(data, '\n')
 			if idx < 0 {
 				if len(data) > 4096 {
-					return false, fpErrBadResponse
+					return false, errFPBadResponse
 				}
 				return false, nil
 			}
@@ -238,17 +309,17 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 			if semi := bytes.IndexByte(line, ';'); semi >= 0 {
 				line = line[:semi]
 			}
-			size, err := strconv.ParseInt(string(bytes.TrimSpace(line)), 16, 64)
-			if err != nil || size < 0 {
-				return false, fpErrBadResponse
+			size, ok := parseHex64Bytes(bytes.TrimSpace(line))
+			if !ok {
+				return false, errFPBadResponse
 			}
 			c.rbuf.consume(idx + 1)
 			if size == 0 {
 				p.phase = h1PhaseTrailers
 				continue
 			}
-			if !p.stream && int64(len(p.body))+size > int64(cfg.MaxResponseBody) {
-				return false, fpErrBodyTooLarge
+			if !p.stream && size > int64(cfg.MaxResponseBody)-int64(len(p.body)) {
+				return false, errFPBodyTooLarge
 			}
 			p.remaining = size
 			p.phase = h1PhaseChunkData
@@ -277,7 +348,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				return false, nil
 			}
 			if data[0] != '\r' || data[1] != '\n' {
-				return false, fpErrBadResponse
+				return false, errFPBadResponse
 			}
 			c.rbuf.consume(2)
 			p.phase = h1PhaseChunkSize
@@ -287,7 +358,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 			idx := bytes.IndexByte(data, '\n')
 			if idx < 0 {
 				if len(data) > cfg.MaxHeaderBytes {
-					return false, fpErrHeaderTooLarge
+					return false, errFPHeaderTooLarge
 				}
 				return false, nil
 			}
@@ -304,7 +375,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 			data := c.rbuf.unread()
 			if len(data) > 0 {
 				if !p.stream && len(p.body)+len(data) > cfg.MaxResponseBody {
-					return false, fpErrBodyTooLarge
+					return false, errFPBodyTooLarge
 				}
 				if !p.emit(c, data) {
 					p.body = append(p.body, data...)
@@ -322,6 +393,10 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 	// what makes the header refs outlive the connection's read buffer.
 	p.hdrBuf = append(p.hdrBuf[:0], block...)
 	block = p.hdrBuf
+	unpairedCR, hasNUL := fpCountCRFindNUL(block)
+	if hasNUL {
+		return false, -1, errFPBadResponse
+	}
 
 	lineEnd := bytes.IndexByte(block, '\n')
 	var statusLine []byte
@@ -334,17 +409,18 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 	}
 	if len(statusLine) > 0 && statusLine[len(statusLine)-1] == '\r' {
 		statusLine = statusLine[:len(statusLine)-1]
+		unpairedCR--
 	}
 	if len(statusLine) < 12 || !bytes.HasPrefix(statusLine, []byte("HTTP/1.")) {
-		return false, -1, fpErrBadResponse
+		return false, -1, errFPBadResponse
 	}
 	minor := statusLine[7]
 	if statusLine[8] != ' ' {
-		return false, -1, fpErrBadResponse
+		return false, -1, errFPBadResponse
 	}
 	d0, d1, d2 := statusLine[9], statusLine[10], statusLine[11]
 	if d0 < '0' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9' {
-		return false, -1, fpErrBadResponse
+		return false, -1, errFPBadResponse
 	}
 	p.status = int(d0-'0')*100 + int(d1-'0')*10 + int(d2-'0')
 	p.keepAlive = minor == '1'
@@ -364,33 +440,23 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 		}
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
+			unpairedCR--
 		}
 		if len(line) == 0 {
 			continue
 		}
-		colon := bytes.IndexByte(line, ':')
-		if colon <= 0 {
-			return false, -1, fpErrBadResponse
+		nameEnd, colon := lowerFieldNameUntilColon(line)
+		if nameEnd <= 0 {
+			return false, -1, errFPBadResponse
 		}
-		name := line[:colon]
-		value := line[colon+1:]
-		for len(value) > 0 && (value[0] == ' ' || value[0] == '\t') {
-			value = value[1:]
-		}
-		for len(value) > 0 && (value[len(value)-1] == ' ' || value[len(value)-1] == '\t') {
-			value = value[:len(value)-1]
-		}
-		for i, ch := range name {
-			if ch >= 'A' && ch <= 'Z' {
-				name[i] = ch + 'a' - 'A'
-			}
-		}
+		name := line[:nameEnd]
+		value := trimOWS(line[colon+1:])
 		p.hdr = append(p.hdr, [2][]byte{name, value})
 		switch {
 		case asciiEqualFold(name, "content-length"):
 			v, err := strconv.ParseInt(string(value), 10, 64)
 			if err != nil || v < 0 || (contentLen >= 0 && contentLen != v) {
-				return false, -1, fpErrBadResponse
+				return false, -1, errFPBadResponse
 			}
 			contentLen = v
 		case asciiEqualFold(name, "transfer-encoding"):
@@ -405,10 +471,67 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 			}
 		}
 	}
+	if unpairedCR != 0 {
+		return false, -1, errFPBadResponse
+	}
 	if chunked {
 		contentLen = -1
 	}
 	return chunked, contentLen, nil
+}
+
+const forbiddenUpgradeToken = "h2c"
+
+func (p *h1Parser) upgradeGranted(ex *Exchange) bool {
+	requested := ex.forwardedUpgrade()
+	if len(requested) == 0 {
+		return false
+	}
+	granted := false
+	for _, h := range p.hdr {
+		if string(h[0]) != "upgrade" {
+			continue
+		}
+		allRequested, anyToken := upgradeTokensRequested(h[1], requested)
+		if !allRequested {
+			return false
+		}
+		granted = granted || anyToken
+	}
+	return granted
+}
+
+func upgradeTokensRequested(granted, requested []byte) (allRequested, anyToken bool) {
+	for rest := granted; len(rest) > 0; {
+		var token []byte
+		token, rest, _ = bytes.Cut(rest, fpComma)
+		token = trimOWS(token)
+		if len(token) == 0 {
+			continue
+		}
+		if asciiEqualFold(token, forbiddenUpgradeToken) || !fpContainsTokenFold(requested, strings.ToLower(string(token))) {
+			return false, false
+		}
+		anyToken = true
+	}
+	return true, anyToken
+}
+
+func (ex *Exchange) forwardedUpgrade() []byte {
+	if ex.rawRequest == nil {
+		return []byte(ex.req.Upgrade)
+	}
+	head, _, _ := bytes.Cut(ex.rawRequest, fpCrlfcrlf)
+	_, fields, _ := bytes.Cut(head, fpCRLF)
+	for len(fields) > 0 {
+		var line []byte
+		line, fields, _ = bytes.Cut(fields, fpCRLF)
+		name, value, ok := bytes.Cut(line, fpColon)
+		if ok && asciiEqualFold(bytes.TrimSpace(name), "upgrade") {
+			return bytes.TrimSpace(value)
+		}
+	}
+	return nil
 }
 
 // stringHeaders materialises the parsed headers for consumers that need strings:

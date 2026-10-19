@@ -1,0 +1,58 @@
+//go:build linux && amd64
+
+#include "textflag.h"
+
+DATA fpscancr<>+0(SB)/8, $0x0D0D0D0D0D0D0D0D
+DATA fpscancr<>+8(SB)/8, $0x0D0D0D0D0D0D0D0D
+DATA fpscancr<>+16(SB)/8, $0x0D0D0D0D0D0D0D0D
+DATA fpscancr<>+24(SB)/8, $0x0D0D0D0D0D0D0D0D
+GLOBL fpscancr<>(SB), RODATA|NOPTR, $32
+
+TEXT ·fpCountCRFindNULAVX2(SB), NOSPLIT, $0-25
+	MOVQ p+0(FP), SI
+	MOVQ n+8(FP), R12
+	XORQ AX, AX
+	XORQ R8, R8
+	XORL R9, R9
+	VMOVDQU fpscancr<>(SB), Y1
+	VPXOR   Y2, Y2, Y2
+
+loop:
+	LEAQ 32(AX), DX
+	CMPQ DX, R12
+	JG   last
+	VMOVDQU   (SI)(AX*1), Y0
+	VPCMPEQB  Y1, Y0, Y3
+	VPMOVMSKB Y3, BX
+	VPCMPEQB  Y2, Y0, Y4
+	VPMOVMSKB Y4, R10
+	POPCNTL   BX, BX
+	ADDQ      BX, R8
+	ORL       R10, R9
+	MOVQ      DX, AX
+	JMP       loop
+
+last:
+	CMPQ AX, R12
+	JGE  done
+	MOVQ R12, DI
+	SUBQ $32, DI
+	MOVQ AX, CX
+	SUBQ DI, CX
+	VMOVDQU   (SI)(DI*1), Y0
+	VPCMPEQB  Y1, Y0, Y3
+	VPMOVMSKB Y3, BX
+	VPCMPEQB  Y2, Y0, Y4
+	VPMOVMSKB Y4, R10
+	SHRL      CX, BX
+	SHRL      CX, R10
+	POPCNTL   BX, BX
+	ADDQ      BX, R8
+	ORL       R10, R9
+
+done:
+	VZEROUPPER
+	MOVQ  R8, crs+16(FP)
+	TESTL R9, R9
+	SETNE nul+24(FP)
+	RET

@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -16,16 +16,16 @@ const nativeSendFileChunk = 64 << 10
 
 var nativeSendFileHook func(wrote int64)
 
-func trySendFileFastPath(sw StreamWriter, file *os.File, size int64, limiter *TokenBucket) (bool, error) {
+func trySendFileFastPath(sw StreamWriter, file *os.File, start, length int64, limiter *TokenBucket) (bool, error) {
 	writer, ok := sw.(*PlainH1StreamWriter)
 	if !ok || !writer.headersSent || writer.chunked || writer.suppressBody {
 		return false, nil
 	}
-	return writer.tryWriteFileNative(file, size, limiter)
+	return writer.tryWriteFileNative(file, start, length, limiter)
 }
 
-func (w *PlainH1StreamWriter) tryWriteFileNative(file *os.File, size int64, limiter *TokenBucket) (bool, error) {
-	if size <= 0 {
+func (w *PlainH1StreamWriter) tryWriteFileNative(file *os.File, start, length int64, limiter *TokenBucket) (bool, error) {
+	if length <= 0 {
 		return true, nil
 	}
 
@@ -42,7 +42,7 @@ func (w *PlainH1StreamWriter) tryWriteFileNative(file *os.File, size int64, limi
 	if inFD < 0 {
 		return true, net.ErrClosed
 	}
-	return true, sendFileFD(outFD, inFD, size, deadline, w.limiter, w.global, limiter)
+	return true, sendFileFD(outFD, inFD, start, length, deadline, w.limiter, w.global, limiter)
 }
 
 func nativeSendFileTarget(conn net.Conn) (int, time.Time, func(), bool, error) {
@@ -70,9 +70,9 @@ func nativeSendFileTarget(conn net.Conn) (int, time.Time, func(), bool, error) {
 	return outFD, time.Time{}, func() {}, true, nil
 }
 
-func sendFileFD(outFD int, inFD int, size int64, deadline time.Time, connLimiter *ConnectionLimiter, global *GlobalLimiter, limiter *TokenBucket) error {
-	var offset int64
-	remaining := size
+func sendFileFD(outFD int, inFD int, start, length int64, deadline time.Time, connLimiter *ConnectionLimiter, global *GlobalLimiter, limiter *TokenBucket) error {
+	offset := start
+	remaining := length
 	for remaining > 0 {
 		chunk := remaining
 		if chunk > nativeSendFileChunk {
@@ -82,6 +82,7 @@ func sendFileFD(outFD int, inFD int, size int64, deadline time.Time, connLimiter
 		n, err := unix.Sendfile(outFD, inFD, &offset, int(chunk))
 		if n > 0 {
 			wrote := int64(n)
+			Stats.BytesOut.Add(uint64(n))
 			if nativeSendFileHook != nil {
 				nativeSendFileHook(wrote)
 			}

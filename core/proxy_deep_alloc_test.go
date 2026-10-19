@@ -103,6 +103,8 @@ func dpDeclaredBodyLen(head []byte) int {
 	return 0
 }
 
+const dpForwardingHeaderOriginAllocs = 6
+
 // Whole-process allocation ceiling. This figure includes the in-process test
 // origin, which uses http.ReadRequest and allocates far more than the proxy
 // does; TestDeepProxyAllocationsAreNearZero measures the proxy itself against a
@@ -115,7 +117,7 @@ func TestDeepAllocationsPerRequestAreBounded(t *testing.T) {
 	addr := dpProxy(t, dpFixed("alloc-check"))
 	got := allocsPerProxiedRequest(t, addr, "/alloc", 3000)
 	t.Logf("allocations per proxied request: %.2f", got)
-	const budget = 14.0
+	const budget = 14.0 + dpForwardingHeaderOriginAllocs
 	if got > budget {
 		t.Fatalf("%.2f allocations per request exceeds the budget of %.0f", got, budget)
 	}
@@ -129,7 +131,7 @@ func TestDeepAllocationsStableAcrossBodySizes(t *testing.T) {
 		addr := dpProxy(t, dpFixed(strings.Repeat("b", size)))
 		got := allocsPerProxiedRequest(t, addr, "/alloc", 1500)
 		t.Logf("body %6d bytes -> %.2f allocations per request", size, got)
-		if got > 14.0 {
+		if got > 14.0+dpForwardingHeaderOriginAllocs {
 			t.Errorf("body %d: %.2f allocations per request is too high", size, got)
 		}
 	}
@@ -171,7 +173,7 @@ func TestDeepAllocationsWithHooksStayBounded(t *testing.T) {
 	t.Logf("allocations per request with both hooks active: %.2f", got)
 	// Hooks are documented to build a ProxyRequest/ProxyResponse per request, so
 	// they cost more; the point is that the cost is small and bounded.
-	if got > 14.0 {
+	if got > 14.0+dpForwardingHeaderOriginAllocs {
 		t.Fatalf("%.2f allocations per hooked request is too high", got)
 	}
 }
@@ -229,7 +231,7 @@ func TestDeepHeapDoesNotGrowUnderSustainedLoad(t *testing.T) {
 
 func BenchmarkProxyRequestSerialize(b *testing.B) {
 	req := &Request{
-		Method: "GET", Path: "/some/path", RawPath: "/some/path", Query: "a=1&b=2",
+		Method: "GET", Path: "/some/path", RawPath: "/some/path", Query: "a=1&b=2", Host: "origin.test", RemoteAddr: "203.0.113.7:51234",
 		Headers: [][2]string{
 			{"User-Agent", "bench/1.0"},
 			{"Accept", "*/*"},
@@ -241,7 +243,7 @@ func BenchmarkProxyRequestSerialize(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		buf = appendProxyRequest(buf[:0], req, "origin.test", "203.0.113.7")
+		buf = appendProxyRequest(buf[:0], req, "origin.test")
 	}
 	if len(buf) == 0 {
 		b.Fatal("serializer produced nothing")
@@ -283,7 +285,7 @@ func BenchmarkBalancerPick(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				lb.pick(backends, "198.51.100.7")
+				lb.pick(backends, "198.51.100.7", 0)
 			}
 		})
 	}

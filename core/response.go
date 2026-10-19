@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -114,6 +116,15 @@ func (r *Response) ensureSW() StreamWriter {
 		return nil
 	}
 	req := r.lazyReq
+	if req.swFactory != nil {
+		sw := req.swFactory.newStreamWriter(req)
+		if sw == nil {
+			return nil
+		}
+		req.StreamWriter = sw
+		r.sw = sw
+		return sw
+	}
 	if req.conn == nil {
 		req.ensureConn()
 	}
@@ -135,7 +146,7 @@ func (r *Response) ensureSW() StreamWriter {
 		}
 	}
 	req.StreamWriter = sw
-	bindRequestMethodToStreamWriter(sw, req.Method)
+	bindRequestToStreamWriter(sw, req)
 	r.sw = sw
 	return sw
 }
@@ -321,7 +332,7 @@ func responseBodyDisposition(method string, statusCode int) (suppressBody bool, 
 	case 204, 205:
 		return true, true
 	case 304:
-		suppressBody = true
+		return true, true
 	}
 	if method != "" {
 		if EqualFoldASCII(method, "HEAD") {

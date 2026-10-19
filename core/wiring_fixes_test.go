@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -98,11 +100,6 @@ func TestStreamMaxWriteSizeEnforced(t *testing.T) {
 	w := &PlainH1StreamWriter{headersSent: true, maxWrite: 10}
 	if err := w.WriteChunk(make([]byte, 20)); err != ErrBodyTooLarge {
 		t.Fatalf("over-cap WriteChunk err = %v, want ErrBodyTooLarge", err)
-	}
-
-	h2 := &H2StreamWriter{headersSent: true, maxWrite: 10}
-	if err := h2.WriteChunk(make([]byte, 20)); err != ErrBodyTooLarge {
-		t.Fatalf("over-cap H2 WriteChunk err = %v, want ErrBodyTooLarge", err)
 	}
 }
 

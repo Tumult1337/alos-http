@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -9,24 +11,40 @@ const (
 	qpackBlockCacheMaxEntries  = 1024
 	qpackBlockCacheMaxBytes    = 1 << 20
 	qpackPrefixCacheMaxEntries = 512
+	qpackBaseSignBit           = 0x80
 )
+
+type qpackCachedSection struct {
+	regular [][2]string
+	meta    hpackRequestMeta
+}
 
 type qpackBlockCache struct {
 	mu    sync.RWMutex
-	m     map[string][][2]string
+	m     map[string]*qpackCachedSection
 	bytes int
 }
 
-var qpackDecodedBlocks = qpackBlockCache{m: make(map[string][][2]string)}
+var qpackDecodedBlocks = qpackBlockCache{m: make(map[string]*qpackCachedSection)}
 
-func (c *qpackBlockCache) get(block []byte) ([][2]string, bool) {
+func (c *qpackBlockCache) get(block []byte) (*qpackCachedSection, bool) {
 	c.mu.RLock()
 	h, ok := c.m[string(block)]
 	c.mu.RUnlock()
 	return h, ok
 }
 
+func (c *qpackBlockCache) hasRoomLocked(total int) bool {
+	return len(c.m) < qpackBlockCacheMaxEntries && c.bytes+total <= qpackBlockCacheMaxBytes
+}
+
 func (c *qpackBlockCache) put(block []byte, headers [][2]string) {
+	c.mu.RLock()
+	room := c.hasRoomLocked(len(block))
+	c.mu.RUnlock()
+	if !room {
+		return
+	}
 	cp := make([][2]string, len(headers))
 	total := len(block)
 	for i, h := range headers {
@@ -35,10 +53,15 @@ func (c *qpackBlockCache) put(block []byte, headers [][2]string) {
 		cp[i] = [2]string{n, v}
 		total += len(n) + len(v)
 	}
+	meta, err := h3ValidateRequestSection(cp)
+	if err != nil {
+		return
+	}
+	section := &qpackCachedSection{regular: cp[h3PseudoFieldCount(&meta):], meta: meta}
 	c.mu.Lock()
-	if len(c.m) < qpackBlockCacheMaxEntries && c.bytes+total <= qpackBlockCacheMaxBytes {
+	if c.hasRoomLocked(total) {
 		if _, exists := c.m[string(block)]; !exists {
-			c.m[strings.Clone(UnsafeString(block))] = cp
+			c.m[strings.Clone(UnsafeString(block))] = section
 			c.bytes += total
 		}
 	}
@@ -350,34 +373,43 @@ func (d *QPACKDecoder) DecodeAppend(data []byte, headers [][2]string) ([][2]stri
 		return headers, ap, ErrTruncated
 	}
 	pos := 0
-	_, n := qpackDecodeInt(data[pos:], 8)
+	requiredInsertCount, n := qpackDecodeInt(data[pos:], 8)
 	if n == 0 {
 		return headers, ap, ErrTruncated
+	}
+	if requiredInsertCount != 0 {
+		return nil, ap, errQPACKDecompression
 	}
 	pos += n
 	_, sn := qpackDecodeInt(data[pos:], 7)
 	if sn == 0 {
 		return headers, ap, ErrTruncated
 	}
+	if data[pos]&qpackBaseSignBit != 0 {
+		return nil, ap, errQPACKDecompression
+	}
 	pos += sn
 
 	for pos < len(data) {
 		b := data[pos]
 		if b&0x80 != 0 {
-			static := b&0x40 != 0
+			if b&0x40 == 0 {
+				return nil, ap, errQPACKDecompression
+			}
 			idx, n := qpackDecodeInt(data[pos:], 6)
 			if n == 0 {
 				return nil, ap, ErrTruncated
 			}
 			pos += n
-			if static {
-				if idx >= uint64(len(qpackStaticTable)) {
-					return nil, ap, ErrTruncated
-				}
-				headers = append(headers, qpackStaticTable[idx])
+			if idx >= uint64(len(qpackStaticTable)) {
+				return nil, ap, ErrTruncated
 			}
+			headers = append(headers, qpackStaticTable[idx])
 		} else if b&0x40 != 0 {
 			nameIsStatic := b&0x10 != 0
+			if !nameIsStatic {
+				return nil, ap, errQPACKDecompression
+			}
 			nameIdx, n := qpackDecodeInt(data[pos:], 4)
 			if n == 0 {
 				return nil, ap, ErrTruncated
@@ -431,7 +463,7 @@ func (d *QPACKDecoder) DecodeAppend(data []byte, headers [][2]string) ([][2]stri
 			pos += vn
 			headers = append(headers, [2]string{name, value})
 		} else {
-			pos++
+			return nil, ap, errQPACKDecompression
 		}
 		if len(headers) > 128 {
 			return nil, ap, ErrTooManyHeaders
@@ -474,7 +506,17 @@ var qpackEncodeBufPool = sync.Pool{
 	New: func() any { b := make([]byte, 0, 256); return &b },
 }
 
+func qpackResponseServer(headers [][2]string, configured string) string {
+	for i := range headers {
+		if headerNameIs(headers[i][0], "server") {
+			return headers[i][1]
+		}
+	}
+	return configured
+}
+
 func qpackEncodeResponseHeaders(status int, contentType string, contentLength int64, headers [][2]string, serverName string) *[]byte {
+	serverName = qpackResponseServer(headers, serverName)
 	bp := qpackEncodeBufPool.Get().(*[]byte)
 	enc := QPACKEncoder{}
 	enc.Reset((*bp)[:0])
@@ -509,14 +551,31 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			enc.encodeLiteral("content-length", UnsafeString(clStr))
 		}
 	}
+	wroteContentType := contentType != ""
+	wroteContentLength := contentLength >= 0
 	for i := range headers {
 		name := headers[i][0]
-		if name != "" && name[0] != ':' {
-			if low, ok := commonLowerHeader(name); ok {
-				enc.EncodeHeader(low, headers[i][1])
-			} else {
-				enc.EncodeHeader(ToLowerASCII(name), headers[i][1])
+		if name == "" || name[0] == ':' || isConnectionSpecificResponseField(name) {
+			continue
+		}
+		switch {
+		case headerNameIs(name, "content-type"):
+			if wroteContentType {
+				continue
 			}
+			wroteContentType = true
+		case headerNameIs(name, "content-length"):
+			if wroteContentLength {
+				continue
+			}
+			wroteContentLength = true
+		case headerNameIs(name, "server"):
+			continue
+		}
+		if low, ok := commonLowerHeader(name); ok {
+			enc.EncodeHeader(low, headers[i][1])
+		} else {
+			enc.EncodeHeader(ToLowerASCII(name), headers[i][1])
 		}
 	}
 	*bp = enc.buf

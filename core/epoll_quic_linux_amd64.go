@@ -156,6 +156,13 @@ func (uc *epollUDPConn) sendLoop() {
 			}
 			sent += int(r1)
 		}
+		var sentBytes uint64
+		for k := 0; k < sent; k++ {
+			sentBytes += uint64(mmsgs[k].Len)
+		}
+		if sentBytes != 0 {
+			Stats.BytesOut.Add(sentBytes)
+		}
 		for bi := range batch {
 			if batch[bi].pbuf != nil {
 				quicPktBufPool.Put(batch[bi].pbuf)
@@ -231,7 +238,7 @@ func (s *Server) serveEpollQUIC(uc *epollUDPConn, connMap *quicConnMap) {
 		}
 	}
 	for {
-		if uc.closed.Load() || s.shuttingDown.Load() {
+		if uc.closed.Load() {
 			return
 		}
 		for i := range mmsgs {
@@ -241,7 +248,7 @@ func (s *Server) serveEpollQUIC(uc *epollUDPConn, connMap *quicConnMap) {
 		}
 		r1, _, errno := unix.Syscall6(unix.SYS_RECVMMSG, uintptr(uc.fd), uintptr(unsafe.Pointer(&mmsgs[0])), uintptr(len(mmsgs)), uintptr(unix.MSG_WAITFORONE), 0, 0)
 		if errno != 0 {
-			if uc.closed.Load() || s.shuttingDown.Load() {
+			if uc.closed.Load() {
 				return
 			}
 			if errno == unix.EINTR || errno == unix.EAGAIN {
@@ -250,19 +257,20 @@ func (s *Server) serveEpollQUIC(uc *epollUDPConn, connMap *quicConnMap) {
 			return
 		}
 		count := int(r1)
+		var received uint64
+		for i := 0; i < count; i++ {
+			received += uint64(mmsgs[i].Len)
+		}
+		Stats.BytesIn.Add(received)
 		for i := 0; i < count; i++ {
 			n := int(mmsgs[i].Len)
 			if n < 5 {
 				continue
 			}
 			data := bufs[i*epollQUICDgramSize : i*epollQUICDgramSize+n]
-			var remoteAddr *net.UDPAddr
-			if quicIsLongHeader(data) {
-				remoteAddr = sockaddrToUDPAddr(&sas[i])
-			}
 			pbuf := quicRecvBufPool.Get().(*[]byte)
 			*pbuf = append((*pbuf)[:0], data...)
-			s.handleQUICPacketIOUring(uc, remoteAddr, *pbuf, pbuf, connMap)
+			s.handleQUICPacketIOUring(uc, &sas[i], *pbuf, pbuf, connMap)
 		}
 	}
 }
@@ -272,6 +280,11 @@ func (s *Server) listenAndServeQUICEpoll(addr string, connMap *quicConnMap) erro
 	listeners, err := createEpollQUICListeners(addr, numListeners)
 	if err != nil {
 		return err
+	}
+	if sa, err := unix.Getsockname(listeners[0].fd); err == nil {
+		if in4, ok := sa.(*unix.SockaddrInet4); ok {
+			s.enableAltSvc(in4.Port)
+		}
 	}
 	var wg sync.WaitGroup
 	for _, ln := range listeners {
@@ -283,6 +296,7 @@ func (s *Server) listenAndServeQUICEpoll(addr string, connMap *quicConnMap) erro
 	}
 	go func() {
 		<-s.done
+		s.quicTimers.awaitStopped()
 		for _, ln := range listeners {
 			ln.close()
 		}

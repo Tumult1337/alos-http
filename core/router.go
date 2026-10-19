@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -46,6 +48,7 @@ type node struct {
 	paramName         string
 	catchName         string
 	middleware        []MiddlewareFunc
+	backtrackable     bool
 }
 
 const (
@@ -81,27 +84,24 @@ func init() {
 }
 
 func methodIndex(method string) int {
-	if len(method) < 3 {
-		return -1
-	}
-	switch {
-	case method[0] == 'G' && method[1] == 'E':
+	switch method {
+	case "GET":
 		return methodGET
-	case method[0] == 'P' && method[1] == 'O':
+	case "POST":
 		return methodPOST
-	case method[0] == 'P' && method[1] == 'U':
+	case "PUT":
 		return methodPUT
-	case method[0] == 'D' && method[1] == 'E':
+	case "DELETE":
 		return methodDELETE
-	case method[0] == 'P' && method[1] == 'A':
+	case "PATCH":
 		return methodPATCH
-	case method[0] == 'H' && method[1] == 'E':
+	case "HEAD":
 		return methodHEAD
-	case method[0] == 'O' && method[1] == 'P':
+	case "OPTIONS":
 		return methodOPTIONS
-	case method[0] == 'C' && method[1] == 'O':
+	case "CONNECT":
 		return methodCONNECT
-	case method[0] == 'T' && method[1] == 'R':
+	case "TRACE":
 		return methodTRACE
 	}
 	return -1
@@ -129,6 +129,8 @@ type Router struct {
 	globalMiddleware        []MiddlewareFunc
 	wrappedNotFound         HandlerFunc
 	wrappedMethodNotAllowed HandlerFunc
+	wrappedAutoOptions      HandlerFunc
+	allowHeaders            [1 << methodCount]string
 	built                   atomic.Bool
 	buildOnce               sync.Once
 	server                  *Server
@@ -377,8 +379,17 @@ func (r *Router) Build() {
 }
 
 func (r *Router) build() {
+	r.addImplicitHEAD()
+	r.buildAllowHeaders()
 	r.wrappedNotFound = r.applyMiddleware(r.notFound)
-	r.wrappedMethodNotAllowed = r.applyMiddleware(r.methodNotAllowed)
+	methodNotAllowed := r.methodNotAllowed
+	r.wrappedMethodNotAllowed = r.applyMiddleware(func(req *Request, resp *Response) {
+		if req.allow != "" {
+			resp.SetHeader("Allow", req.allow)
+		}
+		methodNotAllowed(req, resp)
+	})
+	r.wrappedAutoOptions = r.applyMiddleware(autoOptions)
 	for mi, root := range r.trees {
 		if root != nil {
 			r.buildNode(root, nil)
@@ -387,6 +398,7 @@ func (r *Router) build() {
 				r.trees[mi] = root.children[0]
 				root = r.trees[mi]
 			}
+			root.backtrackable = hasStaticParamSiblings(root)
 			var statics []staticEntry
 			collectStaticRoutes(root, "", &statics)
 			if len(statics) > 0 {
@@ -426,6 +438,82 @@ func (r *Router) build() {
 		}
 	}
 	r.built.Store(true)
+}
+
+func (r *Router) addImplicitHEAD() {
+	get := r.trees[methodGET]
+	if get == nil {
+		return
+	}
+	type implicitRoute struct {
+		path    string
+		handler HandlerFunc
+	}
+	var missing []implicitRoute
+	head := r.trees[methodHEAD]
+	walkRoutes(get, "", func(path string, n *node) {
+		if n.handler == nil {
+			return
+		}
+		if head != nil {
+			var probe Request
+			if r.findInTree(head, path, &probe) != nil {
+				return
+			}
+		}
+		missing = append(missing, implicitRoute{path: path, handler: n.handler})
+	})
+	for _, route := range missing {
+		r.Handle("HEAD", route.path, route.handler)
+	}
+}
+
+func (r *Router) buildAllowHeaders() {
+	order := make([]int, len(allMethods))
+	for i := range order {
+		order[i] = i
+	}
+	sort.Slice(order, func(a, b int) bool { return allMethods[order[a]] < allMethods[order[b]] })
+	for mask := 1; mask < len(r.allowHeaders); mask++ {
+		var b strings.Builder
+		for _, i := range order {
+			method := allMethods[i]
+			if mask&(1<<i) == 0 {
+				continue
+			}
+			if b.Len() > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(method)
+		}
+		r.allowHeaders[mask] = b.String()
+	}
+}
+
+func autoOptions(req *Request, resp *Response) {
+	resp.SetHeader("Allow", req.allow)
+	resp.Status(204)
+}
+
+func (r *Router) methodMiss(idx int, path string, req *Request) HandlerFunc {
+	allowed := 0
+	for i, root := range r.trees {
+		if i == idx || root == nil {
+			continue
+		}
+		if (root.catchAll != nil && hasPrefix(path, root.path)) || findBuiltOrBacktrack(root, path, req) != nil {
+			allowed |= 1 << i
+		}
+	}
+	req.ParamCount = 0
+	if allowed == 0 {
+		return r.wrappedNotFound
+	}
+	req.allow = r.allowHeaders[allowed|1<<methodOPTIONS]
+	if idx == methodOPTIONS {
+		return r.wrappedAutoOptions
+	}
+	return r.wrappedMethodNotAllowed
 }
 
 func collectStaticRoutes(n *node, prefix string, out *[]staticEntry) {
@@ -484,7 +572,7 @@ func (r *Router) Lookup(method, path string, req *Request) HandlerFunc {
 	if root == nil {
 		return r.applyMiddleware(r.notFound)
 	}
-	handler := r.findInTree(root, path, req)
+	handler := r.findInTreeOrBacktrack(root, path, req)
 	if handler != nil {
 		return r.applyMiddleware(handler)
 	}
@@ -494,15 +582,7 @@ func (r *Router) Lookup(method, path string, req *Request) HandlerFunc {
 func (r *Router) lookupBuilt(idx int, path string, req *Request) HandlerFunc {
 	root := r.trees[idx]
 	if root == nil {
-		for i := range r.trees {
-			if i != idx && r.trees[i] != nil {
-				if findBuilt(r.trees[i], path, req) != nil {
-					req.ParamCount = 0
-					return r.wrappedMethodNotAllowed
-				}
-			}
-		}
-		return r.wrappedNotFound
+		return r.methodMiss(idx, path, req)
 	}
 
 	if hashes := r.staticHashes[idx]; hashes != nil {
@@ -523,17 +603,18 @@ func (r *Router) lookupBuilt(idx int, path string, req *Request) HandlerFunc {
 	if handler := findBuilt(root, path, req); handler != nil {
 		return handler
 	}
+	if root.backtrackable {
+		if handler := findWithBacktracking(root, path, req, builtHandlerOf); handler != nil {
+			return handler
+		}
+	}
 
-	if root.catchAll != nil {
+	if root.catchAll != nil && hasPrefix(path, root.path) {
 		req.ParamCount = 0
 		if len(req.Params) > 0 {
 			p := &req.Params[0]
 			p.Key = root.catchAll.catchName
-			if len(path) > 1 {
-				p.Value = path[1:]
-			} else {
-				p.Value = ""
-			}
+			p.Value = path[len(root.path):]
 			req.ParamCount = 1
 		}
 		return root.catchAll.wrappedHandler
@@ -546,15 +627,7 @@ func (r *Router) lookupBuilt(idx int, path string, req *Request) HandlerFunc {
 		}
 	}
 
-	for i := range r.trees {
-		if i != idx && r.trees[i] != nil {
-			if findBuilt(r.trees[i], path, req) != nil {
-				req.ParamCount = 0
-				return r.wrappedMethodNotAllowed
-			}
-		}
-	}
-	return r.wrappedNotFound
+	return r.methodMiss(idx, path, req)
 }
 
 func findBuilt(current *node, path string, req *Request) HandlerFunc {
@@ -803,6 +876,115 @@ func (r *Router) findInTree(root *node, path string, req *Request) HandlerFunc {
 	}
 }
 
+const routerBacktrackBudget = 64
+
+func findBuiltOrBacktrack(root *node, path string, req *Request) HandlerFunc {
+	if h := findBuilt(root, path, req); h != nil || !root.backtrackable {
+		return h
+	}
+	return findWithBacktracking(root, path, req, builtHandlerOf)
+}
+
+func hasStaticParamSiblings(n *node) bool {
+	if n.paramChild != nil && len(n.children) > 0 {
+		return true
+	}
+	for _, child := range n.children {
+		if hasStaticParamSiblings(child) {
+			return true
+		}
+	}
+	if n.paramChild != nil && hasStaticParamSiblings(n.paramChild) {
+		return true
+	}
+	return n.catchAll != nil && hasStaticParamSiblings(n.catchAll)
+}
+
+func (r *Router) findInTreeOrBacktrack(root *node, path string, req *Request) HandlerFunc {
+	if h := r.findInTree(root, path, req); h != nil {
+		return h
+	}
+	return findWithBacktracking(root, path, req, treeHandlerOf)
+}
+
+func builtHandlerOf(n *node) HandlerFunc { return n.wrappedHandler }
+
+func treeHandlerOf(n *node) HandlerFunc { return n.handler }
+
+func findWithBacktracking(root *node, path string, req *Request, handlerOf func(*node) HandlerFunc) HandlerFunc {
+	if !hasPrefix(path, root.path) {
+		return nil
+	}
+	req.ParamCount = 0
+	budget := routerBacktrackBudget
+	return routeBacktrack(root, path[len(root.path):], req, handlerOf, &budget)
+}
+
+func routeBacktrack(n *node, remaining string, req *Request, handlerOf func(*node) HandlerFunc, budget *int) HandlerFunc {
+	for {
+		if len(remaining) == 0 {
+			return handlerOf(n)
+		}
+		if *budget <= 0 {
+			return nil
+		}
+		*budget--
+		child := n.staticChildFor(remaining)
+		if child != nil {
+			if n.paramChild == nil && n.catchAll == nil {
+				n, remaining = child, remaining[len(child.path):]
+				continue
+			}
+			paramCount := req.ParamCount
+			if h := routeBacktrack(child, remaining[len(child.path):], req, handlerOf, budget); h != nil {
+				return h
+			}
+			req.ParamCount = paramCount
+		}
+		if n.paramChild != nil {
+			end := 0
+			for end < len(remaining) && remaining[end] != '/' {
+				end++
+			}
+			paramCount := req.ParamCount
+			appendRouteParam(req, n.paramChild.paramName, remaining[:end])
+			if n.catchAll == nil {
+				n, remaining = n.paramChild, remaining[end:]
+				continue
+			}
+			if h := routeBacktrack(n.paramChild, remaining[end:], req, handlerOf, budget); h != nil {
+				return h
+			}
+			req.ParamCount = paramCount
+		}
+		if n.catchAll != nil {
+			appendRouteParam(req, n.catchAll.catchName, remaining)
+			return handlerOf(n.catchAll)
+		}
+		return nil
+	}
+}
+
+func (n *node) staticChildFor(remaining string) *node {
+	c := remaining[0]
+	for i, b := range n.indices {
+		if b == c {
+			if child := n.children[i]; hasPrefix(remaining, child.path) {
+				return child
+			}
+			return nil
+		}
+	}
+	return nil
+}
+
+func appendRouteParam(req *Request, key, value string) {
+	if req.ParamCount < len(req.Params) {
+		req.Params[req.ParamCount] = Param{Key: key, Value: value}
+		req.ParamCount++
+	}
+}
+
 func (r *Router) applyMiddleware(handler HandlerFunc) HandlerFunc {
 	h := handler
 	for i := len(r.globalMiddleware) - 1; i >= 0; i-- {
@@ -952,19 +1134,24 @@ func (r *Router) Routes() []RouteInfo {
 }
 
 func collectRoutes(n *node, prefix, method string, out *[]RouteInfo) {
+	walkRoutes(n, prefix, func(path string, _ *node) {
+		*out = append(*out, RouteInfo{Method: method, Path: path})
+	})
+}
+
+func walkRoutes(n *node, prefix string, visit func(path string, n *node)) {
 	fullPath := prefix + n.path
 	if n.handler != nil || n.wrappedHandler != nil {
-		*out = append(*out, RouteInfo{Method: method, Path: fullPath})
+		visit(fullPath, n)
 	}
 	for _, child := range n.children {
-		collectRoutes(child, fullPath, method, out)
+		walkRoutes(child, fullPath, visit)
 	}
 	if n.paramChild != nil {
-		collectRoutes(n.paramChild, fullPath+":"+n.paramChild.paramName, method, out)
+		walkRoutes(n.paramChild, fullPath+":"+n.paramChild.paramName, visit)
 	}
 	if n.catchAll != nil {
-		catchPath := fullPath + "*" + n.catchAll.catchName
-		*out = append(*out, RouteInfo{Method: method, Path: catchPath})
+		visit(fullPath+"*"+n.catchAll.catchName, n.catchAll)
 	}
 }
 
@@ -997,12 +1184,12 @@ func (r *Router) Match(method, path string) bool {
 			return false
 		}
 		var dummy Request
-		return findBuilt(root, path, &dummy) != nil
+		return findBuiltOrBacktrack(root, path, &dummy) != nil
 	}
 	root := r.trees[idx]
 	if root == nil {
 		return false
 	}
 	var dummy Request
-	return r.findInTree(root, path, &dummy) != nil
+	return r.findInTreeOrBacktrack(root, path, &dummy) != nil
 }

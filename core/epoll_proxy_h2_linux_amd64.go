@@ -22,40 +22,35 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 	host := stripPort(req.Host)
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	reqCacheOK := false
+	cachePath := ""
 
-	if pe.Cache != nil && cacheableMethod {
+	admission, outcome := w.admitProxyRequest(req, &stream.resp)
+	if outcome != proxyAdmitted {
+		return outcome.startResult()
+	}
+	if pe.hasHooks() {
+		promoteRequestStrings(req)
+	}
+
+	cache := pe.activeCache()
+	if cache != nil && cacheableMethod {
 		reqCacheOK = proxyCacheRequestAllowed(req)
-		cachePath := req.Path
-		if req.Query != "" {
-			cachePath = req.Path + "?" + req.Query
-		}
-		if entry, hit := pe.Cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			pe.Cache.ServeCached(entry, req, &stream.resp)
-			if pe.OnResponse != nil {
-				pr := &ProxyResponse{
-					Domain:     ds.config.Domain,
-					Backend:    "cache",
-					ClientAddr: req.RemoteAddr,
-					Method:     req.Method,
-					Path:       req.Path,
-					StatusCode: entry.statusCode,
-					Headers:    stream.resp.Headers,
-				}
-				pe.OnResponse(pr)
-				stream.resp.Status(pr.StatusCode)
-				stream.resp.Headers = pr.Headers
-			}
+		cachePath = proxyRequestTarget(req)
+		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
+			admission.release(w.server)
+			w.serveProxyCacheHit(pe, ds, cache, entry, req, &stream.resp)
 			return proxyStartServed
 		}
 	}
 
 	if len(ds.backends) == 0 {
-		stream.resp.Reset()
-		stream.resp.Status(502).String("No healthy backend available")
+		admission.release(w.server)
+		proxyRefusedNoBackend.answer(&stream.resp)
 		return proxyStartServed
 	}
 
 	px := w.pxGet()
+	px.admission = admission
 	px.w = w
 	px.c = c
 	px.cGen = c.generation
@@ -64,8 +59,12 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 	px.method = req.Method
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
-	px.mayCache = pe.Cache != nil && cacheableMethod
+	px.mayCache = cache != nil && cacheableMethod
 	px.reqCacheOK = reqCacheOK
+	px.cacheHost = host
+	px.cacheKey = cachePath
+	px.cacheGen = cache.purgeGeneration()
+	px.cache = cache
 	// HTTP/2 has no per-request connection reuse decision; the stream ends and
 	// the connection carries on.
 	px.keepClient = true
@@ -75,89 +74,14 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 		px.tried = append(px.tried, false)
 	}
 
-	if !w.proxyAttemptH2(px) {
+	if r := w.proxyAttempt(px); r.status != 0 {
+		w.proxyFailStream(px, r.status, r.msg)
 		return proxyStartServed
 	}
 	return proxyStartPending
 }
 
-// proxyAttemptH2 mirrors proxyAttempt but reads the request from the stream.
-func (w *epollWorker) proxyAttemptH2(px *proxyExchange) bool {
-	ds := px.ds
-	idx := pickRetryBackend(ds, extractIP(px.clientAddr), px.tried)
-	if idx < 0 {
-		w.proxyFailStream(px, 502, "No healthy backend available")
-		return false
-	}
-	px.tried[idx] = true
-	b := ds.backends[idx]
-	px.b = b
-
-	req := &px.h2Stream.req
-	hostHdr := ds.config.HostHeader
-	if px.pe.OnRequest != nil {
-		pr := &ProxyRequest{
-			Domain:     ds.config.Domain,
-			Backend:    b.Addr,
-			ClientAddr: px.clientAddr,
-			Method:     req.Method,
-			Path:       req.Path,
-			Headers:    req.Headers,
-			Host:       hostHdr,
-		}
-		originalPath := req.Path
-		if !px.pe.OnRequest(pr) {
-			w.proxyFailStream(px, 502, "Request blocked by interceptor")
-			return false
-		}
-		if pr.Path != originalPath {
-			// The serialiser prefers RawPath so escaped targets survive; a hook
-			// that rewrote Path must therefore drop it, or the rewrite is lost.
-			req.RawPath = ""
-		}
-		req.Path = pr.Path
-		req.Headers = pr.Headers
-		hostHdr = pr.Host
-	}
-
-	authority := fpProxyAuthority(b.Addr)
-	if hostHdr == "" {
-		if ds.config.PreserveHost {
-			hostHdr = req.Host
-		} else {
-			hostHdr = authority
-		}
-	}
-	px.reqRaw = appendProxyRequest(px.reqRaw[:0], req, hostHdr, extractIP(px.clientAddr))
-
-	ip, port, err := resolveAuthority(authority)
-	if err != nil {
-		w.proxyRetryOrFailH2(px, err)
-		return false
-	}
-
-	px.Exchange.ip = ip
-	px.Exchange.port = port
-	px.Exchange.key = poolKey{authority: authority, tls: b.TLS, skipVerify: b.TLSSkipVerify}
-	px.Exchange.connectTimeoutNano = int64(ds.config.ConnectTimeout)
-	px.Exchange.readTimeoutNano = int64(ds.config.ReadTimeout)
-	px.Exchange.idleTimeoutNano = int64(ds.config.IdleTimeout)
-	px.Exchange.maxIdle = ds.config.MaxIdleConns
-	px.Exchange.deadline = w.be.nowNano() + proxyStartDeadline(ds)
-	px.Exchange.rawRequest = px.reqRaw
-	px.Exchange.req.Method = req.Method
-	px.Exchange.resp = fpResponse{}
-	px.Exchange.err = nil
-	px.finished = false
-	px.retried = false
-
-	b.ActiveConns.Add(1)
-	w.be.startExchange(&px.Exchange)
-	return true
-}
-
-// proxyFailStream answers the stream with an error and releases the exchange
-// without ever contacting a backend.
+// proxyFailStream answers the stream with an error and releases the exchange.
 func (w *epollWorker) proxyFailStream(px *proxyExchange, status int, msg string) {
 	if stream := px.h2Stream; stream != nil {
 		stream.resp.Reset()
@@ -169,38 +93,13 @@ func (w *epollWorker) proxyFailStream(px *proxyExchange, status int, msg string)
 // proxyRetryOrFailH2 fails over to another backend, or gives up and answers the
 // stream. An HTTP/2 response is buffered, so a retry is always possible.
 func (w *epollWorker) proxyRetryOrFailH2(px *proxyExchange, err error) {
-	if px.b != nil {
-		px.b.ActiveConns.Add(-1)
-		if px.pe.OnError != nil {
-			px.pe.OnError(ProxyError{
-				Domain:     px.ds.config.Domain,
-				Backend:    px.b.Addr,
-				ClientAddr: px.clientAddr,
-				Method:     px.method,
-				Path:       px.path,
-				Attempt:    px.attempt + 1,
-				Err:        err,
-			})
-		}
-		px.b = nil
-	}
+	w.proxyRecordFailure(px, err)
 	if px.h2Stream == nil {
 		w.pxPut(px)
 		return
 	}
-	maxRetries := px.ds.config.MaxRetries
-	if maxRetries > len(px.ds.backends)-1 {
-		maxRetries = len(px.ds.backends) - 1
-	}
-	if px.attempt >= maxRetries {
-		w.finishProxyStream(px, 502, respHeaders{}, []byte("All backends failed"), "")
-		return
-	}
-	px.attempt++
-	if !w.proxyAttemptH2(px) {
-		// proxyAttemptH2 already answered the stream and released px, but the
-		// stream still has to be handed back to the HTTP/2 writer.
-		return
+	if r := w.proxyRetry(px, err); r.status != 0 {
+		w.proxyRefuse(px, r)
 	}
 }
 
@@ -241,12 +140,14 @@ func (w *epollWorker) finishProxyStream(px *proxyExchange, status int, headers r
 		stream.resp.ContentType = upstreamType
 	}
 
-	if c == nil || c.generation != gen || c.fd < 0 {
-		// The connection went away; the HTTP/2 bookkeeping was already cleaned
-		// up by closeConn, so the stream is simply dropped.
+	if c == nil {
 		return
 	}
+	alive := c.generation == gen && c.fd >= 0
 	c.finishH2Dispatch(w, gen, streamID, stream)
+	if !alive {
+		return
+	}
 	// finishH2Dispatch only marks the connection for flushing, and flushPending
 	// runs solely when a task was posted. The goroutine path always posted one;
 	// this path posts nothing, so the write has to be issued here or the framed
@@ -262,4 +163,79 @@ func (w *epollWorker) abortProxyStream(px *proxyExchange) {
 		px.b.ActiveConns.Add(-1)
 		px.b = nil
 	}
+}
+
+var (
+	proxyH2ConnBufferBudget   int64 = 64 << 20
+	proxyH2ServerBufferBudget int64 = 512 << 20
+)
+
+const proxyH2BodyKeep = 64 << 10
+
+var (
+	proxyRefusedBufferFull = proxyRefusal{503, "Proxy response buffer exhausted"}
+	proxyRefusedTooLarge   = proxyRefusal{502, "Upstream response too large"}
+)
+
+func (w *epollWorker) admitH2Response(px *proxyExchange, contentLen int64) bool {
+	px.h2Expected = contentLen
+	switch {
+	case contentLen > int64(w.beCfg.MaxResponseBody):
+		px.refusal = proxyRefusedTooLarge
+	case contentLen >= 0 && !px.reserveH2Buffer(contentLen):
+		px.refusal = proxyRefusedBufferFull
+	case contentLen >= 0 && (contentLen <= proxyBufferedResponseLimit ||
+		px.mayCache && contentLen <= px.cache.maxCacheableSize()):
+		return false
+	}
+	px.h2Streamed = true
+	return true
+}
+
+func (w *epollWorker) bufferH2Chunk(c *backendConn, px *proxyExchange, data []byte) {
+	if px.h2Expected < 0 {
+		if len(px.h2Body)+len(data) > w.beCfg.MaxResponseBody {
+			w.refuseResponse(c, px, proxyRefusedTooLarge)
+			return
+		}
+		if !px.reserveH2Buffer(int64(len(data))) {
+			w.refuseResponse(c, px, proxyRefusedBufferFull)
+			return
+		}
+	}
+	px.h2Body = append(px.h2Body, data...)
+}
+
+func (w *epollWorker) refuseResponse(c *backendConn, px *proxyExchange, r proxyRefusal) {
+	px.refusal = r
+	w.be.closeConn(c, errFPClientClosed)
+}
+
+func (px *proxyExchange) reserveH2Buffer(n int64) bool {
+	c := px.c
+	if c.h2ProxyBuffered+n > proxyH2ConnBufferBudget {
+		return false
+	}
+	if px.pe.h2Buffered.Add(n) > proxyH2ServerBufferBudget {
+		px.pe.h2Buffered.Add(-n)
+		return false
+	}
+	c.h2ProxyBuffered += n
+	px.h2Reserved += n
+	return true
+}
+
+func (px *proxyExchange) discardH2Buffer() {
+	px.h2Body = px.h2Body[:0]
+	px.h2Expected = 0
+	px.refusal = proxyRefusal{}
+	px.h2Streamed = false
+	if px.h2Reserved == 0 {
+		return
+	}
+	if px.c != nil {
+		px.c.h2ProxyBuffered -= px.h2Reserved
+	}
+	px.pe.h2Buffered.Add(-px.h2Reserved)
+	px.h2Reserved = 0
 }

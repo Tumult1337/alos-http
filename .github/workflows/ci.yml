@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: vet
+        run: go vet ./core/
+
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./core/
+
+      - name: test
+        run: go test -race -count=1 -timeout 40m ./core/ ./tests/...
+
+      - name: h3 interop
+        working-directory: tests/h3interop
+        run: go test -count=1 -timeout 10m ./...
+
+      - name: fuzz
+        run: |
+          for f in $(go test -list '^Fuzz' ./core/ | grep '^Fuzz'); do
+            go test -run '^$' -fuzz "^${f}\$" -fuzztime 30s ./core/
+          done
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: benchmark smoke
+        run: go test -run '^$' -bench . -benchtime 1x ./core/

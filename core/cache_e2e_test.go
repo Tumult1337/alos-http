@@ -1,4 +1,4 @@
-//go:build linux && amd64 && e2e
+//go:build linux && amd64
 
 package core
 
@@ -30,21 +30,23 @@ func e2eWaitReady(url string) bool {
 
 func TestE2E_CacheServesHitsAndGzip(t *testing.T) {
 	var calls int32
-	srv := New(Config{Addr: ":18091", PlainHTTP: true, MinPrealloc: 16, Listeners: 2})
+	addr := freeLoopbackAddr(t)
+	srv := New(Config{Addr: addr, PlainHTTP: true, MinPrealloc: 16, Listeners: 2})
 	srv.Router.Use(Cache(CacheConfig{TTL: time.Minute, Gzip: true, GzipMinBytes: 100}))
 	srv.Router.GET("/page", func(req *Request, resp *Response) {
 		atomic.AddInt32(&calls, 1)
 		resp.Status(200).String(strings.Repeat("hello world ", 300))
 	})
-	go func() { _ = srv.ListenAndServeEpollH2(":18091") }()
-	if !e2eWaitReady("http://127.0.0.1:18091/page") {
+	go func() { _ = srv.ListenAndServeEpollH2(addr) }()
+	t.Cleanup(func() { stopServer(srv) })
+	if !e2eWaitReady("http://" + addr + "/page") {
 		t.Fatal("server did not come up")
 	}
 
 	tr := &http.Transport{DisableCompression: true}
 	client := &http.Client{Transport: tr}
 	do := func() *http.Response {
-		req, _ := http.NewRequest("GET", "http://127.0.0.1:18091/page", nil)
+		req, _ := http.NewRequest("GET", "http://"+addr+"/page", nil)
 		req.Header.Set("Accept-Encoding", "gzip")
 		resp, err := client.Do(req)
 		if err != nil {
@@ -82,15 +84,17 @@ func TestE2E_CacheServesHitsAndGzip(t *testing.T) {
 }
 
 func TestE2E_ActiveConnsTracksLiveConnection(t *testing.T) {
-	srv := New(Config{Addr: ":18092", PlainHTTP: true, MinPrealloc: 16, Listeners: 2})
+	addr := freeLoopbackAddr(t)
+	srv := New(Config{Addr: addr, PlainHTTP: true, MinPrealloc: 16, Listeners: 2})
 	srv.Router.GET("/x", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
-	go func() { _ = srv.ListenAndServeEpollH2(":18092") }()
-	if !e2eWaitReady("http://127.0.0.1:18092/x") {
+	go func() { _ = srv.ListenAndServeEpollH2(addr) }()
+	t.Cleanup(func() { stopServer(srv) })
+	if !e2eWaitReady("http://" + addr + "/x") {
 		t.Fatal("server did not come up")
 	}
 
 	start := Stats.ActiveConns.Load()
-	conn, err := net.Dial("tcp", "127.0.0.1:18092")
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
@@ -144,16 +148,18 @@ func e2eStatusLine(conn net.Conn, xff string) (string, error) {
 }
 
 func TestE2E_PerIPConnLimit_ProxyMode(t *testing.T) {
-	srv := New(Config{Addr: ":18093", PlainHTTP: true, MinPrealloc: 16, Listeners: 2, ProxyMode: true, MaxConnsPerIP: 5})
+	addr := freeLoopbackAddr(t)
+	srv := New(Config{Addr: addr, PlainHTTP: true, MinPrealloc: 16, Listeners: 2, ProxyMode: true, MaxConnsPerIP: 5})
 	srv.Router.GET("/x", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
-	go func() { _ = srv.ListenAndServeEpollH2(":18093") }()
-	if !e2eWaitReady("http://127.0.0.1:18093/x") {
+	go func() { _ = srv.ListenAndServeEpollH2(addr) }()
+	t.Cleanup(func() { stopServer(srv) })
+	if !e2eWaitReady("http://" + addr + "/x") {
 		t.Fatal("server did not come up")
 	}
 
 	var held []net.Conn
 	for i := 0; i < 12; i++ {
-		conn, err := net.Dial("tcp", "127.0.0.1:18093")
+		conn, err := net.Dial("tcp", addr)
 		if err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}
@@ -170,18 +176,21 @@ func TestE2E_PerIPConnLimit_ProxyMode(t *testing.T) {
 }
 
 func TestE2E_PerIPConnLimit_NonProxyAtAccept(t *testing.T) {
-	srv := New(Config{Addr: ":18094", PlainHTTP: true, MinPrealloc: 16, Listeners: 1, MaxConnsPerIP: 5})
+	addr := freeLoopbackAddr(t)
+	srv := New(Config{Addr: addr, PlainHTTP: true, MinPrealloc: 16, Listeners: 1, MaxConnsPerIP: 5})
 	srv.Router.GET("/x", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
-	go func() { _ = srv.ListenAndServeEpollH2(":18094") }()
-	if !e2eWaitReady("http://127.0.0.1:18094/x") {
+	go func() { _ = srv.ListenAndServeEpollH2(addr) }()
+	t.Cleanup(func() { stopServer(srv) })
+	if !e2eWaitReady("http://" + addr + "/x") {
 		t.Fatal("server did not come up")
 	}
-	time.Sleep(300 * time.Millisecond)
+	http.DefaultClient.CloseIdleConnections()
+	waitFor(t, harnessIOTimeout, func() bool { return ctCount(srv, "127.0.0.1") <= 0 })
 
 	var held []net.Conn
 	ok := 0
 	for i := 0; i < 14; i++ {
-		conn, err := net.Dial("tcp", "127.0.0.1:18094")
+		conn, err := net.Dial("tcp", addr)
 		if err != nil {
 			continue
 		}

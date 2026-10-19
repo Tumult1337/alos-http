@@ -1,8 +1,21 @@
+//go:build linux && amd64
+
 package core
 
 import (
+	"math/bits"
 	"sync/atomic"
 	"time"
+)
+
+const (
+	nanosPerSecond          = int64(time.Second)
+	bytesPerMbps            = 125000
+	maxBandwidthMbps        = 250000
+	minDeficitSleep         = 50 * time.Microsecond
+	maxDeficitSleep         = 10 * time.Millisecond
+	connLimiterDefaultBurst = 65536
+	globalLimiterBurst      = 1 << 20
 )
 
 // TokenBucket is a lock-free token-bucket rate limiter safe for concurrent
@@ -21,6 +34,11 @@ type TokenBucket struct {
 // Example: tb := NewTokenBucket(1_000_000, 1_000_000) // ~1MB/s, 1MB burst
 // Example: tb := NewTokenBucket(65536, 131072)         // 64KB/s, 128KB burst
 func NewTokenBucket(ratePerSec, burst int64) *TokenBucket {
+	if ratePerSec <= 0 {
+		burst = 0
+	} else if burst <= 0 {
+		burst = ratePerSec
+	}
 	tb := &TokenBucket{
 		rate:  ratePerSec,
 		burst: burst,
@@ -38,9 +56,7 @@ func (tb *TokenBucket) refill() {
 		return
 	}
 
-	seconds := elapsed / 1_000_000_000
-	remainder := elapsed % 1_000_000_000
-	tokensToAdd := seconds*tb.rate + (remainder*tb.rate)/1_000_000_000
+	tokensToAdd := mulDivCapped(elapsed, tb.rate, nanosPerSecond, tb.burst)
 	if tokensToAdd <= 0 {
 		return
 	}
@@ -48,9 +64,9 @@ func (tb *TokenBucket) refill() {
 	if tb.lastTime.CompareAndSwap(last, now) {
 		for {
 			current := tb.tokens.Load()
-			newTokens := current + tokensToAdd
-			if newTokens > tb.burst {
-				newTokens = tb.burst
+			newTokens := tb.burst
+			if tokensToAdd < tb.burst-current {
+				newTokens = current + tokensToAdd
 			}
 			if tb.tokens.CompareAndSwap(current, newTokens) {
 				break
@@ -70,7 +86,7 @@ func (tb *TokenBucket) Allow(tokens int64) bool {
 		return true
 	}
 	if tokens > tb.burst {
-		return false
+		return tb.burst <= 0
 	}
 	tb.refill()
 	for {
@@ -90,6 +106,9 @@ func (tb *TokenBucket) Allow(tokens int64) bool {
 //
 // Example: tb.Wait(int64(len(chunk)))
 func (tb *TokenBucket) Wait(tokens int64) {
+	if tb.burst <= 0 {
+		return
+	}
 	for tokens > tb.burst {
 		tb.waitForChunk(tb.burst)
 		tokens -= tb.burst
@@ -111,17 +130,28 @@ func (tb *TokenBucket) sleepForDeficit(n int64) {
 	tb.refill()
 	deficit := n - tb.tokens.Load()
 	if deficit <= 0 || tb.rate <= 0 {
-		time.Sleep(50 * time.Microsecond)
+		time.Sleep(minDeficitSleep)
 		return
 	}
-	waitNs := (deficit * 1_000_000_000) / tb.rate
-	if waitNs < int64(50*time.Microsecond) {
-		waitNs = int64(50 * time.Microsecond)
+	waitNs := mulDivCapped(deficit, nanosPerSecond, tb.rate, int64(maxDeficitSleep))
+	time.Sleep(max(time.Duration(waitNs), minDeficitSleep))
+}
+
+func mulDivCapped(a, b, divisor, limit int64) int64 {
+	hi, lo := bits.Mul64(uint64(a), uint64(b))
+	if hi >= uint64(divisor) {
+		return limit
 	}
-	if waitNs > int64(10*time.Millisecond) {
-		waitNs = int64(10 * time.Millisecond)
+	var quotient uint64
+	if hi == 0 {
+		quotient = lo / uint64(divisor)
+	} else {
+		quotient, _ = bits.Div64(hi, lo, uint64(divisor))
 	}
-	time.Sleep(time.Duration(waitNs))
+	if quotient >= uint64(limit) {
+		return limit
+	}
+	return int64(quotient)
 }
 
 // WaitWithDeadline is like Wait but gives up and returns false if deadline
@@ -130,6 +160,9 @@ func (tb *TokenBucket) sleepForDeficit(n int64) {
 //
 // Example: ok := tb.WaitWithDeadline(4096, time.Now().Add(2*time.Second))
 func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
+	if tb.burst <= 0 {
+		return true
+	}
 	for tokens > tb.burst {
 		for !tb.Allow(tb.burst) {
 			if time.Now().After(deadline) {
@@ -175,6 +208,17 @@ type BandwidthConfig struct {
 	BurstSize       int64
 }
 
+func mbpsToBytesPerSec(mbps int64) int64 {
+	return min(mbps, maxBandwidthMbps) * bytesPerMbps
+}
+
+func (config BandwidthConfig) burstBytes(defaultBytes int64) int64 {
+	if config.BurstSize <= 0 {
+		return defaultBytes
+	}
+	return mbpsToBytesPerSec(config.BurstSize)
+}
+
 // ConnectionLimiter holds the per-connection upload and download token
 // buckets used to throttle a single connection's bandwidth. A nil Upload or
 // Download bucket means that direction is unthrottled.
@@ -190,15 +234,12 @@ type ConnectionLimiter struct {
 // Example: cl := NewConnectionLimiter(BandwidthConfig{})  // both directions unthrottled
 func NewConnectionLimiter(config BandwidthConfig) *ConnectionLimiter {
 	var cl ConnectionLimiter
-	burst := config.BurstSize * 125000
-	if config.BurstSize <= 0 {
-		burst = 65536
-	}
+	burst := config.burstBytes(connLimiterDefaultBurst)
 	if config.MaxUploadRate > 0 {
-		cl.Upload = NewTokenBucket(config.MaxUploadRate*125000, burst)
+		cl.Upload = NewTokenBucket(mbpsToBytesPerSec(config.MaxUploadRate), burst)
 	}
 	if config.MaxDownloadRate > 0 {
-		cl.Download = NewTokenBucket(config.MaxDownloadRate*125000, burst)
+		cl.Download = NewTokenBucket(mbpsToBytesPerSec(config.MaxDownloadRate), burst)
 	}
 	return &cl
 }
@@ -223,6 +264,20 @@ func (cl *ConnectionLimiter) ThrottleDownload(n int64) {
 	}
 }
 
+func (s *Server) newConnLimiter() *ConnectionLimiter {
+	if !s.connBandwidthOn {
+		return nil
+	}
+	return NewConnectionLimiter(s.config.ConnBandwidth)
+}
+
+func throttleUploadBytes(conn *ConnectionLimiter, global *GlobalLimiter, n int64) {
+	conn.ThrottleUpload(n)
+	if global != nil && global.Upload != nil {
+		global.Upload.Wait(n)
+	}
+}
+
 // GlobalLimiter holds the server-wide upload and download token buckets
 // shared across all connections. A nil Upload or Download bucket means that
 // direction is unthrottled.
@@ -238,15 +293,12 @@ type GlobalLimiter struct {
 // Example: gl := NewGlobalLimiter(BandwidthConfig{})  // both directions unthrottled
 func NewGlobalLimiter(config BandwidthConfig) *GlobalLimiter {
 	var gl GlobalLimiter
-	burst := config.BurstSize * 125000
-	if config.BurstSize <= 0 {
-		burst = 1 << 20
-	}
+	burst := config.burstBytes(globalLimiterBurst)
 	if config.MaxUploadRate > 0 {
-		gl.Upload = NewTokenBucket(config.MaxUploadRate*125000, burst)
+		gl.Upload = NewTokenBucket(mbpsToBytesPerSec(config.MaxUploadRate), burst)
 	}
 	if config.MaxDownloadRate > 0 {
-		gl.Download = NewTokenBucket(config.MaxDownloadRate*125000, burst)
+		gl.Download = NewTokenBucket(mbpsToBytesPerSec(config.MaxDownloadRate), burst)
 	}
 	return &gl
 }

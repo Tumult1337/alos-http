@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -8,6 +8,9 @@ type byteBuffer struct {
 }
 
 func (bb *byteBuffer) write(p []byte) {
+	if bb.r > 0 && len(bb.b)+len(p) > cap(bb.b) {
+		bb.compact()
+	}
 	bb.b = append(bb.b, p...)
 }
 

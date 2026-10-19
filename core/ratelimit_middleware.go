@@ -1,6 +1,9 @@
+//go:build linux && amd64
+
 package core
 
 import (
+	"net/netip"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -37,7 +40,29 @@ type RateLimitMiddlewareConfig struct {
 	StopCh      <-chan struct{}
 }
 
-const rateLimitBlockFor = 30 * time.Second
+const (
+	rateLimitBlockFor       = 30 * time.Second
+	rateLimitIPv6PrefixBits = 64
+)
+
+func isIPv4Text(ip string) bool {
+	return len(ip) > 3 && (ip[3] == '.' || ip[2] == '.' || ip[1] == '.')
+}
+
+func rateLimitKeyForIP(ip string) string {
+	if isIPv4Text(ip) || indexByte(ip, ':') < 0 {
+		return ip
+	}
+	addr, err := netip.ParseAddr(ip)
+	if err != nil || addr.Is4In6() {
+		return ip
+	}
+	prefix, err := addr.WithZone("").Prefix(rateLimitIPv6PrefixBits)
+	if err != nil {
+		return ip
+	}
+	return prefix.String()
+}
 
 type rateLimitMWEntry struct {
 	state        atomic.Uint64
@@ -88,11 +113,14 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 	if cfg.Window <= 0 {
 		cfg.Window = time.Minute
 	}
-	useResolvedIP := cfg.KeyFunc == nil
 	keyFunc := cfg.KeyFunc
 	if keyFunc == nil {
 		keyFunc = func(req *Request) string {
-			return extractClientIP(req.RemoteAddr)
+			ip := extractClientIP(req.RemoteAddr)
+			if !isIPv4Text(ip) {
+				ip = rateLimitKeyForIP(ip)
+			}
+			return ip
 		}
 	}
 
@@ -128,14 +156,10 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 		}
 	}()
 
-	reject := func(req *Request, resp *Response, key string, retryAfterSecs int64) {
+	reject := func(req *Request, resp *Response, retryAfterSecs int64) {
 		if cfg.OnLimit != nil {
-			ip := key
-			if !useResolvedIP {
-				ip = extractClientIP(req.RemoteAddr)
-			}
 			ev := RateLimitEvent{
-				IP:   ip,
+				IP:   extractClientIP(req.RemoteAddr),
 				Path: req.Path,
 				Rule: RateLimitRule{
 					Path:     req.Path,
@@ -171,7 +195,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 					if retryAfterSecs < 1 {
 						retryAfterSecs = 1
 					}
-					reject(req, resp, key, retryAfterSecs)
+					reject(req, resp, retryAfterSecs)
 					return
 				}
 				if entry.blockedUntil.CompareAndSwap(blockedUntil, 0) {
@@ -186,7 +210,7 @@ func RateLimitMiddleware(cfg RateLimitMiddlewareConfig) MiddlewareFunc {
 			}
 			if count > cfg.MaxRequests {
 				entry.blockedUntil.Store(now + blockNanos)
-				reject(req, resp, key, blockSecs)
+				reject(req, resp, blockSecs)
 				return
 			}
 

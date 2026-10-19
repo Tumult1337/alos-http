@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -85,17 +87,29 @@ func (s *ShardedMap[K, V]) Delete(key K) {
 // locked and iterated independently, so concurrent writes may be reflected
 // in one shard but not another.
 func (s *ShardedMap[K, V]) Range(fn func(K, V) bool) {
+	var snapshot []shardEntry[K, V]
 	for i := range s.shards {
-		sh := &s.shards[i]
-		sh.mu.RLock()
-		for k, v := range sh.m {
-			if !fn(k, v) {
-				sh.mu.RUnlock()
+		snapshot = s.shards[i].appendEntries(snapshot[:0])
+		for _, entry := range snapshot {
+			if !fn(entry.key, entry.val) {
 				return
 			}
 		}
-		sh.mu.RUnlock()
 	}
+}
+
+type shardEntry[K comparable, V any] struct {
+	key K
+	val V
+}
+
+func (sh *mapShard[K, V]) appendEntries(dst []shardEntry[K, V]) []shardEntry[K, V] {
+	sh.mu.RLock()
+	defer sh.mu.RUnlock()
+	for k, v := range sh.m {
+		dst = append(dst, shardEntry[K, V]{key: k, val: v})
+	}
+	return dst
 }
 
 // StringHash returns a fast, non-cryptographic hash of s, suitable for use

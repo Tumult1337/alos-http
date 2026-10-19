@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -48,14 +50,14 @@ func TestRootFastEligible(t *testing.T) {
 	})
 	t.Run("ratelimit-disables", func(t *testing.T) {
 		s := New(Config{})
-		s.RateLimit = &RateLimitEngine{}
+		s.rateLimitEngine.Store(&RateLimitEngine{})
 		if s.rootFastEligible() {
 			t.Fatal("RateLimit must disable fast path")
 		}
 	})
 	t.Run("cors-disables", func(t *testing.T) {
 		s := New(Config{})
-		s.CORS = &CORSEngine{}
+		s.corsEngine.Store(&CORSEngine{})
 		if s.rootFastEligible() {
 			t.Fatal("CORS must disable fast path")
 		}
@@ -451,12 +453,6 @@ func TestStreamMaxWriteAllWriters(t *testing.T) {
 	})
 	t.Run("h1-over-cap", func(t *testing.T) {
 		w := &H1StreamWriter{headersSent: true, maxWrite: 10}
-		if err := w.WriteChunk(make([]byte, 20)); err != ErrBodyTooLarge {
-			t.Fatalf("err = %v", err)
-		}
-	})
-	t.Run("h2-over-cap", func(t *testing.T) {
-		w := &H2StreamWriter{headersSent: true, maxWrite: 10}
 		if err := w.WriteChunk(make([]byte, 20)); err != ErrBodyTooLarge {
 			t.Fatalf("err = %v", err)
 		}

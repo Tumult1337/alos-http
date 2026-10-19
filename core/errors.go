@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 type staticError struct{ msg string }

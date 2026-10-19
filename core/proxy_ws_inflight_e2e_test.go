@@ -1,4 +1,4 @@
-//go:build linux && amd64 && e2e
+//go:build linux && amd64
 
 package core
 

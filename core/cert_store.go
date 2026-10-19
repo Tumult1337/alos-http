@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -5,7 +7,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
-	"log"
 	"os"
 	"strings"
 	"sync"
@@ -51,10 +52,13 @@ const (
 //	Example: Source: core.CertManual.
 //	Example: Source: core.CertSelfSigned.
 type CertConfig struct {
-	Domain   string
-	CertFile string
-	KeyFile  string
-	Source   CertSource
+	Domain         string
+	CertFile       string
+	KeyFile        string
+	OCSPStapleFile string
+	Source         CertSource
+	ClientAuth     *ClientAuthType
+	ClientCAs      *x509.CertPool
 }
 
 // CertEntry holds a loaded TLS certificate and its private key, along with
@@ -74,6 +78,8 @@ type CertEntry struct {
 	cachedEECertH1    []byte
 	cachedEECertH2    []byte
 	cachedEECertEmpty []byte
+
+	staple atomic.Pointer[ocspStaple]
 }
 
 // CertInfo is a read-only summary of a loaded certificate returned by
@@ -91,6 +97,7 @@ type CertStore struct {
 	certs    *alosmap.TypedMap[string, *CertEntry]
 	defEntry atomic.Pointer[CertEntry]
 	mu       sync.Mutex
+	onAdd    func(*CertEntry)
 }
 
 // NewCertStore returns an empty CertStore.
@@ -179,9 +186,14 @@ func (entry *CertEntry) CachedEECert(alpn string) []byte {
 func (cs *CertStore) AddCert(entry *CertEntry) {
 	entry.Domain = normalizeCertDomain(entry.Domain)
 	entry.initCachedHandshake()
+	cs.mu.Lock()
 	cs.certs.Store(entry.Domain, entry)
-	if cs.defEntry.Load() == nil {
-		cs.defEntry.CompareAndSwap(nil, entry)
+	if def := cs.defEntry.Load(); def == nil || def.Domain == entry.Domain {
+		cs.defEntry.Store(entry)
+	}
+	cs.mu.Unlock()
+	if cs.onAdd != nil {
+		cs.onAdd(entry)
 	}
 }
 
@@ -211,6 +223,8 @@ func (cs *CertStore) RemoveCert(domain string) {
 // Example: certStore.SetDefault("example.com")
 func (cs *CertStore) SetDefault(domain string) {
 	domain = normalizeCertDomain(domain)
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
 	v, ok := cs.certs.Load(domain)
 	if !ok {
 		return
@@ -284,7 +298,7 @@ func NewCertEntryFromDER(domain string, certDER []byte, privKey crypto.Signer, s
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
 	keyBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
 	if err != nil {
-		log.Printf("[CERT] failed to marshal private key for %s: %v", domain, err)
+		logger().Error("certificate private key could not be encoded", "domain", domain, "err", err)
 		return &CertEntry{
 			Domain:   domain,
 			ChainDER: [][]byte{certDER},
@@ -295,7 +309,7 @@ func NewCertEntryFromDER(domain string, certDER []byte, privKey crypto.Signer, s
 	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyBytes})
 	tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
 	if err != nil {
-		log.Printf("[CERT] failed to create TLS cert for %s: %v", domain, err)
+		logger().Error("certificate could not be loaded", "domain", domain, "err", err)
 	}
 
 	return &CertEntry{
@@ -319,7 +333,7 @@ func (s *Server) AddCert(domain string, certPEM, keyPEM []byte) error {
 	}
 	s.certStore.AddCert(entry)
 	s.rebuildFallbackTLSConfig()
-	log.Printf("[CERT] added cert for %s (manual)", domain)
+	s.logger().Info("certificate added", "domain", domain, "source", "manual")
 	return nil
 }
 
@@ -351,7 +365,7 @@ func (s *Server) AddSelfSignedCert(domain string) error {
 	}
 	s.certStore.AddCert(NewCertEntryFromDER(domain, der, priv, CertSelfSigned))
 	s.rebuildFallbackTLSConfig()
-	log.Printf("[CERT] added self-signed cert for %s", domain)
+	s.logger().Info("certificate added", "domain", domain, "source", "self-signed")
 	return nil
 }
 
@@ -362,7 +376,7 @@ func (s *Server) AddSelfSignedCert(domain string) error {
 func (s *Server) RemoveCert(domain string) {
 	s.certStore.RemoveCert(domain)
 	s.rebuildFallbackTLSConfig()
-	log.Printf("[CERT] removed cert for %s", domain)
+	s.logger().Info("certificate removed", "domain", domain)
 }
 
 // SetDefaultCert makes the certificate registered for domain the server's
@@ -371,7 +385,7 @@ func (s *Server) RemoveCert(domain string) {
 // Example: srv.SetDefaultCert("example.com")
 func (s *Server) SetDefaultCert(domain string) {
 	s.certStore.SetDefault(domain)
-	log.Printf("[CERT] default cert set to %s", domain)
+	s.logger().Info("default certificate set", "domain", domain)
 }
 
 // ListCerts returns a snapshot of every certificate registered on the
@@ -399,7 +413,7 @@ func (s *Server) ReloadCert(domain, certFile, keyFile string) error {
 	}
 	s.certStore.AddCert(entry)
 	s.rebuildFallbackTLSConfig()
-	log.Printf("[CERT] reloaded cert for %s", domain)
+	s.logger().Info("certificate reloaded", "domain", domain)
 	return nil
 }
 
@@ -415,7 +429,7 @@ func (s *Server) UpdateCert(domain string, certPEM, keyPEM []byte) error {
 	}
 	s.certStore.AddCert(entry)
 	s.rebuildFallbackTLSConfig()
-	log.Printf("[CERT] updated cert for %s", domain)
+	s.logger().Info("certificate updated", "domain", domain)
 	return nil
 }
 

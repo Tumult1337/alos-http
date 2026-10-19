@@ -1,11 +1,21 @@
+//go:build linux && amd64
+
 package core
 
 const (
+	quicErrNoError           = 0x00
 	quicErrFlowControl       = 0x03
+	quicErrStreamLimit       = 0x04
+	quicErrStreamState       = 0x05
+	quicErrFinalSize         = 0x06
+	quicErrFrameEncoding     = 0x07
 	quicErrProtocolViolation = 0x0a
 )
 
-var errQUICFrameNotAllowedInSpace = &staticError{"frame type not permitted in this packet space"}
+var (
+	errQUICFrameNotAllowedInSpace = &staticError{"frame type not permitted in this packet space"}
+	errQUICUnknownFrame           = &staticError{"unknown frame type"}
+)
 
 func quicFrameAllowedInHandshakeSpaces(frameType uint64) bool {
 	switch frameType {
@@ -94,6 +104,17 @@ type quicMaxStreamsFrame struct {
 	bidi       bool
 }
 
+type quicResetStreamFrame struct {
+	streamID  uint64
+	errorCode uint64
+	finalSize uint64
+}
+
+type quicStopSendingFrame struct {
+	streamID  uint64
+	errorCode uint64
+}
+
 type quicNewConnIDFrame struct {
 	seq        uint64
 	retirePT   uint64
@@ -167,6 +188,29 @@ func quicAppendMaxStreamsFrame(dst []byte, maxStreams uint64, bidi bool) []byte 
 	return dst
 }
 
+func quicAppendResetStreamFrame(dst []byte, streamID, errorCode, finalSize uint64) []byte {
+	dst = quicAppendVarint(dst, quicFrameResetStream)
+	dst = quicAppendVarint(dst, streamID)
+	dst = quicAppendVarint(dst, errorCode)
+	dst = quicAppendVarint(dst, finalSize)
+	return dst
+}
+
+func quicAppendStopSendingFrame(dst []byte, streamID, errorCode uint64) []byte {
+	dst = quicAppendVarint(dst, quicFrameStopSending)
+	dst = quicAppendVarint(dst, streamID)
+	dst = quicAppendVarint(dst, errorCode)
+	return dst
+}
+
+func quicAppendAppCloseFrame(dst []byte, errorCode uint64, reason string) []byte {
+	dst = quicAppendVarint(dst, quicFrameAppClose)
+	dst = quicAppendVarint(dst, errorCode)
+	dst = quicAppendVarint(dst, uint64(len(reason)))
+	dst = append(dst, reason...)
+	return dst
+}
+
 func quicAppendHandshakeDoneFrame(dst []byte) []byte {
 	return quicAppendVarint(dst, quicFrameHandshakeDone)
 }
@@ -207,14 +251,6 @@ func (p *quicFrameParser) readBytes(n int) ([]byte, bool) {
 	return b, true
 }
 
-func (p *quicFrameParser) skip(n int) bool {
-	if p.off+n > len(p.data) {
-		return false
-	}
-	p.off += n
-	return true
-}
-
 type quicFrameVisitor struct {
 	onPadding       func()
 	onPing          func()
@@ -224,11 +260,17 @@ type quicFrameVisitor struct {
 	onMaxData       func(f quicMaxDataFrame)
 	onMaxStreamData func(f quicMaxStreamDataFrame)
 	onMaxStreams    func(f quicMaxStreamsFrame)
+	onResetStream   func(f quicResetStreamFrame)
+	onStopSending   func(f quicStopSendingFrame)
+	onRetireConnID  func(seq uint64)
+	onPathChallenge func(data [quicPathChallengeLen]byte)
+	onPathResponse  func(data [quicPathChallengeLen]byte)
 	onConnClose     func(f quicConnCloseFrame)
 	onHandshakeDone func()
 	onNewConnID     func(f quicNewConnIDFrame)
 	onNewToken      func(token []byte)
 	allowed         func(frameType uint64) bool
+	nonProbing      bool
 }
 
 func quicParseFrames(data []byte, v *quicFrameVisitor) error {
@@ -249,6 +291,9 @@ func quicParseFrames(data []byte, v *quicFrameVisitor) error {
 		}
 		if v.allowed != nil && !v.allowed(frameType) {
 			return errQUICFrameNotAllowedInSpace
+		}
+		if !v.nonProbing && !quicIsProbingFrame(frameType) {
+			v.nonProbing = true
 		}
 
 		switch {
@@ -360,22 +405,30 @@ func quicParseFrames(data []byte, v *quicFrameVisitor) error {
 			}
 
 		case frameType == quicFrameResetStream:
-			if _, ok := p.readVarint(); !ok {
+			var f quicResetStreamFrame
+			if f.streamID, ok = p.readVarint(); !ok {
 				return ErrTruncated
 			}
-			if _, ok := p.readVarint(); !ok {
+			if f.errorCode, ok = p.readVarint(); !ok {
 				return ErrTruncated
 			}
-			if _, ok := p.readVarint(); !ok {
+			if f.finalSize, ok = p.readVarint(); !ok {
 				return ErrTruncated
+			}
+			if v.onResetStream != nil {
+				v.onResetStream(f)
 			}
 
 		case frameType == quicFrameStopSending:
-			if _, ok := p.readVarint(); !ok {
+			var f quicStopSendingFrame
+			if f.streamID, ok = p.readVarint(); !ok {
 				return ErrTruncated
 			}
-			if _, ok := p.readVarint(); !ok {
+			if f.errorCode, ok = p.readVarint(); !ok {
 				return ErrTruncated
+			}
+			if v.onStopSending != nil {
+				v.onStopSending(f)
 			}
 
 		case frameType == quicFrameDataBlocked:
@@ -397,22 +450,31 @@ func quicParseFrames(data []byte, v *quicFrameVisitor) error {
 			}
 
 		case frameType == quicFrameRetireConnID:
-			if _, ok := p.readVarint(); !ok {
+			seq, ok := p.readVarint()
+			if !ok {
 				return ErrTruncated
 			}
-
-		case frameType == quicFramePathChallenge:
-			if !p.skip(8) {
-				return ErrTruncated
+			if v.onRetireConnID != nil {
+				v.onRetireConnID(seq)
 			}
 
-		case frameType == quicFramePathResponse:
-			if !p.skip(8) {
+		case frameType == quicFramePathChallenge || frameType == quicFramePathResponse:
+			raw, ok := p.readBytes(quicPathChallengeLen)
+			if !ok {
 				return ErrTruncated
+			}
+			var data [quicPathChallengeLen]byte
+			copy(data[:], raw)
+			if frameType == quicFramePathChallenge {
+				if v.onPathChallenge != nil {
+					v.onPathChallenge(data)
+				}
+			} else if v.onPathResponse != nil {
+				v.onPathResponse(data)
 			}
 
 		default:
-			return ErrH2BadHeader
+			return errQUICUnknownFrame
 		}
 	}
 	return nil

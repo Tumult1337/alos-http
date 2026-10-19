@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -16,6 +18,46 @@ const (
 	quicTimeThreshold    = 9.0 / 8.0
 	quicMaxTrackedSent   = 16384
 )
+
+const quicSendTimeLogEntries = 128
+
+type quicSendTime struct {
+	pn uint64
+	at int64
+}
+
+type quicSendTimeLog struct {
+	entries [quicSendTimeLogEntries]quicSendTime
+	written uint64
+	lastAt  int64
+}
+
+func (l *quicSendTimeLog) record(pn uint64, at int64) {
+	if at == l.lastAt {
+		return
+	}
+	l.lastAt = at
+	l.entries[l.written%quicSendTimeLogEntries] = quicSendTime{pn: pn, at: at}
+	l.written++
+}
+
+func (l *quicSendTimeLog) sentAt(pn uint64) (int64, bool) {
+	oldest := l.written - min(l.written, quicSendTimeLogEntries)
+	for i := l.written; i > oldest; i-- {
+		if e := &l.entries[(i-1)%quicSendTimeLogEntries]; e.pn <= pn {
+			return e.at, true
+		}
+	}
+	return 0, false
+}
+
+type quicAckTally struct {
+	largest        uint64
+	largestSent    int64
+	ackedInFlight  uint64
+	largestTracked bool
+	anyAcked       bool
+}
 
 type quicSentPacket struct {
 	pn        uint64
@@ -48,6 +90,10 @@ type quicLossState struct {
 	ssthresh uint64
 
 	ptoCount int
+
+	peerMaxAckDelay time.Duration
+
+	appSendTimes quicSendTimeLog
 }
 
 func newQuicLossState() *quicLossState {
@@ -55,24 +101,37 @@ func newQuicLossState() *quicLossState {
 		smoothedRTT: quicInitialRTT,
 		rttVar:      quicInitialRTT / 2,
 		minRTT:      0,
-		cwnd:        10 * quicMaxPacketSize,
+		cwnd:        quicInitialWindow,
 		ssthresh:    math.MaxUint64,
 	}
 	ls.largestAcked[0] = -1
 	ls.largestAcked[1] = -1
 	ls.largestAcked[2] = -1
+	ls.peerMaxAckDelay = quicMaxAckDelay
 	return ls
 }
 
+func (ls *quicLossState) setPeerMaxAckDelay(d time.Duration) {
+	ls.mu.Lock()
+	ls.peerMaxAckDelay = d
+	ls.mu.Unlock()
+}
+
 func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit bool, frames []byte) {
+	now := turbo.Now()
+	if space == quicSpaceAppData {
+		ls.appSendTimes.record(pn, now)
+	}
+	if !ackElicit {
+		return
+	}
 	var framesBuf *[]byte
 	var stored []byte
-	if ackElicit && len(frames) > 0 {
+	if len(frames) > 0 {
 		framesBuf = quicFramePool.Get().(*[]byte)
 		*framesBuf = append((*framesBuf)[:0], frames...)
 		stored = *framesBuf
 	}
-	now := turbo.Now()
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	sp := quicSentPacket{
@@ -85,32 +144,33 @@ func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit 
 		inFlight:  ackElicit,
 	}
 	ls.sent[space] = append(ls.sent[space], sp)
-	if ackElicit {
-		ls.bytesInFlight += size
-	}
+	ls.bytesInFlight += size
 }
 
-func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay time.Duration) [][]byte {
+var errQUICAckUnsentPacket = &staticError{"ACK of a packet number that was never sent"}
+
+func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay time.Duration, nextPN uint64) (lossPossible bool, err error) {
 	if ack.firstRange > ack.largestAck {
-		return nil
+		return false, nil
+	}
+	if ack.largestAck >= nextPN {
+		return false, errQUICAckUnsentPacket
 	}
 
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 
 	largest := int64(ack.largestAck)
-	if largest > ls.largestAcked[space] {
+	newlyLargest := largest > ls.largestAcked[space]
+	if newlyLargest {
 		ls.largestAcked[space] = largest
 	}
 
-	var lostFrames [][]byte
-	var ackedInFlight uint64
-	var newestSent int64
-	var anyAcked bool
+	tally := quicAckTally{largest: ack.largestAck}
 
 	lo := ack.largestAck - ack.firstRange
 	hi := ack.largestAck
-	ls.markAcked(space, lo, hi, &ackedInFlight, &newestSent, &anyAcked)
+	ls.markAcked(space, lo, hi, &tally)
 
 	for _, r := range ack.ranges {
 		if lo < r.gap+2 {
@@ -121,44 +181,78 @@ func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay tim
 			break
 		}
 		lo = hi - r.count
-		ls.markAcked(space, lo, hi, &ackedInFlight, &newestSent, &anyAcked)
+		ls.markAcked(space, lo, hi, &tally)
 	}
 
-	if anyAcked && newestSent != 0 {
-		latestRTT := turbo.Since(newestSent)
+	if sent, ok := ls.largestAckedSentTime(space, &tally, newlyLargest); ok {
+		latestRTT := turbo.Since(sent)
 		if latestRTT < quicTimerGranularity {
 			latestRTT = quicTimerGranularity
 		}
 		ls.updateRTT(latestRTT, ackDelay)
 	}
 
-	if ackedInFlight > 0 {
+	if tally.ackedInFlight > 0 {
 		if ls.cwnd < ls.ssthresh {
-			ls.cwnd += ackedInFlight
+			ls.cwnd += tally.ackedInFlight
 		} else {
-			ls.cwnd += quicMaxPacketSize * ackedInFlight / ls.cwnd
+			ls.cwnd += quicMaxPacketSize * tally.ackedInFlight / ls.cwnd
 		}
 	}
 
-	lostFrames = ls.detectLost(space, lostFrames)
-
 	ls.ptoCount = 0
-	return lostFrames
+	sent := ls.sent[space]
+	return len(sent) > 0 && int64(sent[0].pn) <= ls.largestAcked[space], nil
 }
 
-func (ls *quicLossState) markAcked(space int, lo, hi uint64, ackedInFlight *uint64, newestSent *int64, anyAcked *bool) {
+func (ls *quicLossState) discardSpace(space int) {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	for i := range ls.sent[space] {
+		sp := &ls.sent[space][i]
+		if sp.inFlight {
+			ls.bytesInFlight -= sp.size
+		}
+		if sp.framesBuf != nil {
+			quicFramePool.Put(sp.framesBuf)
+		}
+	}
+	ls.sent[space] = nil
+}
+
+func (ls *quicLossState) detectLostPackets(space int) [][]byte {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	return ls.detectLost(space, nil)
+}
+
+func (ls *quicLossState) largestAckedSentTime(space int, tally *quicAckTally, newlyLargest bool) (int64, bool) {
+	switch {
+	case !tally.anyAcked:
+		return 0, false
+	case tally.largestTracked:
+		return tally.largestSent, true
+	case newlyLargest && space == quicSpaceAppData:
+		return ls.appSendTimes.sentAt(tally.largest)
+	default:
+		return 0, false
+	}
+}
+
+func (ls *quicLossState) markAcked(space int, lo, hi uint64, tally *quicAckTally) {
 	remaining := ls.sent[space][:0]
 	for i := range ls.sent[space] {
 		sp := &ls.sent[space][i]
 		if sp.pn >= lo && sp.pn <= hi {
 			if sp.inFlight {
 				ls.bytesInFlight -= sp.size
-				*ackedInFlight += uint64(sp.size)
+				tally.ackedInFlight += uint64(sp.size)
 			}
-			if sp.sent > *newestSent {
-				*newestSent = sp.sent
+			if sp.pn == tally.largest {
+				tally.largestSent = sp.sent
+				tally.largestTracked = true
 			}
-			*anyAcked = true
+			tally.anyAcked = true
 			if sp.framesBuf != nil {
 				quicFramePool.Put(sp.framesBuf)
 			}
@@ -244,8 +338,22 @@ func (ls *quicLossState) updateRTT(latestRTT, ackDelay time.Duration) {
 	ls.smoothedRTT = (7*ls.smoothedRTT + adjustedRTT) / 8
 }
 
+const quicInitialWindow = 10 * quicMaxPacketSize
+
+func (ls *quicLossState) resetForNewPath() {
+	ls.mu.Lock()
+	ls.smoothedRTT = quicInitialRTT
+	ls.rttVar = quicInitialRTT / 2
+	ls.minRTT = 0
+	ls.firstRTTDone = false
+	ls.cwnd = quicInitialWindow
+	ls.ssthresh = math.MaxUint64
+	ls.ptoCount = 0
+	ls.mu.Unlock()
+}
+
 func (ls *quicLossState) ptoTimeout() time.Duration {
-	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity) + quicMaxAckDelay
+	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity) + ls.peerMaxAckDelay
 	return pto * time.Duration(1<<uint(ls.ptoCount))
 }
 
@@ -275,9 +383,11 @@ func (ls *quicLossState) ptoExpiredFrames(space int) [][]byte {
 	if len(ls.sent[space]) == 0 {
 		return nil
 	}
-	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity) + quicMaxAckDelay
-	pto *= time.Duration(1 << uint(ls.ptoCount))
+	pto := ls.ptoTimeout()
 	cutoff := turbo.Now() - int64(pto)
+	if ls.sent[space][0].sent >= cutoff {
+		return nil
+	}
 
 	var frames [][]byte
 	remaining := ls.sent[space][:0]

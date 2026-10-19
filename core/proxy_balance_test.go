@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -20,7 +22,7 @@ func backendsForBalance(weights ...int) []*backend {
 func pickCounts(lb loadBalancer, backends []*backend, clientIP string, rounds int) []int {
 	counts := make([]int, len(backends))
 	for i := 0; i < rounds; i++ {
-		idx := lb.pick(backends, clientIP)
+		idx := lb.pick(backends, clientIP, 0)
 		if idx >= 0 {
 			counts[idx]++
 		}
@@ -36,7 +38,7 @@ func TestBalancerRoundRobinIsExactlyEven(t *testing.T) {
 	// The order must be strictly sequential, not merely balanced.
 	for i := 0; i < 8; i++ {
 		want := i % len(backends)
-		if got := lb.pick(backends, ""); got != want {
+		if got := lb.pick(backends, "", 0); got != want {
 			t.Fatalf("pick %d = %d, want %d (round robin must cycle in order)", i, got, want)
 		}
 	}
@@ -72,7 +74,7 @@ func TestBalancerReportsNoBackendWhenAllUnhealthy(t *testing.T) {
 			b.Healthy.Store(false)
 		}
 		lb := newBalancer(typ, backends)
-		if got := lb.pick(backends, "1.2.3.4"); got != -1 {
+		if got := lb.pick(backends, "1.2.3.4", 0); got != -1 {
 			t.Errorf("balancer %d returned %d with every backend unhealthy, want -1", typ, got)
 		}
 	}
@@ -81,7 +83,7 @@ func TestBalancerReportsNoBackendWhenAllUnhealthy(t *testing.T) {
 func TestBalancerHandlesEmptyBackendSet(t *testing.T) {
 	for _, typ := range []LoadBalancerType{LBRoundRobin, LBWeightedRR, LBLeastConn, LBIPHash, LBRandom} {
 		lb := newBalancer(typ, nil)
-		if got := lb.pick(nil, "1.2.3.4"); got != -1 {
+		if got := lb.pick(nil, "1.2.3.4", 0); got != -1 {
 			t.Errorf("balancer %d returned %d for an empty backend set, want -1", typ, got)
 		}
 	}
@@ -141,13 +143,13 @@ func TestBalancerLeastConnChoosesFewest(t *testing.T) {
 	backends[2].ActiveConns.Store(5)
 	lb := newBalancer(LBLeastConn, backends)
 
-	if got := lb.pick(backends, ""); got != 1 {
+	if got := lb.pick(backends, "", 0); got != 1 {
 		t.Fatalf("pick = %d, want 1 (fewest active connections)", got)
 	}
 
 	// Once it is the busiest, it must stop being chosen.
 	backends[1].ActiveConns.Store(9)
-	if got := lb.pick(backends, ""); got != 2 {
+	if got := lb.pick(backends, "", 0); got != 2 {
 		t.Fatalf("pick = %d, want 2 after backend 1 became busiest", got)
 	}
 }
@@ -159,7 +161,7 @@ func TestBalancerLeastConnSkipsUnhealthy(t *testing.T) {
 	backends[1].ActiveConns.Store(50)
 	lb := newBalancer(LBLeastConn, backends)
 
-	if got := lb.pick(backends, ""); got != 1 {
+	if got := lb.pick(backends, "", 0); got != 1 {
 		t.Fatalf("pick = %d, want 1; an idle but unhealthy backend must not be chosen", got)
 	}
 }
@@ -169,16 +171,16 @@ func TestBalancerIPHashIsStablePerClient(t *testing.T) {
 	backends := backendsForBalance(1, 1, 1, 1)
 	lb := newBalancer(LBIPHash, backends)
 
-	first := lb.pick(backends, "203.0.113.9")
+	first := lb.pick(backends, "203.0.113.9", 0)
 	for i := 0; i < 50; i++ {
-		if got := lb.pick(backends, "203.0.113.9"); got != first {
+		if got := lb.pick(backends, "203.0.113.9", 0); got != first {
 			t.Fatalf("same client mapped to %d then %d; IP hash must be consistent", first, got)
 		}
 	}
 
 	seen := map[int]bool{}
 	for i := 0; i < 200; i++ {
-		seen[lb.pick(backends, fmt.Sprintf("198.51.100.%d", i%256))] = true
+		seen[lb.pick(backends, fmt.Sprintf("198.51.100.%d", i%256), 0)] = true
 	}
 	if len(seen) < 2 {
 		t.Fatalf("200 distinct client IPs all mapped to %v; IP hash is not spreading", seen)
@@ -192,10 +194,10 @@ func TestBalancerIPHashFallsThroughWhenTargetDown(t *testing.T) {
 	lb := newBalancer(LBIPHash, backends)
 
 	const ip = "203.0.113.9"
-	target := lb.pick(backends, ip)
+	target := lb.pick(backends, ip, 0)
 	backends[target].Healthy.Store(false)
 
-	got := lb.pick(backends, ip)
+	got := lb.pick(backends, ip, 0)
 	if got == target {
 		t.Fatal("IP hash kept selecting a backend it had just marked unhealthy")
 	}

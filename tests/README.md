@@ -17,13 +17,7 @@ The `tests` tree is the categorized entry point for framework verification. It a
 
 ## Run everything
 
-Windows:
-
-```bat
-tests\runall.bat
-```
-
-Linux and macOS:
+On Linux amd64:
 
 ```sh
 ./tests/runall.sh

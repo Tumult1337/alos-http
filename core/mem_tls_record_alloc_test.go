@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -21,6 +23,9 @@ func newTestTrafficAEAD(t testing.TB) *TrafficAEAD {
 }
 
 func TestBuildTLS13AppDataRecordsSteadyStateZeroAlloc(t *testing.T) {
+	if raceEnabled {
+		t.Skip("the race detector instruments every allocation, so budgets do not apply")
+	}
 	w := newTestTrafficAEAD(t)
 	for _, size := range []int{13, 16 << 10, 64 << 10, 256 << 10} {
 		payload := bytes.Repeat([]byte{'x'}, size)

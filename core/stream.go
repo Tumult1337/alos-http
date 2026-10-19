@@ -1,10 +1,9 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"net"
-	"sync"
-	"sync/atomic"
-	"time"
 )
 
 func classifyH1StreamHeaders(headers [][2]string) (bool, bool) {
@@ -26,10 +25,61 @@ func classifyH1StreamHeaders(headers [][2]string) (bool, bool) {
 	return chunked, hasConnection
 }
 
+func appendH1StreamHead(buf []byte, statusCode int, headers [][2]string, contentType string, chunked, closeAfter bool, serverName string, altSvc *altSvcHeader) []byte {
+	buf = appendStatusLine(buf, statusCode)
+	if contentType != "" {
+		buf = appendContentTypeHeader(buf, contentType)
+	}
+	if chunked {
+		buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
+	}
+	hasConnection := false
+	hasServer := false
+	for i := range headers {
+		if EqualFoldASCII(headers[i][0], "connection") {
+			hasConnection = true
+		}
+		if EqualFoldASCII(headers[i][0], "server") {
+			hasServer = true
+		}
+		if altSvc != nil && EqualFoldASCII(headers[i][0], altSvcHeaderName) {
+			altSvc = nil
+		}
+		buf = append(buf, headers[i][0]...)
+		buf = append(buf, ':', ' ')
+		buf = append(buf, headers[i][1]...)
+		buf = append(buf, '\r', '\n')
+	}
+	if !hasConnection {
+		if closeAfter {
+			buf = append(buf, "Connection: close\r\n"...)
+		} else {
+			buf = append(buf, "Connection: keep-alive\r\n"...)
+		}
+	}
+	if !hasServer {
+		buf = append(buf, "Server: "...)
+		buf = append(buf, serverName...)
+		buf = append(buf, '\r', '\n')
+	}
+	if altSvc != nil {
+		buf = append(buf, altSvc.h1...)
+	}
+	return append(buf, '\r', '\n')
+}
+
+const h1LastChunk = "0\r\n\r\n"
+
+func appendH1Chunk(buf, data []byte) []byte {
+	var sizeBuf [16]byte
+	buf = append(buf, appendHex(sizeBuf[:0], int64(len(data)))...)
+	buf = append(buf, '\r', '\n')
+	buf = append(buf, data...)
+	return append(buf, '\r', '\n')
+}
+
 func releaseStreamWriter(sw StreamWriter) {
 	switch writer := sw.(type) {
-	case *H2StreamWriter:
-		H2StreamWriterPool.Put(writer)
 	case *H1StreamWriter:
 		H1StreamWriterPool.Put(writer)
 	case *PlainH1StreamWriter:
@@ -37,183 +87,61 @@ func releaseStreamWriter(sw StreamWriter) {
 	}
 }
 
-// H2StreamWriter writes an HTTP/2 response as HEADERS and DATA frames on a
-// single stream, honoring per-stream and per-connection flow control and any
-// configured bandwidth limiter. It implements StreamWriter.
-type H2StreamWriter struct {
-	streamID     uint32
-	writeCh      chan<- WriteRequest
-	done         <-chan struct{}
-	window       *atomic.Int64
-	connWindow   *atomic.Int64
-	maxFrame     *atomic.Uint32
-	limiter      *ConnectionLimiter
-	global       *GlobalLimiter
-	method       string
-	serverName   string
-	written      int64
-	maxWrite     int64
-	headersSent  bool
-	suppressBody bool
-	flowCond     *sync.Cond
-}
-
-// WriteRequest is a single write submitted to a connection's serialized
-// writer goroutine; the outcome is delivered on Done.
-type WriteRequest struct {
-	Data        []byte
-	Done        chan error
-	releaseBuf  *[]byte
-	releasePool uint8
-}
-
-func bindRequestMethodToStreamWriter(sw StreamWriter, method string) {
+func bindRequestToStreamWriter(sw StreamWriter, req *Request) {
 	switch writer := sw.(type) {
-	case *H2StreamWriter:
-		writer.method = method
-		writer.suppressBody = false
 	case *H1StreamWriter:
-		writer.method = method
+		writer.method = req.Method
 		writer.suppressBody = false
+		writer.cors.bind(req)
 	case *PlainH1StreamWriter:
-		writer.method = method
+		writer.method = req.Method
 		writer.suppressBody = false
+		writer.cors.bind(req)
 	}
 }
 
-// WriteHeader encodes and sends the HTTP/2 HEADERS frame for the stream with
-// statusCode, headers, and contentType. Later calls are no-ops.
-func (w *H2StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
-	if w.headersSent {
-		return nil
-	}
-	w.headersSent = true
-	w.suppressBody, _ = responseBodyDisposition(w.method, statusCode)
+const corsMaxResponseHeaders = 7
 
-	bp := MediumBufPool.Get().(*[]byte)
-	enc := HpackEncoder{}
-	enc.Reset((*bp)[:0])
-	encodeH2ResponseHeaders(&enc, statusCode, contentType, -1, headers, w.serverName)
-
-	fbp := H2FrameBufPool.Get().(*[]byte)
-	headerFrame := H2WriteFrame((*fbp)[:0], H2FrameHeaders, H2FlagEndHeaders, w.streamID, enc.Buf)
-	*bp = enc.Buf[:0]
-	MediumBufPool.Put(bp)
-
-	err := w.sendFrame(headerFrame)
-	*fbp = headerFrame[:0]
-	H2FrameBufPool.Put(fbp)
-	return err
+type streamCORSPolicy struct {
+	engine *CORSEngine
+	snap   *corsSnapshot
 }
 
-// WriteChunk sends data as one or more HTTP/2 DATA frames, splitting oversized
-// payloads to the negotiated max frame size and waiting for available
-// flow-control window (up to 30s) before each frame. It applies any
-// configured download rate limit and returns ErrBodyTooLarge if a maximum
-// response size was set and is exceeded.
-func (w *H2StreamWriter) WriteChunk(data []byte) error {
-	if !w.headersSent {
-		return ErrStreamClosed
-	}
-	if w.suppressBody {
-		return nil
-	}
-	if w.maxWrite > 0 {
-		w.written += int64(len(data))
-		if w.written > w.maxWrite {
-			return ErrBodyTooLarge
-		}
-	}
-
-	maxFrame := int(w.maxFrame.Load())
-	remaining := data
-
-	for len(remaining) > 0 {
-		chunk := remaining
-		if len(chunk) > maxFrame {
-			chunk = chunk[:maxFrame]
-		}
-
-		waitStart := time.Now()
-		w.flowCond.L.Lock()
-		for {
-			windowAvail := w.window.Load()
-			connAvail := w.connWindow.Load()
-			avail := windowAvail
-			if connAvail < avail {
-				avail = connAvail
-			}
-			if avail > 0 {
-				if int64(len(chunk)) > avail {
-					chunk = chunk[:int(avail)]
-				}
-				break
-			}
-			select {
-			case <-w.done:
-				w.flowCond.L.Unlock()
-				return ErrStreamClosed
-			default:
-			}
-			if time.Since(waitStart) > 30*time.Second {
-				w.flowCond.L.Unlock()
-				return ErrStreamClosed
-			}
-			w.flowCond.Wait()
-		}
-		w.flowCond.L.Unlock()
-
-		if w.limiter != nil {
-			w.limiter.ThrottleDownload(int64(len(chunk)))
-		}
-		if w.global != nil && w.global.Download != nil {
-			w.global.Download.Wait(int64(len(chunk)))
-		}
-
-		w.window.Add(-int64(len(chunk)))
-		w.connWindow.Add(-int64(len(chunk)))
-
-		fbp := H2FrameBufPool.Get().(*[]byte)
-		dataFrame := H2WriteFrame((*fbp)[:0], H2FrameData, 0, w.streamID, chunk)
-		err := w.sendFrame(dataFrame)
-		*fbp = dataFrame[:0]
-		H2FrameBufPool.Put(fbp)
-		if err != nil {
-			return err
-		}
-
-		remaining = remaining[len(chunk):]
-	}
-	return nil
+type streamCORSHead struct {
+	policy streamCORSPolicy
+	origin string
 }
 
-// Flush is a no-op; H2StreamWriter has no internal buffering to flush.
-func (w *H2StreamWriter) Flush() error {
-	return nil
-}
-
-// Close sends an empty DATA frame with END_STREAM set, ending the HTTP/2
-// stream.
-func (w *H2StreamWriter) Close() error {
-	fbp := H2FrameBufPool.Get().(*[]byte)
-	emptyFrame := H2WriteFrame((*fbp)[:0], H2FrameData, H2FlagEndStream, w.streamID, nil)
-	err := w.sendFrame(emptyFrame)
-	*fbp = emptyFrame[:0]
-	H2FrameBufPool.Put(fbp)
-	return err
-}
-
-func (w *H2StreamWriter) sendFrame(frame []byte) error {
-	done := ErrChanPool.Get().(chan error)
-	select {
-	case w.writeCh <- WriteRequest{Data: frame, Done: done}:
-		err := <-done
-		ErrChanPool.Put(done)
-		return err
-	case <-w.done:
-		ErrChanPool.Put(done)
-		return ErrStreamClosed
+func (h *streamCORSHead) bind(req *Request) {
+	if req.streamCORS.snap != nil {
+		h.capture(req)
 	}
+}
+
+func (h *streamCORSHead) capture(req *Request) {
+	h.policy = req.streamCORS
+	h.origin = req.Header("origin")
+}
+
+func (h *streamCORSHead) reset() {
+	if h.policy.snap != nil {
+		*h = streamCORSHead{}
+	}
+}
+
+func (h *streamCORSHead) withCORS(headers [][2]string) [][2]string {
+	if h.policy.snap == nil {
+		return headers
+	}
+	return h.mergeInto(headers)
+}
+
+func (h *streamCORSHead) mergeInto(headers [][2]string) [][2]string {
+	head := Response{Headers: make([][2]string, len(headers), len(headers)+corsMaxResponseHeaders)}
+	copy(head.Headers, headers)
+	originOnly := Request{cachedOrigin: h.origin, headerCacheMask: headerCacheOrigin}
+	h.policy.engine.applyCORS(h.policy.snap, &originOnly, &head)
+	return head.Headers
 }
 
 // H1StreamWriter writes an HTTP/1.1 response over an encrypted (TLS)
@@ -226,12 +154,14 @@ type H1StreamWriter struct {
 	global       *GlobalLimiter
 	method       string
 	serverName   string
+	altSvc       *altSvcHeader
 	written      int64
 	maxWrite     int64
 	headersSent  bool
 	chunked      bool
 	suppressBody bool
 	closeAfter   bool
+	cors         streamCORSHead
 }
 
 // WriteHeader writes the HTTP/1.1 status line and headers, selecting chunked
@@ -242,6 +172,7 @@ func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 		return nil
 	}
 	w.headersSent = true
+	headers = w.cors.withCORS(headers)
 	w.suppressBody, _ = responseBodyDisposition(w.method, statusCode)
 	w.chunked, _ = classifyH1StreamHeaders(headers)
 	if w.suppressBody {
@@ -251,43 +182,7 @@ func (w *H1StreamWriter) WriteHeader(statusCode int, headers [][2]string, conten
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
 
-	buf = appendStatusLine(buf, statusCode)
-
-	if contentType != "" {
-		buf = append(buf, "Content-Type: "...)
-		buf = append(buf, contentType...)
-		buf = append(buf, '\r', '\n')
-	}
-	if w.chunked {
-		buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
-	}
-	hasConnection := false
-	hasServer := false
-	for i := range headers {
-		if EqualFoldASCII(headers[i][0], "connection") {
-			hasConnection = true
-		}
-		if EqualFoldASCII(headers[i][0], "server") {
-			hasServer = true
-		}
-		buf = append(buf, headers[i][0]...)
-		buf = append(buf, ':', ' ')
-		buf = append(buf, headers[i][1]...)
-		buf = append(buf, '\r', '\n')
-	}
-	if !hasConnection {
-		if w.closeAfter {
-			buf = append(buf, "Connection: close\r\n"...)
-		} else {
-			buf = append(buf, "Connection: keep-alive\r\n"...)
-		}
-	}
-	if !hasServer {
-		buf = append(buf, "Server: "...)
-		buf = append(buf, w.serverName...)
-		buf = append(buf, '\r', '\n')
-	}
-	buf = append(buf, '\r', '\n')
+	buf = appendH1StreamHead(buf, statusCode, headers, contentType, w.chunked, w.closeAfter, w.serverName, w.altSvc)
 
 	err := w.writeEncrypted(buf)
 	*bp = buf
@@ -325,13 +220,7 @@ func (w *H1StreamWriter) WriteChunk(data []byte) error {
 	}
 
 	bp := MediumBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	var sizeBuf [16]byte
-	size := appendHex(sizeBuf[:0], int64(len(data)))
-	buf = append(buf, size...)
-	buf = append(buf, '\r', '\n')
-	buf = append(buf, data...)
-	buf = append(buf, '\r', '\n')
+	buf := appendH1Chunk((*bp)[:0], data)
 
 	err := w.writeEncrypted(buf)
 	*bp = buf[:0]
@@ -372,6 +261,7 @@ type PlainH1StreamWriter struct {
 	chunked      bool
 	suppressBody bool
 	closeAfter   bool
+	cors         streamCORSHead
 }
 
 // WriteHeader writes the HTTP/1.1 status line and headers, selecting chunked
@@ -382,6 +272,7 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 		return nil
 	}
 	w.headersSent = true
+	headers = w.cors.withCORS(headers)
 	w.suppressBody, _ = responseBodyDisposition(w.method, statusCode)
 	w.chunked, _ = classifyH1StreamHeaders(headers)
 	if w.suppressBody {
@@ -391,43 +282,7 @@ func (w *PlainH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, c
 	bp := LargeBufPool.Get().(*[]byte)
 	buf := (*bp)[:0]
 
-	buf = appendStatusLine(buf, statusCode)
-
-	if contentType != "" {
-		buf = append(buf, "Content-Type: "...)
-		buf = append(buf, contentType...)
-		buf = append(buf, '\r', '\n')
-	}
-	if w.chunked {
-		buf = append(buf, "Transfer-Encoding: chunked\r\n"...)
-	}
-	hasConnection := false
-	hasServer := false
-	for i := range headers {
-		if EqualFoldASCII(headers[i][0], "connection") {
-			hasConnection = true
-		}
-		if EqualFoldASCII(headers[i][0], "server") {
-			hasServer = true
-		}
-		buf = append(buf, headers[i][0]...)
-		buf = append(buf, ':', ' ')
-		buf = append(buf, headers[i][1]...)
-		buf = append(buf, '\r', '\n')
-	}
-	if !hasConnection {
-		if w.closeAfter {
-			buf = append(buf, "Connection: close\r\n"...)
-		} else {
-			buf = append(buf, "Connection: keep-alive\r\n"...)
-		}
-	}
-	if !hasServer {
-		buf = append(buf, "Server: "...)
-		buf = append(buf, w.serverName...)
-		buf = append(buf, '\r', '\n')
-	}
-	buf = append(buf, '\r', '\n')
+	buf = appendH1StreamHead(buf, statusCode, headers, contentType, w.chunked, w.closeAfter, w.serverName, nil)
 
 	err := writeFull(w.conn, buf)
 	*bp = buf
@@ -465,13 +320,7 @@ func (w *PlainH1StreamWriter) WriteChunk(data []byte) error {
 	}
 
 	bp := MediumBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	var sizeBuf [16]byte
-	size := appendHex(sizeBuf[:0], int64(len(data)))
-	buf = append(buf, size...)
-	buf = append(buf, '\r', '\n')
-	buf = append(buf, data...)
-	buf = append(buf, '\r', '\n')
+	buf := appendH1Chunk((*bp)[:0], data)
 
 	err := writeFull(w.conn, buf)
 	*bp = buf[:0]

@@ -1,6 +1,6 @@
 module github.com/guno1928/alos-http
 
-go 1.26.4
+go 1.26.9
 
 require (
 	github.com/andybalholm/brotli v1.2.1
@@ -9,8 +9,8 @@ require (
 	github.com/guno1928/alosmap v0.0.0-20260622010136-91db0f96eeae
 	github.com/guno1928/turbo v0.0.0-20260706091412-3b318c1e1ce7
 	github.com/zeebo/xxh3 v1.1.0
-	golang.org/x/crypto v0.53.0
-	golang.org/x/sys v0.46.0
+	golang.org/x/crypto v0.58.0
+	golang.org/x/sys v0.49.0
 )
 
 require (

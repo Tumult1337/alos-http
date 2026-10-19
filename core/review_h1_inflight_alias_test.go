@@ -58,7 +58,7 @@ func TestH1InFlightRequestSurvivesReadBufPoolReuse(t *testing.T) {
 		ReadTimeout:   30 * time.Second,
 		IdleTimeout:   30 * time.Second,
 	})
-	bigBody := bytes.Repeat([]byte("x"), 8<<20)
+	bigBody := bytes.Repeat([]byte("x"), h1ProgressiveBodyThreshold)
 	s.Router.GET("/ping", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
 	s.Router.GET("/big", func(req *Request, resp *Response) { resp.Status(200).Bytes(bigBody) })
 	s.Router.GET("/slow/:id", func(req *Request, resp *Response) { resp.Status(200).String("ok") })

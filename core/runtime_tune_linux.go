@@ -1,10 +1,8 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
-	"log"
-
 	"golang.org/x/sys/unix"
 )
 
@@ -27,5 +25,5 @@ func maybeRaiseProcessFileLimit() {
 	if err := unix.Setrlimit(unix.RLIMIT_NOFILE, &next); err != nil {
 		return
 	}
-	log.Printf("[INFO] raised RLIMIT_NOFILE soft limit to %d (hard=%d)", target, lim.Max)
+	logger().Info("raised RLIMIT_NOFILE soft limit", "soft", target, "hard", lim.Max)
 }

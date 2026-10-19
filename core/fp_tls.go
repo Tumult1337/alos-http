@@ -1,16 +1,12 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
-	"crypto"
 	"crypto/cipher"
 	"crypto/ecdh"
-	"crypto/ecdsa"
-	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
@@ -18,24 +14,55 @@ import (
 	"hash"
 )
 
-var errTLS = errors.New("outbound: tls handshake failed")
+var (
+	errTLSHelloRetryRequest = errors.New("outbound: tls backend sent a HelloRetryRequest, which this client does not support")
+	errTLSDowngrade         = errors.New("outbound: tls backend negotiated TLS 1.2 with a TLS 1.3 downgrade sentinel")
+)
+
+var tlsHelloRetryRequestRandom = [32]byte{
+	0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+	0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+}
 
 const (
-	tlsRecHandshake       = 22
-	tlsRecAppData         = 23
-	tlsRecAlert           = 21
-	tlsRecChangeCipher    = 20
-	tlsHSClientHello      = 1
-	tlsHSServerHello      = 2
-	tlsHSEncryptedExts    = 8
-	tlsHSCertificate      = 11
-	tlsHSCertVerify       = 15
-	tlsHSFinished         = 20
-	suiteAES128GCMSHA256  = 0x1301
-	suiteAES256GCMSHA384  = 0x1302
-	tlsGroupX25519        = 0x001d
-	tlsMaxRecordPlaintext = 16384
+	tlsDowngradeSentinelPrefix = "DOWNGRD"
+	tlsServerHelloMinLen       = 2 + 32 + 1
+	tlsLegacyVersion12         = 0x0303
 )
+
+const (
+	hs13AwaitExtensions uint8 = iota
+	hs13AwaitCertificate
+	hs13AwaitRequestedCertificate
+	hs13AwaitCertVerify
+	hs13AwaitFinished
+	hs13FlightDone
+)
+
+type hsTransition struct {
+	from uint8
+	msg  byte
+	to   uint8
+}
+
+var tls13ServerFlight = []hsTransition{
+	{hs13AwaitExtensions, tlsHSEncryptedExts, hs13AwaitCertificate},
+	{hs13AwaitCertificate, tlsHSCertificateRequest, hs13AwaitRequestedCertificate},
+	{hs13AwaitCertificate, tlsHSCertificate, hs13AwaitCertVerify},
+	{hs13AwaitRequestedCertificate, tlsHSCertificate, hs13AwaitCertVerify},
+	{hs13AwaitCertVerify, tlsHSCertVerify, hs13AwaitFinished},
+	{hs13AwaitFinished, tlsHSFinished, hs13FlightDone},
+}
+
+func (t *tlsTransport) stepHandshake(flight []hsTransition, msg byte) error {
+	for _, tr := range flight {
+		if tr.from == t.hsStep && tr.msg == msg {
+			t.hsStep = tr.to
+			return nil
+		}
+	}
+	return errTLS
+}
 
 type tlsState int8
 
@@ -49,6 +76,7 @@ const (
 
 type tlsTransport struct {
 	state                     tlsState
+	hsStep                    uint8
 	version                   uint16
 	priv                      *ecdh.PrivateKey
 	clientRandom              [32]byte
@@ -69,6 +97,9 @@ type tlsTransport struct {
 	serverName                string
 	alpnH2                    bool
 	skipVerify                bool
+	trust                     *upstreamTrust
+	certRequested             bool
+	certRequestSchemes        []uint16
 	certs                     [][]byte
 	serverProvedKeyPossession bool
 	negALPN                   string
@@ -88,11 +119,12 @@ type aeadKey struct {
 }
 
 func newTLSTransport(ex *Exchange) transport {
-	host, _, _ := splitAuthority(ex.req.Authority, ex.req.Scheme)
+	host, _, _ := splitAuthority(ex.key.authority, "https")
 	return &tlsTransport{
-		serverName: host,
+		serverName: ex.key.trust.verifyName(host),
 		alpnH2:     ex.key.h2,
 		skipVerify: ex.key.skipVerify,
+		trust:      ex.key.trust,
 	}
 }
 
@@ -171,12 +203,15 @@ func (t *tlsTransport) feed(c *backendConn, raw []byte) error {
 					return err
 				}
 			} else if realType == tlsRecAlert {
-				return fpErrConnClosed
+				return errFPConnClosed
 			}
 			continue
 		}
 		switch ctype {
 		case tlsRecChangeCipher:
+			if t.state != tlsExpectEncrypted {
+				return errTLS
+			}
 		case tlsRecHandshake:
 			if t.state == tlsExpectServerHello {
 				if err := t.handleServerHello(body); err != nil {
@@ -186,6 +221,9 @@ func (t *tlsTransport) feed(c *backendConn, raw []byte) error {
 				return errTLS
 			}
 		case tlsRecAppData:
+			if t.state != tlsExpectEncrypted {
+				return errTLS
+			}
 			plain, err := t.openRecord(&t.serverHSKey, body)
 			if err != nil {
 				return err
@@ -216,14 +254,17 @@ func (t *tlsTransport) handleServerHello(body []byte) error {
 		return errTLS
 	}
 	msg := body[4:]
-	if len(msg) < 34 {
+	if len(msg) < tlsServerHelloMinLen {
 		return errTLS
 	}
 	copy(t.serverRandom[:], msg[2:34])
+	if t.serverRandom == tlsHelloRetryRequestRandom {
+		return errTLSHelloRetryRequest
+	}
 	p := 34
 	sidLen := int(msg[p])
 	p += 1 + sidLen
-	if p+2 > len(msg) {
+	if p+3 > len(msg) {
 		return errTLS
 	}
 	t.suite = uint16(msg[p])<<8 | uint16(msg[p+1])
@@ -268,6 +309,12 @@ func (t *tlsTransport) handleServerHello(body []byte) error {
 	}
 
 	if !is13 {
+		if uint16(msg[0])<<8|uint16(msg[1]) != tlsLegacyVersion12 {
+			return errTLS
+		}
+		if string(t.serverRandom[24:31]) == tlsDowngradeSentinelPrefix && t.serverRandom[31] <= 1 {
+			return errTLSDowngrade
+		}
 		return t.begin12()
 	}
 
@@ -325,6 +372,9 @@ func (t *tlsTransport) handleEncryptedHandshake(c *backendConn, data []byte) err
 		}
 		msg := t.inHS[:4+mlen]
 		mtype := msg[0]
+		if err := t.stepHandshake(tls13ServerFlight, mtype); err != nil {
+			return err
+		}
 		if mtype == tlsHSFinished {
 			if err := t.verifyServerFinished(msg); err != nil {
 				return err
@@ -348,6 +398,11 @@ func (t *tlsTransport) handleEncryptedHandshake(c *backendConn, data []byte) err
 		}
 		if mtype == tlsHSEncryptedExts {
 			t.parseEncryptedExtensions(msg[4:])
+		}
+		if mtype == tlsHSCertificateRequest {
+			if err := t.parseCertificateRequest13(msg[4:]); err != nil {
+				return err
+			}
 		}
 		t.transcript = append(t.transcript, msg...)
 		t.inHS = t.inHS[4+mlen:]
@@ -384,8 +439,16 @@ func (t *tlsTransport) finishHandshake(c *backendConn, serverFinished []byte) er
 	t.clientAppKey = t.makeKey(cAP)
 	t.serverAppKey = t.makeKey(sAP)
 
+	authMsgs, err := t.clientAuthMessages13()
+	if err != nil {
+		return err
+	}
+	finishedHash := thAfterFinished
+	if len(authMsgs) > 0 {
+		finishedHash = t.hashOf(t.transcript)
+	}
 	clientBaseKey := t.clientFinishedKey()
-	verifyData := t.hmacHash(clientBaseKey, thAfterFinished)
+	verifyData := t.hmacHash(clientBaseKey, finishedHash)
 	finishedMsg := make([]byte, 4+len(verifyData))
 	finishedMsg[0] = tlsHSFinished
 	finishedMsg[1] = byte(len(verifyData) >> 16)
@@ -395,11 +458,9 @@ func (t *tlsTransport) finishHandshake(c *backendConn, serverFinished []byte) er
 
 	ccs := tlsPlaintextRecord(tlsRecChangeCipher, []byte{0x01})
 	c.wbuf.write(ccs)
-	rec, err := t.sealRecord(&t.clientHSKey, tlsRecHandshake, finishedMsg)
-	if err != nil {
+	if err := t.writeHandshake13(c, append(authMsgs, finishedMsg...)); err != nil {
 		return err
 	}
-	c.wbuf.write(rec)
 	t.negALPN = "http/1.1"
 	if t.alpnNegotiatedH2 {
 		t.negALPN = "h2"
@@ -423,7 +484,7 @@ func (t *tlsTransport) verifyCerts() error {
 			pool.AddCert(inter)
 		}
 	}
-	_, err = leaf.Verify(x509.VerifyOptions{DNSName: t.serverName, Intermediates: pool})
+	_, err = leaf.Verify(x509.VerifyOptions{DNSName: t.serverName, Intermediates: pool, Roots: t.trust.roots()})
 	return err
 }
 
@@ -456,62 +517,18 @@ func (t *tlsTransport) certVerifyContent() []byte {
 	return signed
 }
 
-func verifyHandshakeSignature(pub any, scheme uint16, signed, sig []byte) error {
-	switch scheme {
-	case 0x0804, 0x0805, 0x0806:
-		key, ok := pub.(*rsa.PublicKey)
-		if !ok {
-			return errTLS
-		}
-		h, id := signatureHash(scheme)
-		h.Write(signed)
-		return rsa.VerifyPSS(key, id, h.Sum(nil), sig,
-			&rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash, Hash: id})
-	case 0x0403, 0x0503, 0x0603:
-		key, ok := pub.(*ecdsa.PublicKey)
-		if !ok {
-			return errTLS
-		}
-		h, _ := signatureHash(scheme)
-		h.Write(signed)
-		if !ecdsa.VerifyASN1(key, h.Sum(nil), sig) {
-			return errTLS
-		}
-		return nil
-	case 0x0807:
-		key, ok := pub.(ed25519.PublicKey)
-		if !ok {
-			return errTLS
-		}
-		if !ed25519.Verify(key, signed, sig) {
-			return errTLS
-		}
-		return nil
-	default:
-		return errTLS
-	}
-}
-
-func signatureHash(scheme uint16) (hash.Hash, crypto.Hash) {
-	switch scheme {
-	case 0x0805, 0x0503:
-		return sha512.New384(), crypto.SHA384
-	case 0x0806, 0x0603:
-		return sha512.New(), crypto.SHA512
-	default:
-		return sha256.New(), crypto.SHA256
-	}
-}
-
 func (t *tlsTransport) parseCertificate(body []byte) {
-	if len(body) < 1 {
+	tls13 := t.version != 0x0303
+	p := 0
+	if tls13 {
+		if len(body) < 1 {
+			return
+		}
+		p = 1 + int(body[0])
+	}
+	if p+3 > len(body) {
 		return
 	}
-	ctxLen := int(body[0])
-	if 1+ctxLen+3 > len(body) {
-		return
-	}
-	p := 1 + ctxLen
 	listLen := int(body[p])<<16 | int(body[p+1])<<8 | int(body[p+2])
 	p += 3
 	end := p + listLen
@@ -528,7 +545,7 @@ func (t *tlsTransport) parseCertificate(body []byte) {
 		copy(der, body[p:p+clen])
 		t.certs = append(t.certs, der)
 		p += clen
-		if p+2 <= end {
+		if tls13 && p+2 <= end {
 			extLen := int(body[p])<<8 | int(body[p+1])
 			p += 2 + extLen
 		}

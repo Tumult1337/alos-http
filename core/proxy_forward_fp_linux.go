@@ -1,8 +1,9 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
+	"errors"
 	"strconv"
 	"strings"
 	"sync"
@@ -55,15 +56,26 @@ func fpProxyHostHeader(req *Request, cfg *DomainConfig) string {
 }
 
 func fpProxyRequestHeaders(req *Request) [][2]string {
-	out := make([][2]string, 0, len(req.Headers)+1)
+	out := make([][2]string, 0, len(req.Headers)+forwardingHeaderCount)
+	nominated := connectionNominations(req.Headers)
 	for _, h := range req.Headers {
-		if isProxyFilteredHeaderFold(h[0]) {
+		if isProxyFilteredHeaderFold(h[0]) || isHopByHopFold(h[0]) || nominated.nominates(h[0]) {
 			continue
 		}
 		out = append(out, h)
 	}
-	if ip := extractIP(req.RemoteAddr); ip != "" {
-		out = append(out, [2]string{"X-Forwarded-For", ip})
+	return appendForwardingHeaderPairs(out, req)
+}
+
+func relayableResponseHeaders(headers [][2]string) [][2]string {
+	out := make([][2]string, 0, len(headers))
+	for _, h := range headers {
+		if isHopByHopFold(h[0]) ||
+			EqualFoldASCII(h[0], "content-length") ||
+			EqualFoldASCII(h[0], "content-type") {
+			continue
+		}
+		out = append(out, h)
 	}
 	return out
 }
@@ -94,6 +106,15 @@ func fpResponseContentLength(headers [][2]string) int64 {
 	return -1
 }
 
+func fpAttemptError(err error, wroteRequest, gotResponse bool) *proxyAttemptError {
+	return &proxyAttemptError{
+		err:          err,
+		wroteRequest: wroteRequest,
+		gotResponse:  gotResponse,
+		timeout:      errors.Is(err, errFPTimeout),
+	}
+}
+
 // forwardRequestFP is the epoll backed replacement for forwardRequest. It
 // keeps the same signature so the call site can switch between them.
 func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
@@ -106,6 +127,8 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 	cachePath := fpProxyPath(req)
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	autoCacheAllowed := cacheableMethod && proxyCacheRequestAllowed(req)
+	cache := pe.activeCache()
+	cacheGen := cache.purgeGeneration()
 
 	var (
 		status      int
@@ -119,15 +142,7 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 	sink := &UpstreamStream{
 		OnHeaders: func(code int, headers [][2]string) error {
 			status = code
-			respHeaders = make([][2]string, 0, len(headers))
-			for _, h := range headers {
-				if isHopByHopFold(h[0]) ||
-					EqualFoldASCII(h[0], "content-length") ||
-					EqualFoldASCII(h[0], "content-type") {
-					continue
-				}
-				respHeaders = append(respHeaders, [2]string{h[0], h[1]})
-			}
+			respHeaders = relayableResponseHeaders(headers)
 			contentType = fpResponseContentType(headers)
 			length := fpResponseContentLength(headers)
 			if length >= 0 && length <= fpProxyBufferLimit {
@@ -157,17 +172,22 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 		},
 	}
 
-	if _, err := client.DoStream(&UpstreamRequest{
-		Scheme:     fpProxyScheme(b),
-		Authority:  fpProxyAuthority(b.Addr),
-		Method:     req.Method,
-		Path:       fpProxyPath(req),
-		HostHeader: fpProxyHostHeader(req, cfg),
-		Headers:    fpProxyRequestHeaders(req),
-		Body:       req.Body,
-		SkipVerify: b.TLSSkipVerify,
-	}, sink); err != nil {
-		return err
+	ex, err := client.exchange(&UpstreamRequest{
+		Scheme:      fpProxyScheme(b),
+		Authority:   fpProxyAuthority(b.Addr),
+		Method:      req.Method,
+		Path:        fpProxyPath(req),
+		HostHeader:  fpProxyHostHeader(req, cfg),
+		Headers:     fpProxyRequestHeaders(req),
+		Body:        req.Body,
+		SkipVerify:  b.TLSSkipVerify,
+		trust:       b.trust,
+		DialTimeout: cfg.ConnectTimeout,
+		ReadTimeout: cfg.ReadTimeout,
+	}, sink)
+	if err != nil {
+		wrote := ex != nil && ex.wroteRequest
+		return fpAttemptError(err, wrote, status != 0)
 	}
 
 	if streaming {
@@ -188,8 +208,8 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 		copy(resp.prepareBody(len(buffered)), buffered)
 	}
 
-	if autoCacheAllowed && pe.Cache != nil && proxyCacheResponseAllowed(respHeaders) {
-		pe.Cache.Put(req.Method, host, cachePath, status, respHeaders, contentType, buffered)
+	if autoCacheAllowed && cache != nil && proxyCacheResponseAllowed(respHeaders) {
+		cache.put(req.Method, host, cachePath, status, respHeaders, contentType, buffered, cachePutOptions{generation: cacheGen})
 	}
 	return nil
 }

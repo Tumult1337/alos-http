@@ -19,6 +19,7 @@ func (w *epollWorker) initBackendLoop() {
 	w.beCfg.LoopsPerOrigin = 1
 	w.beCfg.fill(1)
 	w.be.init(w.epfd, &w.beCfg, w)
+	w.be.panicReporter = w.server
 }
 
 // backendEvent dispatches an epoll event that carries the backend class tag.
@@ -33,10 +34,10 @@ func (w *epollWorker) backendEvent(fd int, evs uint32) {
 	if evs&unix.EPOLLERR != 0 {
 		err := socketError(c.fd)
 		if err == nil {
-			err = fpErrConnClosed
+			err = errFPConnClosed
 		}
 		if c.state == connConnecting {
-			err = fpErrDialFailed
+			err = errFPDialFailed
 		}
 		w.be.closeConn(c, err)
 		return
@@ -55,6 +56,7 @@ func (w *epollWorker) backendEvent(fd int, evs uint32) {
 	}
 	if evs&unix.EPOLLOUT != 0 && c.wbuf.length() > 0 {
 		w.be.flushWrites(c)
+		w.resumeTunnelIfDrained(c)
 	}
 }
 
@@ -84,6 +86,8 @@ func (w *epollWorker) abortProxyExchange(c *epollConn) {
 	c.proxyEx = nil
 	if px.h2Stream != nil {
 		w.abortProxyStream(px)
+	} else if c.inFlight > 0 {
+		c.inFlight--
 	}
 	px.c = nil
 	if bc := c.pausedBackend; bc != nil {
@@ -97,7 +101,7 @@ func (w *epollWorker) abortProxyExchange(c *epollConn) {
 		px.b = nil
 	}
 	if bc := px.Exchange.bc; bc != nil && bc.cur == &px.Exchange {
-		w.be.closeConn(bc, fpErrClientClosed)
+		w.be.closeConn(bc, errFPClientClosed)
 		return
 	}
 	w.pxPut(px)
@@ -123,8 +127,16 @@ func (w *epollWorker) exchangeDone(ex *Exchange) {
 		w.exPut(ex)
 		return
 	}
+	if px.starting {
+		return
+	}
 	if px.b != nil {
 		px.b.ActiveConns.Add(-1)
+	}
+	if px.refusal.status != 0 {
+		px.b = nil
+		w.proxyRefuse(px, px.refusal)
+		return
 	}
 	if ex.err != nil {
 		if px.h2Stream != nil {
@@ -138,18 +150,28 @@ func (w *epollWorker) exchangeDone(ex *Exchange) {
 		w.proxyEndStream(px)
 		return
 	}
-	status, headers, hooked := w.applyResponseHook(px, ex.resp.Status, ex.resp.headers())
-	if px.pe.Cache != nil {
-		w.proxyMaybeCache(px, status, headers, ex.resp.Body, hooked)
+	body := ex.resp.Body
+	if px.h2Streamed {
+		body = px.h2Body
+	}
+	status, headers, hooked, hookOK := w.applyResponseHook(px, ex.resp.Status, ex.resp.headers())
+	if !hookOK {
+		px.b = nil
+		w.proxyRefuse(px, proxyRefusedHookFailed)
+		return
+	}
+	if px.cache != nil {
+		w.proxyMaybeCache(px, status, headers, body, hooked)
 	}
 	if px.b != nil {
+		px.ds.outlier.recordStatus(px.b, ex.resp.Status)
 		px.b = nil
 	}
 	if px.h2Stream != nil {
-		w.finishProxyStream(px, status, headers, ex.resp.Body, "")
+		w.finishProxyStream(px, status, headers, body, "")
 		return
 	}
-	w.proxyFinishClient(px, status, headers, ex.resp.Body, "")
+	w.proxyFinishClient(px, status, headers, body, "")
 }
 
 // shouldStreamResponse keeps small, known-length responses buffered so a failed
@@ -160,10 +182,8 @@ func (w *epollWorker) shouldStreamResponse(c *backendConn, contentLen int64) boo
 		return false
 	}
 	px := proxyExchangeOf(c.cur)
-	// An HTTP/2 stream is framed out of a completed response under flow
-	// control, so there is nothing to relay into incrementally.
 	if px.h2Stream != nil {
-		return false
+		return w.admitH2Response(px, contentLen)
 	}
 	// A response of unknown length has to be relayed; there is no way to know
 	// whether it would ever fit anywhere.
@@ -173,7 +193,7 @@ func (w *epollWorker) shouldStreamResponse(c *backendConn, contentLen int64) boo
 	// A cacheable response that the cache would accept is buffered so it can
 	// actually be stored. Without this a CDN silently stops caching everything
 	// above the buffering threshold, which is the opposite of what it wants.
-	if px.mayCache && contentLen <= px.pe.Cache.maxCacheableSize() {
+	if px.mayCache && contentLen <= px.cache.maxCacheableSize() {
 		return false
 	}
 	return contentLen > proxyBufferedResponseLimit
@@ -187,11 +207,21 @@ func (w *epollWorker) beginStreamResponse(c *backendConn, p *h1Parser, contentLe
 		return
 	}
 	px := proxyExchangeOf(ex)
+	if px.h2Stream != nil {
+		if r := px.refusal; r.status != 0 {
+			w.refuseResponse(c, px, r)
+		}
+		return
+	}
 	cc := px.c
 	if cc == nil || cc.generation != px.cGen || cc.fd < 0 {
 		return
 	}
-	status, headers, _ := w.applyResponseHook(px, p.status, respHeaders{raw: p.hdr})
+	status, headers, _, hookOK := w.applyResponseHook(px, p.status, respHeaders{raw: p.hdr})
+	if !hookOK {
+		w.refuseResponse(c, px, proxyRefusedHookFailed)
+		return
+	}
 
 	if !cc.tls {
 		cc.writeBuf = appendProxyStreamHead(cc.writeBuf, status, headers, contentLen, px.keepClient)
@@ -207,6 +237,7 @@ func (w *epollWorker) beginStreamResponse(c *backendConn, p *h1Parser, contentLe
 	px.headersOut = true
 	if px.b != nil {
 		px.b.ActiveConns.Add(-1)
+		px.ds.outlier.recordStatus(px.b, p.status)
 		px.b = nil
 	}
 	w.flush(cc)
@@ -220,9 +251,13 @@ func (w *epollWorker) streamResponseChunk(c *backendConn, data []byte) {
 		return
 	}
 	px := proxyExchangeOf(ex)
+	if px.h2Stream != nil {
+		w.bufferH2Chunk(c, px, data)
+		return
+	}
 	cc := px.c
 	if cc == nil || cc.generation != px.cGen || cc.fd < 0 {
-		w.be.closeConn(c, fpErrClientClosed)
+		w.be.closeConn(c, errFPClientClosed)
 		return
 	}
 	if px.streamChunked {
@@ -243,6 +278,10 @@ func (w *epollWorker) streamResponseChunk(c *backendConn, data []byte) {
 // endStreamResponse is the completion callback for a streamed response.
 func (w *epollWorker) endStreamResponse(ex *Exchange) {
 	px := proxyExchangeOf(ex)
+	if px.h2Stream != nil {
+		w.exchangeDone(ex)
+		return
+	}
 	if px.b != nil {
 		px.b.ActiveConns.Add(-1)
 		px.b = nil
@@ -277,24 +316,37 @@ func (w *epollWorker) proxyEndStream(px *proxyExchange) {
 
 // applyResponseHook lets OnResponse observe and rewrite a live upstream
 // response, which previously only ran for cache hits.
-func (w *epollWorker) applyResponseHook(px *proxyExchange, status int, headers respHeaders) (int, respHeaders, *ProxyResponse) {
-	if px.pe == nil || px.pe.OnResponse == nil {
-		return status, headers, nil
+func (w *epollWorker) applyResponseHook(px *proxyExchange, status int, headers respHeaders) (int, respHeaders, *ProxyResponse, bool) {
+	var onResponse ProxyResponseFunc
+	if px.pe != nil {
+		onResponse = px.pe.responseHook()
+	}
+	if onResponse == nil {
+		return status, headers, nil, true
 	}
 	// A hook is handed real strings and may keep or rewrite them, so its result
 	// travels onwards in string form.
-	current := w.headerStrings(headers)
-	pr := &ProxyResponse{
-		Domain:     px.ds.config.Domain,
-		Backend:    px.backendAddr(),
-		ClientAddr: px.clientAddr,
-		Method:     px.method,
-		Path:       px.path,
-		StatusCode: status,
-		Headers:    append(make([][2]string, 0, len(current)), current...),
+	hook := &proxyHookResponse{}
+	pr := &hook.ProxyResponse
+	pr.Domain = px.ds.config.Domain
+	pr.Backend = px.backendAddr()
+	pr.ClientAddr = px.clientAddr
+	pr.Method = px.method
+	pr.Path = px.path
+	pr.StatusCode = status
+	pr.Headers = append(hook.headers[:0], w.headerStrings(headers)...)
+	if !w.guardUserHook(nil, func() { onResponse(pr) }) {
+		return status, headers, nil, false
 	}
-	px.pe.OnResponse(pr)
-	return pr.StatusCode, respHeaders{str: pr.Headers}, pr
+	return pr.StatusCode, respHeaders{str: pr.Headers}, pr, true
+}
+
+func (w *epollWorker) proxyRefuse(px *proxyExchange, r proxyRefusal) {
+	if px.h2Stream != nil {
+		w.finishProxyStream(px, r.status, respHeaders{}, []byte(r.msg), "")
+		return
+	}
+	w.proxyFinishClient(px, r.status, respHeaders{}, []byte(r.msg), "text/plain; charset=utf-8")
 }
 
 func (px *proxyExchange) backendAddr() string {

@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -85,7 +87,7 @@ func TestTimeoutFastAndSlow(t *testing.T) {
 	}
 
 	slow := Timeout(150 * time.Millisecond)(func(req *Request, resp *Response) {
-		time.Sleep(600 * time.Millisecond)
+		<-req.Context().Done()
 		resp.Status(200).String("slow")
 	})
 	req2 := newTestReq()

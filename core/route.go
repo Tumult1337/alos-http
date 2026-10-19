@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import "time"
@@ -75,8 +77,10 @@ func (rt *Route) applyServerRateLimitDefaults(cfg *RateLimitMiddlewareConfig) {
 	}
 	s := rt.router.server
 	cfg.OnLimit = func(event RateLimitEvent, req *Request, resp *Response) bool {
-		if s.RateLimit != nil && s.RateLimit.OnLimit != nil {
-			return s.RateLimit.OnLimit(event, req, resp)
+		if rl := s.rateLimitEngine.Load(); rl != nil {
+			if onLimit := rl.limitHook(); onLimit != nil {
+				return onLimit(event, req, resp)
+			}
 		}
 		return false
 	}

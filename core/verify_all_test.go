@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -265,7 +267,7 @@ func TestVerify_Timeout(t *testing.T) {
 	})
 	t.Run("SlowReturns504", func(t *testing.T) {
 		h := Timeout(120 * time.Millisecond)(func(req *Request, resp *Response) {
-			time.Sleep(600 * time.Millisecond)
+			<-req.Context().Done()
 			resp.Status(200)
 		})
 		resp := newTestResp()
@@ -276,7 +278,7 @@ func TestVerify_Timeout(t *testing.T) {
 	})
 	t.Run("FiresPromptly", func(t *testing.T) {
 		h := Timeout(120 * time.Millisecond)(func(req *Request, resp *Response) {
-			time.Sleep(2 * time.Second)
+			<-req.Context().Done()
 			resp.Status(200)
 		})
 		start := time.Now()
@@ -359,17 +361,17 @@ func TestVerify_PrepareBody(t *testing.T) {
 
 func TestVerify_Compress(t *testing.T) {
 	t.Run("NegotiateGzip", func(t *testing.T) {
-		if negotiateEncoding("gzip, deflate") != encodingGzip {
+		if negotiateEncoding("gzip, deflate", offerAllEncodings) != encodingGzip {
 			t.Fatal("should pick gzip")
 		}
 	})
 	t.Run("NegotiateDeflate", func(t *testing.T) {
-		if negotiateEncoding("deflate") != encodingDeflate {
+		if negotiateEncoding("deflate", offerAllEncodings) != encodingDeflate {
 			t.Fatal("should pick deflate")
 		}
 	})
 	t.Run("NegotiateNone", func(t *testing.T) {
-		if negotiateEncoding("") != encodingNone {
+		if negotiateEncoding("", offerAllEncodings) != encodingNone {
 			t.Fatal("empty should be none")
 		}
 	})

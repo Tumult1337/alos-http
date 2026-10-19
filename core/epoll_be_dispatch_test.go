@@ -56,11 +56,8 @@ func TestWorkerBackendEventCarriesClassTag(t *testing.T) {
 
 	w := newWorkerForBackendTest(t)
 	addr := ln.Addr().(*net.TCPAddr)
-	var ip [4]byte
-	copy(ip[:], addr.IP.To4())
-
 	ex := &Exchange{req: &fpRequest{}}
-	ex.ip = ip
+	ex.ip = addr.AddrPort().Addr().Unmap()
 	ex.port = uint16(addr.Port)
 	ex.key = poolKey{authority: addr.String()}
 	ex.deadline = w.be.nowNano() + int64(5*time.Second)
@@ -138,8 +135,7 @@ func TestWorkerBackendIntraBatchFDReuseIsDropped(t *testing.T) {
 
 	w := newWorkerForBackendTest(t)
 	addr := ln.Addr().(*net.TCPAddr)
-	var ip [4]byte
-	copy(ip[:], addr.IP.To4())
+	ip := addr.AddrPort().Addr().Unmap()
 
 	newExchange := func() *Exchange {
 		ex := &Exchange{req: &fpRequest{}}
@@ -165,7 +161,7 @@ func TestWorkerBackendIntraBatchFDReuseIsDropped(t *testing.T) {
 	if firstFD < 0 {
 		t.Fatal("no backend conn registered")
 	}
-	w.be.closeConn(w.be.conns[firstFD], fpErrConnClosed)
+	w.be.closeConn(w.be.conns[firstFD], errFPConnClosed)
 
 	second := newExchange()
 	w.be.newConn(second)

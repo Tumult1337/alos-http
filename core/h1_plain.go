@@ -1,13 +1,10 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"bytes"
-	"io"
-	"log"
-	"net"
-	"sync"
-
-	"github.com/guno1928/alosmap"
+	"math/bits"
 )
 
 func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
@@ -25,7 +22,7 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 			dst = append(dst, ctPrefixOctet...)
 		default:
 			dst = append(dst, "Content-Type: "...)
-			dst = append(dst, resp.ContentType...)
+			dst = appendHeaderValueStripped(dst, resp.ContentType)
 			dst = append(dst, '\r', '\n')
 		}
 	}
@@ -93,7 +90,7 @@ func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
 var rootPrefix16 = [16]byte{'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/', '1', '.', '1', '\r', '\n'}
 var rootPrefixBytes = rootPrefix16[:]
 
-func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool) {
+func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, bool, bool) {
 	fast := s.plainRootFast.Load()
 	if fast == nil {
 		return nil, 0, false, false
@@ -101,7 +98,7 @@ func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool
 	if len(data) < len(rootPrefixBytes)+4 || !equalPrefix16(data, &rootPrefix16) {
 		return nil, 0, false, false
 	}
-	maxHeaderBytes := s.config.MaxHeaderSize
+	maxHeaderBytes := s.limits.Load().MaxHeaderSize
 	if maxHeaderBytes <= 0 {
 		maxHeaderBytes = 8192
 	}
@@ -112,13 +109,22 @@ func (s *Server) matchPlainRootFastRequest(data []byte) ([]byte, int, bool, bool
 	if !ok {
 		return nil, 0, false, false
 	}
-	if !keepAlive {
-		return fast.getClose, consumed, true, true
-	}
-	return fast.getKeepAlive, consumed, false, true
+	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true
 }
 
+const rootScalarScanMaxBytes = 96
+
 func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (consumed int, keepAlive bool, ok bool, needRead bool) {
+	if len(buf) <= rootScalarScanMaxBytes {
+		st := rootFastState{keepAlive: true}
+		if headerEnd, ok := st.scanFields(buf, lineLen); ok && st.hosts == 1 {
+			return headerEnd, st.keepAlive, true, false
+		}
+	} else if endsWithHeaderTerminator(buf, lineLen) {
+		if keepAlive, ok := rootFastHeaders(buf[lineLen : len(buf)-2]); ok {
+			return len(buf), keepAlive, true, false
+		}
+	}
 	headerEnd := findHeaderTerminatorBytes(buf, lineLen)
 	if headerEnd < 0 {
 		if len(buf) > maxHeaderBytes {
@@ -126,41 +132,163 @@ func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes int) (con
 		}
 		return 0, false, false, true
 	}
-	keepAlive = true
-	for offset := lineLen; offset < headerEnd-4; {
-		lineEnd := findCRLFBytes(buf, offset)
-		if lineEnd < 0 || lineEnd > headerEnd-2 {
-			return 0, false, false, false
-		}
-		if lineEnd == offset {
-			break
-		}
-		line := buf[offset:lineEnd]
-		if asciiHasPrefixFoldBytes(line, "connection:") {
-			value := trimASCIISpaceBytes(line[len("connection:"):])
-			if asciiEqualFoldBytes(value, "close") {
-				keepAlive = false
-			} else if asciiEqualFoldBytes(value, "keep-alive") {
-				keepAlive = true
-			}
-		} else if asciiHasPrefixFoldBytes(line, "content-length:") || asciiHasPrefixFoldBytes(line, "transfer-encoding:") {
-			return 0, false, false, false
-		}
-		offset = lineEnd + 2
+	keepAlive, ok = rootFastHeaders(buf[lineLen : headerEnd-2])
+	if !ok {
+		return 0, false, false, false
 	}
 	return headerEnd, keepAlive, true, false
 }
 
-func asciiHasPrefixFoldBytes(line []byte, prefix string) bool {
-	if len(line) < len(prefix) {
-		return false
+func endsWithHeaderTerminator(buf []byte, lineLen int) bool {
+	n := len(buf)
+	return n-2 >= lineLen && n >= 4 && string(buf[n-4:]) == "\r\n\r\n"
+}
+
+func rootFastHeaders(block []byte) (keepAlive, ok bool) {
+	st := rootFastState{keepAlive: true}
+	if !st.fields(block) || st.hosts != 1 {
+		return false, false
 	}
-	for i := 0; i < len(prefix); i++ {
-		if line[i]|0x20 != prefix[i]|0x20 {
+	return st.keepAlive, true
+}
+
+type rootFastState struct {
+	hosts     int
+	keepAlive bool
+}
+
+func (st *rootFastState) scanFields(buf []byte, i int) (headerEnd int, ok bool) {
+	for i+1 < len(buf) {
+		if buf[i] == '\r' {
+			return i + 2, buf[i+1] == '\n'
+		}
+		name, value, next, hostSafe, ok := rootFieldScalar(buf, i)
+		if !ok || !st.field(name, value, hostSafe) {
+			return 0, false
+		}
+		i = next
+	}
+	return 0, false
+}
+
+func (st *rootFastState) fields(block []byte) bool {
+	if len(block) >= h1BlockMinBytes {
+		if ok, indexed := st.indexedFields(block); indexed {
+			return ok
+		}
+	}
+	return st.lineFields(block)
+}
+
+func (st *rootFastState) indexedFields(block []byte) (ok, indexed bool) {
+	var idx h1BlockIndexOut
+	if !h1BlockIndex(block, &idx) {
+		return false, false
+	}
+	chunks := (len(block) + 63) >> 6
+	for ci := 0; ci < chunks; ci++ {
+		for c := idx.cands[ci]; c != 0; c &= c - 1 {
+			start := ci<<6 | bits.TrailingZeros64(c)
+			colon := h1NextBit(&idx.ends, start, chunks)
+			end := len(block) - 2
+			if next := h1NextBit(&idx.starts, colon, chunks); next >= 0 {
+				end = next - 2
+			}
+			if !st.field(block[start:colon], block[colon+1:end], false) {
+				return false, true
+			}
+		}
+	}
+	return true, true
+}
+
+func (st *rootFastState) lineFields(block []byte) bool {
+	for i := 0; i < len(block); {
+		var name, value []byte
+		var hostSafe, ok bool
+		if len(block)-i >= h1ScalarScanMax {
+			name, value, i, ok = rootFieldVector(block, i)
+		} else {
+			name, value, i, hostSafe, ok = rootFieldScalar(block, i)
+		}
+		if !ok || !st.field(name, value, hostSafe) {
 			return false
 		}
 	}
 	return true
+}
+
+func (st *rootFastState) field(name, value []byte, hostSafe bool) bool {
+	switch len(name) {
+	case len("host"):
+		if asciiEqualFoldBytes(name, "host") {
+			st.hosts++
+			return hostSafe || ValidateHost(UnsafeString(trimOWS(value)))
+		}
+	case len("connection"):
+		if asciiEqualFoldBytes(name, "connection") {
+			if value = trimOWS(value); !asciiEqualFoldBytes(value, "keep-alive") {
+				if closeRequested, _ := connectionOptionList(UnsafeString(value)); closeRequested {
+					st.keepAlive = false
+				}
+			}
+		}
+	case len("expect"), len("content-length"), len("transfer-encoding"):
+		return !asciiEqualFoldBytes(name, "expect") && !asciiEqualFoldBytes(name, "content-length") && !asciiEqualFoldBytes(name, "transfer-encoding")
+	}
+	return true
+}
+
+func rootFieldVector(fields []byte, i int) (name, value []byte, next int, ok bool) {
+	rest := fields[i:]
+	special, nameEnd := h1HeaderLineSpecials(rest)
+	end, bad := classifyFirstSpecial(rest, special)
+	if bad || end <= 0 || !validH1Colon(rest[:end], nameEnd) {
+		return nil, nil, 0, false
+	}
+	return rest[:nameEnd], trimOWS(rest[nameEnd+1 : end]), i + end + 2, true
+}
+
+func rootFieldScalar(fields []byte, i int) (name, value []byte, next int, hostSafe, ok bool) {
+	start := i
+	for i < len(fields) && h1FieldClass[fields[i]]&h1ClassToken != 0 {
+		i++
+	}
+	if i == start || i == len(fields) || fields[i] != ':' {
+		return nil, nil, 0, false, false
+	}
+	name = fields[start:i]
+	i++
+	for i < len(fields) && (fields[i] == ' ' || fields[i] == '\t') {
+		i++
+	}
+	valueStart := i
+	var seen uint8
+	common := ^uint8(0)
+	for i < len(fields) && fields[i] != '\r' {
+		class := h1FieldClass[fields[i]]
+		seen |= class
+		common &= class
+		i++
+	}
+	if i+1 >= len(fields) || seen&h1ClassSpecial != 0 || fields[i+1] != '\n' {
+		return nil, nil, 0, false, false
+	}
+	return name, fields[valueStart:i], i + 2, common&h1ClassHost != 0, true
+}
+
+func connectionOptions(value []byte) (closeRequested, keepAliveRequested bool) {
+	switch {
+	case asciiEqualFoldBytes(value, "keep-alive"):
+		return false, true
+	case asciiEqualFoldBytes(value, "close"):
+		return true, false
+	}
+	return connectionOptionList(UnsafeString(value))
+}
+
+func connectionOptionList(options string) (closeRequested, keepAliveRequested bool) {
+	return containsTokenFold(options, "close"), containsTokenFold(options, "keep-alive")
 }
 
 func asciiEqualFoldBytes(line []byte, value string) bool {
@@ -184,17 +312,6 @@ func findHeaderTerminatorBytes(buf []byte, start int) int {
 		return -1
 	}
 	return start + idx + 4
-}
-
-func findCRLFBytes(buf []byte, start int) int {
-	if start >= len(buf) {
-		return -1
-	}
-	idx := indexCRLF2(buf[start:])
-	if idx < 0 {
-		return -1
-	}
-	return start + idx
 }
 
 // ParseH1RequestHead parses the HTTP/1.x request line and header block in
@@ -238,6 +355,11 @@ func validH1Version(v []byte) bool {
 }
 
 func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCount int) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, badTransferEncoding bool, chunkedEncoding bool, tooLarge bool, ok bool) {
+	headerEnd, contentLength, hasContentLength, closeConn, reject, chunkedEncoding, tooLarge, ok := parseH1RequestHead(data, req, maxHeaderBytes, maxHeaderCount)
+	return headerEnd, contentLength, hasContentLength, closeConn, reject != h1RejectNone, chunkedEncoding, tooLarge, ok
+}
+
+func parseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCount int) (headerEnd int, contentLength int, hasContentLength bool, closeConn bool, reject h1RejectReason, chunkedEncoding bool, tooLarge bool, ok bool) {
 	maxBytes := maxHeaderBytes
 	if maxBytes <= 0 {
 		maxBytes = 8192
@@ -247,195 +369,230 @@ func ParseH1RequestHead(data []byte, req *Request, maxHeaderBytes, maxHeaderCoun
 		maxCount = 128
 	}
 
-	idx := indexCRLF2(data)
+	idx, bad := classifyFirstSpecial(data, firstH1Special(data))
+	if bad {
+		return 0, 0, false, false, h1RejectRequestLine, false, false, true
+	}
 	if idx < 0 {
 		if len(data) > maxBytes {
-			return 0, 0, false, false, false, false, true, false
+			return 0, 0, false, false, h1RejectNone, false, true, false
 		}
-		return 0, 0, false, false, false, false, false, false
+		return 0, 0, false, false, h1RejectNone, false, false, false
 	}
 
 	rl := data[:idx]
 	sp1 := bytes.IndexByte(rl, ' ')
 	if sp1 < 0 {
-		return 0, 0, false, false, false, false, false, false
+		return 0, 0, false, false, h1RejectRequestLine, false, false, true
 	}
 	sp2 := bytes.IndexByte(rl[sp1+1:], ' ')
-	if sp2 < 0 {
-		return 0, 0, false, false, true, false, false, true
+	if sp2 <= 0 {
+		return 0, 0, false, false, h1RejectRequestLine, false, false, true
 	}
 	sp2 += sp1 + 1
 
 	if !validH1Version(rl[sp2+1:]) {
-		return 0, 0, false, false, true, false, false, true
+		return 0, 0, false, false, h1RejectRequestLine, false, false, true
 	}
 	http10 := rl[sp2+8] == '0'
 	if http10 {
-		req.Proto = "HTTP/1.0"
+		req.Proto = internedHTTP10
 	} else {
-		req.Proto = "HTTP/1.1"
+		req.Proto = internedHTTP11
 	}
 	keepAliveRequested := false
 
 	methodBytes := rl[:sp1]
 	if !isH1Token(methodBytes) {
-		return 0, 0, false, false, true, false, false, true
+		return 0, 0, false, false, h1RejectRequestLine, false, false, true
 	}
-	switch {
-	case len(methodBytes) == 3 && methodBytes[0] == 'G' && methodBytes[1] == 'E' && methodBytes[2] == 'T':
-		req.Method = "GET"
-	case len(methodBytes) == 4 && methodBytes[0] == 'P' && methodBytes[1] == 'O' && methodBytes[2] == 'S' && methodBytes[3] == 'T':
-		req.Method = "POST"
-	case len(methodBytes) == 3 && methodBytes[0] == 'P' && methodBytes[1] == 'U' && methodBytes[2] == 'T':
-		req.Method = "PUT"
-	case len(methodBytes) == 6 && methodBytes[0] == 'D':
-		req.Method = "DELETE"
-	case len(methodBytes) == 5 && methodBytes[0] == 'P' && methodBytes[1] == 'A':
-		req.Method = "PATCH"
-	case len(methodBytes) == 4 && methodBytes[0] == 'H':
-		req.Method = "HEAD"
-	case len(methodBytes) == 7 && methodBytes[0] == 'O':
-		req.Method = "OPTIONS"
+	switch string(methodBytes) {
+	case internedGET:
+		req.Method = internedGET
+	case internedPOST:
+		req.Method = internedPOST
+	case internedPUT:
+		req.Method = internedPUT
+	case internedDELETE:
+		req.Method = internedDELETE
+	case internedPATCH:
+		req.Method = internedPATCH
+	case internedHEAD:
+		req.Method = internedHEAD
+	case internedOPTIONS:
+		req.Method = internedOPTIONS
 	default:
 		req.Method = string(methodBytes)
 	}
 
-	var rawURI string
-	if sp2 < 0 {
-		rawURI = UnsafeString(rl[sp1+1:])
-	} else {
-		rawURI = UnsafeString(rl[sp1+1 : sp2])
+	rawURI := UnsafeString(rl[sp1+1 : sp2])
+	var absoluteHost, target string
+	absoluteForm := false
+	if len(rawURI) > 0 && rawURI[0] != '/' {
+		absoluteHost, target, absoluteForm = splitAbsoluteForm(rawURI)
 	}
-	req.Path = sanitizeRequestPath(rawURI)
-	_, req.Query = splitPathQuery(rawURI)
+	if absoluteForm {
+		if absoluteHost == "" || !ValidateHost(absoluteHost) {
+			return 0, 0, false, false, h1RejectHost, false, false, true
+		}
+		rawURI = target
+	}
+	pathPart, query := splitPathQuery(rawURI)
+	req.Path = sanitizeSplitPath(pathPart)
+	req.Query = query
 	req.RawPath = rawURI
 
+	badTransferEncoding := false
+	hostCount := 0
 	for pos := idx + 2; pos < len(data); {
 		if pos > maxBytes {
-			return 0, 0, false, false, false, false, true, false
+			return 0, 0, false, false, h1RejectNone, false, true, false
 		}
 		remaining := data[pos:]
-		lineEndOff := indexCRLF2(remaining)
+		var special, nameEnd int
+		hostSafe := false
+		if len(remaining) < h1ScalarScanMax {
+			special, nameEnd, hostSafe = h1HeaderLineScalar(remaining)
+		} else {
+			special, nameEnd = h1HeaderLineSpecials(remaining)
+		}
+		lineEndOff, bad := classifyFirstSpecial(remaining, special)
+		if bad {
+			return 0, 0, false, false, h1RejectCTL, false, false, true
+		}
 		if lineEndOff < 0 {
 			if len(data) > maxBytes {
-				return 0, 0, false, false, false, false, true, false
+				return 0, 0, false, false, h1RejectNone, false, true, false
 			}
-			return 0, 0, false, false, false, false, false, false
+			return 0, 0, false, false, h1RejectNone, false, false, false
 		}
 		nl := pos + lineEndOff
 		if nl == pos {
-			if hasContentLength && chunkedEncoding {
-				badTransferEncoding = true
+			if badTransferEncoding || chunkedEncoding && (hasContentLength || http10) {
+				return 0, 0, false, false, h1RejectTransferEncoding, false, false, true
+			}
+			if hostCount > 1 || hostCount == 0 && !http10 {
+				return 0, 0, false, false, h1RejectHost, false, false, true
+			}
+			if http10 {
+				req.expect = h1ExpectNone
+			}
+			if absoluteForm {
+				req.Host = absoluteHost
+				req.cachedHost = absoluteHost
+				req.headerCacheMask |= headerCacheHost
 			}
 			if http10 && !keepAliveRequested {
 				closeConn = true
 			}
 			req.aliasesReadBuf = true
-			return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, false, true
+			return nl + 2, contentLength, hasContentLength, closeConn, h1RejectNone, chunkedEncoding, false, true
 		}
 
 		line := data[pos:nl]
-		colon := bytes.IndexByte(line, ':')
-		if colon > 0 {
-			if line[colon-1] == ' ' || line[colon-1] == '\t' || line[0] == ' ' || line[0] == '\t' {
-				return nl + 2, contentLength, hasContentLength, closeConn, true, chunkedEncoding, false, true
-			}
-			name := UnsafeString(line[:colon])
-			val := line[colon+1:]
-			if len(val) > 0 && val[0] == ' ' {
-				val = val[1:]
-			}
-			valStr := UnsafeString(val)
-			req.Headers = append(req.Headers, [2]string{name, valStr})
-			if len(req.Headers) > maxCount {
-				return nl + 2, contentLength, hasContentLength, closeConn, badTransferEncoding, chunkedEncoding, true, false
-			}
+		if !validH1Colon(line, nameEnd) {
+			return 0, 0, false, false, h1HeaderLineReject(line), false, false, true
+		}
+		colon := nameEnd
+		name := UnsafeString(line[:colon])
+		val := trimOWS(line[colon+1:])
+		valStr := UnsafeString(val)
+		req.Headers = append(req.Headers, [2]string{name, valStr})
+		if len(req.Headers) > maxCount {
+			return nl + 2, contentLength, hasContentLength, closeConn, h1RejectNone, chunkedEncoding, true, false
+		}
 
-			switch colon {
-			case 4:
-				if (name[0] == 'H' || name[0] == 'h') && EqualFoldASCII(name, "Host") {
-					req.Host = valStr
-					req.cachedHost = valStr
-					req.headerCacheMask |= headerCacheHost
+		switch colon {
+		case 4:
+			if (name[0] == 'H' || name[0] == 'h') && EqualFoldASCII(name, "Host") {
+				hostCount++
+				if !hostSafe && !ValidateHost(valStr) {
+					return 0, 0, false, false, h1RejectHost, false, false, true
 				}
-			case 6:
-				if (name[0] == 'O' || name[0] == 'o') && EqualFoldASCII(name, "Origin") {
-					req.cachedOrigin = valStr
-					req.headerCacheMask |= headerCacheOrigin
-				}
-			case 7:
-				if (name[0] == 'U' || name[0] == 'u') && EqualFoldASCII(name, "Upgrade") {
-					req.cachedUpgrade = valStr
-					req.headerCacheMask |= headerCacheUpgrade
-				}
-			case 9:
-				if (name[0] == 'X' || name[0] == 'x') && EqualFoldASCII(name, "X-Real-IP") {
-					req.cachedXRI = valStr
-					req.headerCacheMask |= headerCacheXRealIP
-				}
-			case 10:
-				if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Connection") {
-					req.cachedConn = valStr
-					req.headerCacheMask |= headerCacheConnection
-					closeConn = len(val) == 5 && asciiLower[val[0]] == 'c' && asciiLower[val[1]] == 'l' && asciiLower[val[2]] == 'o' && asciiLower[val[3]] == 's' && asciiLower[val[4]] == 'e'
-					keepAliveRequested = len(val) == 10 && asciiEqualFoldBytes(val, "keep-alive")
-				}
-			case 13:
-				if (name[0] == 'A' || name[0] == 'a') && EqualFoldASCII(name, "Authorization") {
-					req.cachedAuth = valStr
-					req.headerCacheMask |= headerCacheAuthorization
-				}
-			case 14:
-				if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Content-Length") {
-					req.cachedCL = valStr
-					req.headerCacheMask |= headerCacheContentLength
-					parsedCL, parsedOK := parseUint(valStr)
-					if hasContentLength {
-						if !parsedOK || contentLength < 0 || parsedCL != contentLength {
-							contentLength = -1
-						}
+				req.Host = valStr
+				req.cachedHost = valStr
+				req.headerCacheMask |= headerCacheHost
+			}
+		case 6:
+			if (name[0] == 'O' || name[0] == 'o') && EqualFoldASCII(name, "Origin") {
+				req.cachedOrigin = valStr
+				req.headerCacheMask |= headerCacheOrigin
+			} else if (name[0] == 'E' || name[0] == 'e') && EqualFoldASCII(name, "Expect") {
+				req.expect = classifyExpect(req.expect, val)
+			}
+		case 7:
+			if (name[0] == 'U' || name[0] == 'u') && EqualFoldASCII(name, "Upgrade") {
+				req.cachedUpgrade = valStr
+				req.headerCacheMask |= headerCacheUpgrade
+			}
+		case 9:
+			if (name[0] == 'X' || name[0] == 'x') && EqualFoldASCII(name, "X-Real-IP") {
+				req.cachedXRI = valStr
+				req.headerCacheMask |= headerCacheXRealIP
+			}
+		case 10:
+			if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Connection") {
+				req.cachedConn = valStr
+				req.headerCacheMask |= headerCacheConnection
+				closeRequested, keepAliveListed := connectionOptions(val)
+				closeConn = closeConn || closeRequested
+				keepAliveRequested = keepAliveRequested || keepAliveListed
+			}
+		case 13:
+			if (name[0] == 'A' || name[0] == 'a') && EqualFoldASCII(name, "Authorization") {
+				req.cachedAuth = valStr
+				req.headerCacheMask |= headerCacheAuthorization
+			}
+		case 14:
+			if (name[0] == 'C' || name[0] == 'c') && EqualFoldASCII(name, "Content-Length") {
+				req.cachedCL = valStr
+				req.headerCacheMask |= headerCacheContentLength
+				parsedCL, parsedOK := parseUint(valStr)
+				if hasContentLength {
+					if !parsedOK || contentLength < 0 || parsedCL != contentLength {
+						contentLength = -1
+					}
+				} else {
+					hasContentLength = true
+					if parsedOK {
+						contentLength = parsedCL
 					} else {
-						hasContentLength = true
-						if parsedOK {
-							contentLength = parsedCL
-						} else {
-							contentLength = -1
-						}
+						contentLength = -1
 					}
 				}
-			case 15:
-				if (name[0] == 'A' || name[0] == 'a') && EqualFoldASCII(name, "Accept-Encoding") {
-					req.cachedAE = valStr
-					req.headerCacheMask |= headerCacheAcceptEncoding
-				} else if (name[0] == 'X' || name[0] == 'x') && EqualFoldASCII(name, "X-Forwarded-For") {
-					req.cachedXFF = valStr
-					req.headerCacheMask |= headerCacheXForwardedFor
+			}
+		case 15:
+			if (name[0] == 'A' || name[0] == 'a') && EqualFoldASCII(name, "Accept-Encoding") {
+				req.cachedAE = valStr
+				req.headerCacheMask |= headerCacheAcceptEncoding
+			} else if (name[0] == 'X' || name[0] == 'x') && EqualFoldASCII(name, "X-Forwarded-For") {
+				req.cachedXFF = valStr
+				req.headerCacheMask |= headerCacheXForwardedFor
+			}
+		case 17:
+			if (name[0] == 'T' || name[0] == 't') && EqualFoldASCII(name, "Transfer-Encoding") {
+				req.cachedTE = valStr
+				req.headerCacheMask |= headerCacheTransferEncoding
+				if EqualFoldASCII(valStr, "chunked") {
+					chunkedEncoding = true
+				} else {
+					badTransferEncoding = true
 				}
-			case 17:
-				if (name[0] == 'T' || name[0] == 't') && EqualFoldASCII(name, "Transfer-Encoding") {
-					req.cachedTE = valStr
-					req.headerCacheMask |= headerCacheTransferEncoding
-					if EqualFoldASCII(valStr, "chunked") {
-						chunkedEncoding = true
-					} else if valStr != "" {
-						badTransferEncoding = true
-					}
-				} else if (name[0] == 'S' || name[0] == 's') && EqualFoldASCII(name, "Sec-WebSocket-Key") {
-					req.cachedWSKey = valStr
-					req.headerCacheMask |= headerCacheWSKey
-				}
-			case 21:
-				if (name[0] == 'S' || name[0] == 's') && EqualFoldASCII(name, "Sec-WebSocket-Version") {
-					req.cachedWSVer = valStr
-					req.headerCacheMask |= headerCacheWSVersion
-				}
+			} else if (name[0] == 'S' || name[0] == 's') && EqualFoldASCII(name, "Sec-WebSocket-Key") {
+				req.cachedWSKey = valStr
+				req.headerCacheMask |= headerCacheWSKey
+			}
+		case 21:
+			if (name[0] == 'S' || name[0] == 's') && EqualFoldASCII(name, "Sec-WebSocket-Version") {
+				req.cachedWSVer = valStr
+				req.headerCacheMask |= headerCacheWSVersion
 			}
 		}
 
 		pos = nl + 2
 	}
 
-	return 0, 0, false, false, false, false, false, false
+	return 0, 0, false, false, h1RejectNone, false, false, false
 }
 
 func appendPlainResponse(resp *Response, dst []byte) []byte {
@@ -448,122 +605,4 @@ func appendPlainResponseClose(resp *Response, dst []byte) []byte {
 
 func appendPlainResponseHeaders(resp *Response, dst []byte) []byte {
 	return appendPlainResponseMode(resp, dst, true, false)
-}
-
-// ServeH2Plain serves an HTTP/2 connection over conn without TLS, running the
-// H2Conn read and write loops until the connection closes.
-func (s *Server) ServeH2Plain(conn net.Conn) {
-	if !s.http2Enabled() {
-		_ = conn.Close()
-		return
-	}
-	hc := &H2Conn{
-		remoteAddr:        conn.RemoteAddr().String(),
-		conn:              conn,
-		plain:             true,
-		hdrBuf:            make([]byte, 5),
-		server:            s,
-		decoder:           newHpackDecoder(s.h2HeaderTableSize()),
-		initialWindowSize: H2DefaultWindowSize,
-		streams:           alosmap.NewTypedSized[int64, *H2Stream](256, 0).Prealloc(256),
-		writeCh:           make(chan WriteRequest, 512),
-		done:              make(chan struct{}),
-		decryptBuf:        make([]byte, 0, MaxRecordSize),
-		appBuf:            make([]byte, 0, MaxRecordSize*2),
-		headerAccum:       make([]byte, 0, 4096),
-	}
-	hc.connWindow.Store(int64(H2DefaultWindowSize))
-	hc.maxFrameSize.Store(H2DefaultMaxFrameSize)
-	hc.recvConnWindow.Store(int64(H2ConnectionWindowSize))
-	hc.flowCond = sync.NewCond(&hc.flowMu)
-
-	go hc.writerLoop()
-
-	defer func() {
-		close(hc.done)
-		hc.flowCond.Broadcast()
-		hc.dispatchWg.Wait()
-		close(hc.writeCh)
-	}()
-
-	if !hc.readAndValidatePreface() {
-		return
-	}
-
-	hc.sendInitialSettingsAndWindowUpdate()
-	hc.serveLoop()
-}
-
-func (hc *H2Conn) readAppDataPlain() error {
-	bp := RecordBufPool.Get().(*[]byte)
-	buf := (*bp)[:cap(*bp)]
-	n, err := hc.conn.Read(buf)
-	if n > 0 {
-		hc.appBuf = append(hc.appBuf, buf[:n]...)
-		hc.appBufValid = len(hc.appBuf)
-	}
-	*bp = buf[:0]
-	RecordBufPool.Put(bp)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (hc *H2Conn) readAndValidatePrefacePlain() bool {
-	var preface [H2PrefaceLen]byte
-	if _, err := io.ReadFull(hc.conn, preface[:]); err != nil {
-		return false
-	}
-	for i := 0; i < H2PrefaceLen; i++ {
-		if preface[i] != H2ClientPreface[i] {
-			return false
-		}
-	}
-	Dbg("[H2-plain] client preface validated")
-	return true
-}
-
-func (hc *H2Conn) writerLoopPlain() {
-	defer func() {
-		if r := recover(); r != nil {
-			log.Printf("[H2] writer panic: %v", r)
-			hc.conn.Close()
-		}
-	}()
-	var batch [writeRequestBatchSize]WriteRequest
-	batchBuf := make([]byte, 0, 16384)
-	for req := range hc.writeCh {
-		batch[0] = req
-		n := 1
-
-	drain:
-		for n < len(batch) {
-			select {
-			case next, ok := <-hc.writeCh:
-				if !ok {
-					break drain
-				}
-				batch[n] = next
-				n++
-			default:
-				break drain
-			}
-		}
-
-		if n == 1 {
-			err := writeFull(hc.conn, req.Data)
-			if req.Done != nil {
-				req.Done <- err
-			}
-		} else {
-			batchBuf = appendWriteBatch(batchBuf, batch, n)
-			err := writeFull(hc.conn, batchBuf)
-			for i := 0; i < n; i++ {
-				if batch[i].Done != nil {
-					batch[i].Done <- err
-				}
-			}
-		}
-	}
 }

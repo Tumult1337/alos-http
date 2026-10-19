@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -8,6 +8,7 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"hash"
+	"net"
 )
 
 func (t *tlsTransport) hashOf(data []byte) []byte {
@@ -74,11 +75,24 @@ func (t *tlsTransport) clientHSSecret() []byte {
 	return t.savedClientHS
 }
 
-func (t *tlsTransport) keyLen() int {
-	if t.suite == suiteAES256GCMSHA384 {
-		return 32
+const (
+	aes128KeyLen = 16
+	aes256KeyLen = 32
+)
+
+func suiteUsesAES256(suite uint16) bool {
+	switch suite {
+	case suiteAES256GCMSHA384, suite12RSAAES256, suite12ECDSAES256:
+		return true
 	}
-	return 16
+	return false
+}
+
+func (t *tlsTransport) keyLen() int {
+	if suiteUsesAES256(t.suite) {
+		return aes256KeyLen
+	}
+	return aes128KeyLen
 }
 
 func (t *tlsTransport) makeKey(secret []byte) aeadKey {
@@ -127,7 +141,7 @@ func (t *tlsTransport) sealRecord(k *aeadKey, contentType byte, plain []byte) ([
 }
 
 func (t *tlsTransport) openRecord(k *aeadKey, body []byte) ([]byte, error) {
-	if len(body) < 16 {
+	if len(body) < 16 || k.aead == nil {
 		return nil, errTLS
 	}
 	aad := make([]byte, 5)
@@ -197,21 +211,22 @@ func (t *tlsTransport) buildClientHello(pub []byte) []byte {
 func (t *tlsTransport) buildExtensions(pub []byte) []byte {
 	var e []byte
 
-	sni := []byte(t.serverName)
-	sniData := make([]byte, 0, len(sni)+5)
-	nameLen := len(sni)
-	listLen := nameLen + 3
-	sniData = append(sniData, byte(listLen>>8), byte(listLen))
-	sniData = append(sniData, 0x00)
-	sniData = append(sniData, byte(nameLen>>8), byte(nameLen))
-	sniData = append(sniData, sni...)
-	e = appendExt(e, 0x0000, sniData)
+	if sniHostName(t.serverName) {
+		nameLen := len(t.serverName)
+		listLen := nameLen + 3
+		sniData := make([]byte, 0, nameLen+5)
+		sniData = append(sniData, byte(listLen>>8), byte(listLen))
+		sniData = append(sniData, 0x00)
+		sniData = append(sniData, byte(nameLen>>8), byte(nameLen))
+		sniData = append(sniData, t.serverName...)
+		e = appendExt(e, 0x0000, sniData)
+	}
 
 	e = appendExt(e, 0x000b, []byte{0x01, 0x00})
 
 	e = appendExt(e, 0x000a, []byte{0x00, 0x02, 0x00, 0x1d})
 
-	sigAlgs := []byte{0x00, 0x0a, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05}
+	sigAlgs := []byte{0x00, 0x14, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x06, 0x03, 0x08, 0x07}
 	e = appendExt(e, 0x000d, sigAlgs)
 
 	e = appendExt(e, 0x002b, []byte{0x04, 0x03, 0x04, 0x03, 0x03})
@@ -284,3 +299,7 @@ func (t *tlsTransport) parseEncryptedExtensions(body []byte) {
 }
 
 var _ hash.Hash
+
+func sniHostName(name string) bool {
+	return name != "" && name[0] != '[' && net.ParseIP(name) == nil
+}

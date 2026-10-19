@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import "sync/atomic"
@@ -29,10 +31,14 @@ type H2Stream struct {
 	Headers       [][2]string
 	Body          []byte
 	bodyOwner     *Server
+	bodyConn      *atomic.Int64
 	bodyAccounted int64
 
 	headerBuf []byte
 	endStream bool
+	Trailers  [][2]string
+
+	declaredLen int64
 
 	req             Request
 	resp            Response
@@ -40,14 +46,23 @@ type H2Stream struct {
 	respOff         int
 	respHeadersSent bool
 	stallBytes      int
+	dispatchGen     uint32
+	wsTunnel        bool
+	abandoned       bool
+	abandonCounted  bool
+
+	cancel   cancelSlot
+	busyPrev *H2Stream
+	busyNext *H2Stream
 }
 
 // Reset clears an H2Stream so it can be reused from a pool.
 func (s *H2Stream) Reset() {
 	if s.bodyOwner != nil && s.bodyAccounted > 0 {
-		s.bodyOwner.releaseBodyBytes(s.bodyAccounted)
+		s.bodyOwner.releaseConnBodyBytes(s.bodyConn, s.bodyAccounted)
 	}
 	s.bodyOwner = nil
+	s.bodyConn = nil
 	s.bodyAccounted = 0
 	s.ID = 0
 	s.State.Store(StreamIdle)
@@ -68,7 +83,13 @@ func (s *H2Stream) Reset() {
 	s.Body = shrinkBuffer(s.Body, 4096)
 	s.headerBuf = shrinkBuffer(s.headerBuf, 4096)
 	s.endStream = false
+	s.Trailers = nil
+	s.declaredLen = -1
 	s.respOff = 0
 	s.respHeadersSent = false
 	s.stallBytes = 0
+	s.dispatchGen = 0
+	s.wsTunnel = false
+	s.abandoned = false
+	s.abandonCounted = false
 }

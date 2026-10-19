@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -71,18 +71,27 @@ func (e *hpackEncoder) field(name, value string) {
 }
 
 type fpHpackDynEntry struct {
-	name  string
-	value string
+	name     string
+	value    string
+	nameBad  bool
+	valueBad bool
 }
+
+const (
+	fpHpackEntryOverhead = 32
+	fpHuffMaxCodeBits    = 30
+)
 
 type hpackDecoder struct {
-	dyn     []fpHpackDynEntry
-	size    int
-	maxSize int
+	dyn         []fpHpackDynEntry
+	size        int
+	maxSize     int
+	maxListSize int
 }
 
-func (d *hpackDecoder) init(maxSize int) {
+func (d *hpackDecoder) init(maxSize, maxListSize int) {
 	d.maxSize = maxSize
+	d.maxListSize = maxListSize
 	d.dyn = d.dyn[:0]
 	d.size = 0
 }
@@ -100,104 +109,126 @@ func (d *hpackDecoder) evict() {
 	}
 }
 
-func (d *hpackDecoder) add(name, value string) {
+func (d *hpackDecoder) add(name, value string, nameBad, valueBad bool) {
 	entrySize := len(name) + len(value) + 32
 	d.size += entrySize
 	d.dyn = append(d.dyn, fpHpackDynEntry{})
 	copy(d.dyn[1:], d.dyn[:len(d.dyn)-1])
-	d.dyn[0] = fpHpackDynEntry{name: name, value: value}
+	d.dyn[0] = fpHpackDynEntry{name: name, value: value, nameBad: nameBad, valueBad: valueBad}
 	d.evict()
 }
 
-func (d *hpackDecoder) lookup(idx int) (string, string, bool) {
+func (d *hpackDecoder) lookup(idx int) (name, value string, nameBad, valueBad, ok bool) {
 	if idx >= 1 && idx <= 61 {
-		return hpackStatic[idx][0], hpackStatic[idx][1], true
+		return hpackStatic[idx][0], hpackStatic[idx][1], false, false, true
 	}
 	di := idx - 62
 	if di >= 0 && di < len(d.dyn) {
-		return d.dyn[di].name, d.dyn[di].value, true
+		e := &d.dyn[di]
+		return e.name, e.value, e.nameBad, e.valueBad, true
 	}
-	return "", "", false
+	return "", "", false, false, false
 }
 
-func (d *hpackDecoder) decode(block []byte, out [][2]string) ([][2]string, error) {
+func (d *hpackDecoder) appendField(out [][2]string, listSize *int, name, value string) ([][2]string, error) {
+	*listSize += len(name) + len(value) + fpHpackEntryOverhead
+	if *listSize > d.maxListSize {
+		return out, errFPHeaderTooLarge
+	}
+	return append(out, [2]string{name, value}), nil
+}
+
+func (d *hpackDecoder) decode(block []byte, out [][2]string) ([][2]string, bool, error) {
 	pos := 0
+	listSize := 0
+	malformed := false
 	for pos < len(block) {
 		b := block[pos]
 		switch {
 		case b&0x80 != 0:
 			idx, n, err := hpackReadInt(block[pos:], 7)
 			if err != nil {
-				return out, err
+				return out, malformed, err
 			}
 			pos += n
-			name, value, ok := d.lookup(idx)
+			name, value, nameBad, valueBad, ok := d.lookup(idx)
 			if !ok {
-				return out, fpErrBadResponse
+				return out, malformed, errFPBadResponse
 			}
-			out = append(out, [2]string{name, value})
+			malformed = malformed || nameBad || valueBad
+			if out, err = d.appendField(out, &listSize, name, value); err != nil {
+				return out, malformed, err
+			}
 		case b&0x40 != 0:
-			name, value, np, err := d.readNameValue(block[pos:], 6)
+			name, value, nameBad, valueBad, np, err := d.readNameValue(block[pos:], 6)
 			if err != nil {
-				return out, err
+				return out, malformed, err
 			}
 			pos += np
-			d.add(name, value)
-			out = append(out, [2]string{name, value})
+			d.add(name, value, nameBad, valueBad)
+			malformed = malformed || nameBad || valueBad
+			if out, err = d.appendField(out, &listSize, name, value); err != nil {
+				return out, malformed, err
+			}
 		case b&0x20 != 0:
 			newMax, n, err := hpackReadInt(block[pos:], 5)
 			if err != nil {
-				return out, err
+				return out, malformed, err
 			}
 			pos += n
 			if newMax > d.maxSize {
-				return out, fpErrBadResponse
+				return out, malformed, errFPBadResponse
 			}
 			d.setMaxSize(newMax)
 		default:
-			name, value, np, err := d.readNameValue(block[pos:], 4)
+			name, value, nameBad, valueBad, np, err := d.readNameValue(block[pos:], 4)
 			if err != nil {
-				return out, err
+				return out, malformed, err
 			}
 			pos += np
-			out = append(out, [2]string{name, value})
+			malformed = malformed || nameBad || valueBad
+			if out, err = d.appendField(out, &listSize, name, value); err != nil {
+				return out, malformed, err
+			}
 		}
 	}
-	return out, nil
+	return out, malformed, nil
 }
 
-func (d *hpackDecoder) readNameValue(block []byte, prefixBits uint8) (string, string, int, error) {
+func (d *hpackDecoder) readNameValue(block []byte, prefixBits uint8) (name, value string, nameBad, valueBad bool, consumed int, err error) {
 	idx, n, err := hpackReadInt(block, prefixBits)
 	if err != nil {
-		return "", "", 0, err
+		return "", "", false, false, 0, err
 	}
 	pos := n
-	var name string
 	if idx == 0 {
 		s, ns, err := hpackReadString(block[pos:])
 		if err != nil {
-			return "", "", 0, err
+			return "", "", false, false, 0, err
 		}
 		name = s
 		pos += ns
+		nameBad = !isValidH2FieldName(name)
 	} else {
-		nm, _, ok := d.lookup(idx)
+		nm, _, nb, _, ok := d.lookup(idx)
 		if !ok {
-			return "", "", 0, fpErrBadResponse
+			return "", "", false, false, 0, errFPBadResponse
 		}
 		name = nm
+		nameBad = nb
 	}
 	value, vs, err := hpackReadString(block[pos:])
 	if err != nil {
-		return "", "", 0, err
+		return "", "", false, false, 0, err
 	}
+	valueBad = !isValidH2FieldValue(value)
 	pos += vs
-	return name, value, pos, nil
+	return name, value, nameBad, valueBad, pos, nil
 }
 
 func hpackReadInt(b []byte, prefixBits uint8) (int, int, error) {
 	if len(b) == 0 {
-		return 0, 0, fpErrBadResponse
+		return 0, 0, errFPBadResponse
 	}
 	maxFirst := (1 << prefixBits) - 1
 	val := int(b[0]) & maxFirst
@@ -208,7 +239,7 @@ func hpackReadInt(b []byte, prefixBits uint8) (int, int, error) {
 	m := 0
 	for {
 		if pos >= len(b) {
-			return 0, 0, fpErrBadResponse
+			return 0, 0, errFPBadResponse
 		}
 		c := b[pos]
 		pos++
@@ -218,7 +249,7 @@ func hpackReadInt(b []byte, prefixBits uint8) (int, int, error) {
 		}
 		m += 7
 		if m > 28 {
-			return 0, 0, fpErrBadResponse
+			return 0, 0, errFPBadResponse
 		}
 	}
 	return val, pos, nil
@@ -226,7 +257,7 @@ func hpackReadInt(b []byte, prefixBits uint8) (int, int, error) {
 
 func hpackReadString(b []byte) (string, int, error) {
 	if len(b) == 0 {
-		return "", 0, fpErrBadResponse
+		return "", 0, errFPBadResponse
 	}
 	huffman := b[0]&0x80 != 0
 	length, n, err := hpackReadInt(b, 7)
@@ -234,7 +265,7 @@ func hpackReadString(b []byte) (string, int, error) {
 		return "", 0, err
 	}
 	if n+length > len(b) {
-		return "", 0, fpErrBadResponse
+		return "", 0, errFPBadResponse
 	}
 	raw := b[n : n+length]
 	if !huffman {
@@ -263,14 +294,17 @@ func fpHpackHuffmanDecode(data []byte) (string, error) {
 			nbits -= used
 			acc &= (1 << nbits) - 1
 		}
+		if nbits >= fpHuffMaxCodeBits {
+			return "", errFPBadResponse
+		}
 	}
 	if nbits > 7 {
-		return "", fpErrBadResponse
+		return "", errFPBadResponse
 	}
 	if nbits > 0 {
 		mask := uint64((1 << nbits) - 1)
 		if acc&mask != mask {
-			return "", fpErrBadResponse
+			return "", errFPBadResponse
 		}
 	}
 	return string(out), nil

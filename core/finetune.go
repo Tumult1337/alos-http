@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -5,12 +7,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
 	"os/exec"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -152,7 +152,7 @@ func DefaultFineTuneOptions() FineTuneOptions {
 			{Name: "5000 connections / 50 threads", Connections: 5000, Threads: 50, Duration: 6 * time.Second},
 			{Name: "8000 connections / 50 threads", Connections: 8000, Threads: 50, Duration: 6 * time.Second},
 		},
-		AutoInstallWrk: true,
+		AutoInstallWrk: false,
 		StartupTimeout: 10 * time.Second,
 		RequestTimeout: 500 * time.Millisecond,
 		BindHost:       "127.0.0.1",
@@ -173,9 +173,6 @@ func (s *Server) FineTune() error {
 func (s *Server) FineTuneWithOptions(options FineTuneOptions) (*FineTuneReport, error) {
 	if s == nil {
 		return nil, errors.New("nil server")
-	}
-	if runtime.GOOS != "linux" || runtime.GOARCH != "amd64" {
-		return nil, fmt.Errorf("finetuner requires linux amd64, got %s/%s", runtime.GOOS, runtime.GOARCH)
 	}
 	if serverDoneClosed(s.done) || len(s.listeners) > 0 {
 		return nil, errors.New("finetuner must run before the server starts")
@@ -215,7 +212,7 @@ func (s *Server) FineTuneWithOptions(options FineTuneOptions) (*FineTuneReport, 
 	for _, listeners := range options.ListenerCandidates {
 		for _, workers := range options.WorkerCandidates {
 			for _, scenario := range options.Scenarios {
-				log.Printf("[FINETUNE] scenario=%q workers=%d listeners=%d accept_shards=%d duration=%s", scenario.Name, workers, listeners, minInt(workers, listeners), formatWrkDuration(scenario.Duration))
+				s.logger().Info("finetune scenario", "scenario", scenario.Name, "workers", workers, "listeners", listeners, "accept_shards", minInt(workers, listeners), "duration", formatWrkDuration(scenario.Duration))
 				result, runErr := s.runFineTuneScenario(wrkPath, workers, listeners, scenario, options)
 				if runErr != nil {
 					return nil, fmt.Errorf("finetune failed for scenario=%q workers=%d listeners=%d accept_shards=%d: %w", scenario.Name, workers, listeners, minInt(workers, listeners), runErr)
@@ -231,7 +228,7 @@ func (s *Server) FineTuneWithOptions(options FineTuneOptions) (*FineTuneReport, 
 	s.config.WorkerCount = report.BestWorkerCount
 	s.config.Listeners = report.BestListenerCount
 
-	log.Print(report.String())
+	s.logger().Info("finetune report\n" + report.String())
 	return report, nil
 }
 
@@ -277,14 +274,14 @@ func (s *Server) runFineTuneScenario(wrkPath string, workers int, listeners int,
 		return FineTuneResult{}, errors.New("failed to start benchmark server")
 	}
 
-	log.Printf("[FINETUNE] wrk start scenario=%q workers=%d listeners=%d threads=%d connections=%d duration=%s url=%s",
-		scenario.Name,
-		workers,
-		listeners,
-		scenario.Threads,
-		scenario.Connections,
-		formatWrkDuration(scenario.Duration),
-		url,
+	s.logger().Info("finetune wrk start",
+		"scenario", scenario.Name,
+		"workers", workers,
+		"listeners", listeners,
+		"threads", scenario.Threads,
+		"connections", scenario.Connections,
+		"duration", formatWrkDuration(scenario.Duration),
+		"url", url,
 	)
 	output, runErr := runWrkScenario(wrkPath, url, scenario)
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -310,15 +307,15 @@ func (s *Server) runFineTuneScenario(wrkPath string, workers int, listeners int,
 	parsed.Listeners = listeners
 	parsed.AcceptShards = minInt(workers, listeners)
 	parsed.RawOutput = output
-	log.Printf("[FINETUNE] wrk result scenario=%q workers=%d listeners=%d accept_shards=%d req/s=%.2f latency=%s max_latency=%s transfer=%s",
-		parsed.Scenario.Name,
-		parsed.Workers,
-		parsed.Listeners,
-		parsed.AcceptShards,
-		parsed.RequestsPerSec,
-		parsed.Latency,
-		parsed.MaxLatency,
-		parsed.TransferPerSec,
+	s.logger().Info("finetune wrk result",
+		"scenario", parsed.Scenario.Name,
+		"workers", parsed.Workers,
+		"listeners", parsed.Listeners,
+		"accept_shards", parsed.AcceptShards,
+		"requests_per_sec", parsed.RequestsPerSec,
+		"latency", parsed.Latency,
+		"max_latency", parsed.MaxLatency,
+		"transfer", parsed.TransferPerSec,
 	)
 	return parsed, nil
 }
@@ -518,12 +515,14 @@ func formatWrkDuration(duration time.Duration) string {
 	return strconv.Itoa(seconds) + "s"
 }
 
+var errWrkNotInstalled = errors.New("wrk not found in PATH: install it with the system package manager (for example apt-get install wrk) or set FineTuneOptions.AutoInstallWrk to let FineTune run the package manager")
+
 func ensureWrkAvailable(autoInstall bool) (string, bool, error) {
 	if wrkPath, err := exec.LookPath("wrk"); err == nil {
 		return wrkPath, false, nil
 	}
 	if !autoInstall {
-		return "", false, errors.New("wrk not found in PATH")
+		return "", false, errWrkNotInstalled
 	}
 	attempted, installErr := tryInstallWrk()
 	if wrkPath, err := exec.LookPath("wrk"); err == nil {
@@ -572,25 +571,13 @@ type wrkInstallCommand struct {
 }
 
 func wrkInstallCommands() []wrkInstallCommand {
-	switch runtime.GOOS {
-	case "linux":
-		return []wrkInstallCommand{
-			{binary: "apt-get", args: []string{"update"}, label: "apt-get update"},
-			{binary: "apt-get", args: []string{"install", "-y", "wrk"}, label: "apt-get install wrk"},
-			{binary: "dnf", args: []string{"install", "-y", "wrk"}, label: "dnf install wrk"},
-			{binary: "yum", args: []string{"install", "-y", "wrk"}, label: "yum install wrk"},
-			{binary: "apk", args: []string{"add", "--no-cache", "wrk"}, label: "apk add wrk"},
-			{binary: "pacman", args: []string{"-Sy", "--noconfirm", "wrk"}, label: "pacman install wrk"},
-		}
-	case "darwin":
-		return []wrkInstallCommand{{binary: "brew", args: []string{"install", "wrk"}, label: "brew install wrk"}}
-	case "windows":
-		return []wrkInstallCommand{
-			{binary: "choco", args: []string{"install", "wrk", "-y"}, label: "choco install wrk"},
-			{binary: "scoop", args: []string{"install", "wrk"}, label: "scoop install wrk"},
-		}
-	default:
-		return nil
+	return []wrkInstallCommand{
+		{binary: "apt-get", args: []string{"update"}, label: "apt-get update"},
+		{binary: "apt-get", args: []string{"install", "-y", "wrk"}, label: "apt-get install wrk"},
+		{binary: "dnf", args: []string{"install", "-y", "wrk"}, label: "dnf install wrk"},
+		{binary: "yum", args: []string{"install", "-y", "wrk"}, label: "yum install wrk"},
+		{binary: "apk", args: []string{"add", "--no-cache", "wrk"}, label: "apk add wrk"},
+		{binary: "pacman", args: []string{"-Sy", "--noconfirm", "wrk"}, label: "pacman install wrk"},
 	}
 }
 

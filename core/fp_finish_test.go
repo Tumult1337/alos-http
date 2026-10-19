@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -44,7 +44,7 @@ func TestFinishIsIdempotent(t *testing.T) {
 	l.finish(ex, nil)
 	free := l.exFree
 
-	l.finish(ex, fpErrConnClosed)
+	l.finish(ex, errFPConnClosed)
 	if l.exFree != free {
 		t.Fatal("a second finish re-queued the exchange, so it would be delivered twice")
 	}

@@ -25,6 +25,7 @@ const (
 const (
 	proxyStartServed  = iota // a complete response is already in the write buffer
 	proxyStartPending        // an exchange is in flight; the connection must wait
+	proxyStartDispatch
 )
 
 type proxyExchange struct {
@@ -44,6 +45,10 @@ type proxyExchange struct {
 	method     string
 	path       string
 	clientAddr string
+	cacheHost  string
+	cacheKey   string
+	cacheGen   uint64
+	cache      *ProxyCache
 
 	// When h2Stream is set the response is delivered through the HTTP/2 framing
 	// path rather than written into the client's byte stream.
@@ -59,7 +64,16 @@ type proxyExchange struct {
 	headersOut    bool
 	streaming     bool
 	streamChunked bool
+	starting      bool
 	reqRaw        []byte
+
+	h2Body     []byte
+	h2Reserved int64
+	h2Expected int64
+	refusal    proxyRefusal
+	h2Streamed bool
+
+	admission proxyAdmission
 
 	next *proxyExchange
 }
@@ -78,10 +92,12 @@ func (w *epollWorker) pxGet() *proxyExchange {
 		req := px.req
 		reqRaw := px.reqRaw[:0]
 		tried := px.tried[:0]
+		h2Body := px.h2Body[:0]
 		*px = proxyExchange{}
 		px.req = req
 		px.reqRaw = reqRaw
 		px.tried = tried
+		px.h2Body = h2Body
 		return px
 	}
 	px = &proxyExchange{}
@@ -90,14 +106,21 @@ func (w *epollWorker) pxGet() *proxyExchange {
 }
 
 func (w *epollWorker) pxPut(px *proxyExchange) {
+	px.discardH2Buffer()
+	px.admission.release(w.server)
 	req := px.req
 	*req = fpRequest{}
 	reqRaw := px.reqRaw[:0]
 	tried := px.tried[:0]
+	h2Body := px.h2Body[:0]
+	if cap(h2Body) > proxyH2BodyKeep {
+		h2Body = nil
+	}
 	*px = proxyExchange{}
 	px.req = req
 	px.reqRaw = reqRaw
 	px.tried = tried
+	px.h2Body = h2Body
 	px.next = w.pxFree
 	w.pxFree = px
 }
@@ -157,38 +180,34 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 	host := stripPort(req.Host)
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	reqCacheOK := false
+	cachePath := ""
 
-	if pe.Cache != nil && cacheableMethod {
+	admission, outcome := w.admitProxyRequest(req, &c.resp)
+	if outcome != proxyAdmitted {
+		return outcome.startResult()
+	}
+	if pe.hasHooks() {
+		promoteRequestStrings(req)
+	}
+
+	cache := pe.activeCache()
+	if cache != nil && cacheableMethod {
 		reqCacheOK = proxyCacheRequestAllowed(req)
-		cachePath := req.Path
-		if req.Query != "" {
-			cachePath = req.Path + "?" + req.Query
-		}
-		if entry, hit := pe.Cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			pe.Cache.ServeCached(entry, req, &c.resp)
-			if pe.OnResponse != nil {
-				pr := &ProxyResponse{
-					Domain:     ds.config.Domain,
-					Backend:    "cache",
-					ClientAddr: req.RemoteAddr,
-					Method:     req.Method,
-					Path:       req.Path,
-					StatusCode: entry.statusCode,
-					Headers:    c.resp.Headers,
-				}
-				pe.OnResponse(pr)
-				c.resp.Status(pr.StatusCode)
-				c.resp.Headers = pr.Headers
-			}
+		cachePath = proxyRequestTarget(req)
+		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
+			admission.release(w.server)
+			w.serveProxyCacheHit(pe, ds, cache, entry, req, &c.resp)
 			return proxyStartServed
 		}
 	}
 
 	if len(ds.backends) == 0 {
+		admission.release(w.server)
 		return w.proxyFailNow(c, 502, "No healthy backend available")
 	}
 
 	px := w.pxGet()
+	px.admission = admission
 	px.w = w
 	px.c = c
 	px.cGen = c.generation
@@ -198,48 +217,297 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
 	px.keepClient = !reqClose
-	px.mayCache = pe.Cache != nil && cacheableMethod
+	px.mayCache = cache != nil && cacheableMethod
 	px.reqCacheOK = reqCacheOK
+	px.cacheHost = host
+	px.cacheKey = cachePath
+	px.cacheGen = cache.purgeGeneration()
+	px.cache = cache
 	for len(px.tried) < len(ds.backends) {
 		px.tried = append(px.tried, false)
 	}
 
-	if !w.proxyAttempt(px) {
-		return proxyStartServed
+	if r := w.proxyAttempt(px); r.status != 0 {
+		w.pxPut(px)
+		return w.proxyFailNow(c, r.status, r.msg)
 	}
 	c.proxyEx = px
 	return proxyStartPending
 }
 
-// proxyAttempt picks a backend and starts an exchange against it. It reports
-// false when the request has been answered outright instead.
-func (w *epollWorker) proxyAttempt(px *proxyExchange) bool {
+type proxyRefusal struct {
+	status int
+	msg    string
+}
+
+var (
+	proxyRefusedNoBackend  = proxyRefusal{502, "No healthy backend available"}
+	proxyRefusedByHook     = proxyRefusal{502, "Request blocked by interceptor"}
+	proxyRefusedHookFailed = proxyRefusal{502, "Proxy hook failed"}
+)
+
+func (r proxyRefusal) answer(resp *Response) {
+	resp.Reset()
+	resp.Status(r.status).String(r.msg)
+}
+
+type proxyAdmission struct {
+	requestSlot bool
+	ipSlot      *ipReqCounter
+}
+
+func (a *proxyAdmission) release(s *Server) {
+	if a.ipSlot != nil {
+		a.ipSlot.release()
+		a.ipSlot = nil
+	}
+	if a.requestSlot {
+		s.releaseRequestSlot()
+		a.requestSlot = false
+	}
+}
+
+type proxyAdmitOutcome uint8
+
+const (
+	proxyAdmitted proxyAdmitOutcome = iota
+	proxyAdmitAnswered
+	proxyAdmitDispatch
+)
+
+func (o proxyAdmitOutcome) startResult() int {
+	if o == proxyAdmitDispatch {
+		return proxyStartDispatch
+	}
+	return proxyStartServed
+}
+
+func (s *Server) proxyNeedsDispatch(pe *ProxyEngine, req *Request) bool {
+	if s.onRequestHooks.Load() != nil || isTLSH1Upgrade(req) {
+		return true
+	}
+	if pe == httpRouteEngine {
+		return false
+	}
+	if s.onResponseHooks.Load() == nil && s.corsEngine.Load() == nil &&
+		!s.config.EnableCompress && s.config.MaxWriteSize <= 0 {
+		return false
+	}
+	return req.Header("Upgrade") == ""
+}
+
+func isTLSH1Upgrade(req *Request) bool {
+	return req.IsTLS && !req.IsH2 && req.h1UpgradeFieldSeen()
+}
+
+func (w *epollWorker) admitProxyRequest(req *Request, resp *Response) (proxyAdmission, proxyAdmitOutcome) {
+	s := w.server
+	if !s.tryAcquireRequestSlot() {
+		statsBlocked()
+		resp.Status(503).String("Service Unavailable")
+		return proxyAdmission{}, proxyAdmitAnswered
+	}
+	a := proxyAdmission{requestSlot: true}
+	if s.perIPLimiter == nil && s.rateLimitEngine.Load() == nil && s.onRequestHooks.Load() == nil {
+		return a, proxyAdmitted
+	}
+	return w.admitGuardedProxyRequest(a, req, resp)
+}
+
+func (w *epollWorker) admitGuardedProxyRequest(a proxyAdmission, req *Request, resp *Response) (proxyAdmission, proxyAdmitOutcome) {
+	s := w.server
+	if s.onRequestHooks.Load() != nil {
+		a.release(s)
+		return proxyAdmission{}, proxyAdmitDispatch
+	}
+	clientIP := extractIP(req.RemoteAddr)
+	if s.perIPLimiter != nil {
+		slot, ok := s.perIPLimiter.hold(clientIP, s.perIPRequestLimit())
+		if !ok {
+			a.release(s)
+			statsBlocked()
+			resp.Status(429).String("Too Many Requests")
+			return proxyAdmission{}, proxyAdmitAnswered
+		}
+		a.ipSlot = slot
+	}
+	if outcome := w.proxiedRateLimitOutcome(clientIP, req, resp); outcome != proxyAdmitted {
+		a.release(s)
+		return proxyAdmission{}, outcome
+	}
+	return a, proxyAdmitted
+}
+
+func (w *epollWorker) proxiedRateLimitOutcome(clientIP string, req *Request, resp *Response) proxyAdmitOutcome {
+	rl := w.server.rateLimitEngine.Load()
+	if rl == nil || clientIP == "" {
+		return proxyAdmitted
+	}
+	allowed, cr, retryAfter := rl.Check(clientIP, req.Path)
+	if allowed {
+		return proxyAdmitted
+	}
+	refusal := rateLimitRefusal{rule: cr, retryAfter: retryAfter}
+	if refusal.runsHook(rl) {
+		req.loopRateLimitRefusal = refusal
+		return proxyAdmitDispatch
+	}
+	statsBlocked()
+	answerTooManyRequests(resp, refusal.retryAfter)
+	return proxyAdmitAnswered
+}
+
+const (
+	proxyHookInlineHeaders      = 8
+	proxyHookSmallInlineHeaders = 2
+	proxyHookMidInlineHeaders   = 4
+	proxyCacheBackend           = "cache"
+)
+
+type proxyHookRequest struct {
+	ProxyRequest
+	headers [proxyHookInlineHeaders][2]string
+}
+
+type proxyHookResponse struct {
+	ProxyResponse
+	headers [proxyHookInlineHeaders][2]string
+}
+
+type proxyHookResponseSmall struct {
+	ProxyResponse
+	headers [proxyHookSmallInlineHeaders][2]string
+}
+
+type proxyHookResponseMid struct {
+	ProxyResponse
+	headers [proxyHookMidInlineHeaders][2]string
+}
+
+func newProxyHookResponse(headerCount int) *ProxyResponse {
+	switch {
+	case headerCount <= proxyHookSmallInlineHeaders:
+		hook := &proxyHookResponseSmall{}
+		hook.Headers = hook.headers[:0]
+		return &hook.ProxyResponse
+	case headerCount <= proxyHookMidInlineHeaders:
+		hook := &proxyHookResponseMid{}
+		hook.Headers = hook.headers[:0]
+		return &hook.ProxyResponse
+	case headerCount <= proxyHookInlineHeaders:
+		hook := &proxyHookResponse{}
+		hook.Headers = hook.headers[:0]
+		return &hook.ProxyResponse
+	}
+	return &ProxyResponse{Headers: make([][2]string, 0, headerCount)}
+}
+
+func newCacheHitHookResponse(ds *domainState, entry *cacheEntry, req *Request, resp *Response) *ProxyResponse {
+	pr := newProxyHookResponse(len(resp.Headers))
+	pr.Domain = ds.config.Domain
+	pr.Backend = proxyCacheBackend
+	pr.ClientAddr = req.RemoteAddr
+	pr.Method = req.Method
+	pr.Path = req.Path
+	pr.StatusCode = entry.statusCode
+	pr.Headers = append(pr.Headers, resp.Headers...)
+	return pr
+}
+
+func adoptHookResponse(resp *Response, pr *ProxyResponse) {
+	resp.Status(pr.StatusCode)
+	resp.Headers = append(resp.Headers[:0], pr.Headers...)
+}
+
+func (pe *ProxyEngine) hasHooks() bool {
+	return pe.requestHook() != nil || pe.responseHook() != nil || pe.errorHook() != nil
+}
+
+func (w *epollWorker) guardUserHook(req *Request, call func()) (completed bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			w.server.reportPanic(req, r)
+			completed = false
+		}
+	}()
+	call()
+	return true
+}
+
+func (w *epollWorker) serveProxyCacheHit(pe *ProxyEngine, ds *domainState, cache *ProxyCache, entry *cacheEntry, req *Request, resp *Response) {
+	cache.ServeCached(entry, req, resp)
+	onResponse := pe.responseHook()
+	if onResponse == nil {
+		return
+	}
+	pr := newCacheHitHookResponse(ds, entry, req, resp)
+	if !w.guardUserHook(req, func() { onResponse(pr) }) {
+		proxyRefusedHookFailed.answer(resp)
+		return
+	}
+	adoptHookResponse(resp, pr)
+}
+
+func proxyRefusalFor(status int) proxyRefusal {
+	return proxyRefusal{status, proxyFailureMessage(status)}
+}
+
+func (px *proxyExchange) cachePutOptions() cachePutOptions {
+	return cachePutOptions{generation: px.cacheGen, offload: true}
+}
+
+func (px *proxyExchange) request() *Request {
+	if px.h2Stream != nil {
+		return &px.h2Stream.req
+	}
+	return &px.c.req
+}
+
+func (w *epollWorker) proxyAttempt(px *proxyExchange) proxyRefusal {
+	for {
+		r, err := w.proxyStartBackend(px)
+		if err == nil {
+			return r
+		}
+		w.proxyRecordFailure(px, err)
+		if status := proxyNextAttempt(px, err); status != 0 {
+			return proxyRefusalFor(status)
+		}
+	}
+}
+
+func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error) {
 	ds := px.ds
 	idx := pickRetryBackend(ds, extractIP(px.clientAddr), px.tried)
 	if idx < 0 {
-		w.proxyFailExchange(px, 502, "No healthy backend available")
-		return false
+		return proxyRefusedNoBackend, nil
 	}
 	px.tried[idx] = true
 	b := ds.backends[idx]
 	px.b = b
+	px.discardH2Buffer()
 
-	req := &px.c.req
+	req := px.request()
 	hostHdr := ds.config.HostHeader
-	if px.pe.OnRequest != nil {
-		pr := &ProxyRequest{
-			Domain:     ds.config.Domain,
-			Backend:    b.Addr,
-			ClientAddr: px.clientAddr,
-			Method:     req.Method,
-			Path:       req.Path,
-			Headers:    req.Headers,
-			Host:       hostHdr,
-		}
+	if onRequest := px.pe.requestHook(); onRequest != nil {
+		hook := &proxyHookRequest{}
+		pr := &hook.ProxyRequest
+		pr.Domain = ds.config.Domain
+		pr.Backend = b.Addr
+		pr.ClientAddr = px.clientAddr
+		pr.Method = req.Method
+		pr.Path = req.Path
+		pr.Headers = append(hook.headers[:0], req.Headers...)
+		pr.Host = hostHdr
 		originalPath := req.Path
-		if !px.pe.OnRequest(pr) {
-			w.proxyFailExchange(px, 502, "Request blocked by interceptor")
-			return false
+		allowed := false
+		if !w.guardUserHook(req, func() { allowed = onRequest(pr) }) {
+			px.b = nil
+			return proxyRefusedHookFailed, nil
+		}
+		if !allowed {
+			px.b = nil
+			return proxyRefusedByHook, nil
 		}
 		if pr.Path != originalPath {
 			// The serialiser prefers RawPath so escaped targets survive; a hook
@@ -247,29 +515,30 @@ func (w *epollWorker) proxyAttempt(px *proxyExchange) bool {
 			req.RawPath = ""
 		}
 		req.Path = pr.Path
-		req.Headers = pr.Headers
+		req.Headers = append(req.Headers[:0], pr.Headers...)
 		hostHdr = pr.Host
 	}
 
 	authority := fpProxyAuthority(b.Addr)
 	if hostHdr == "" {
-		if ds.config.PreserveHost {
+		if ds.config.PreserveHost && req.Host != "" {
 			hostHdr = req.Host
 		} else {
 			hostHdr = authority
 		}
 	}
-	px.reqRaw = appendProxyRequest(px.reqRaw[:0], req, hostHdr, extractIP(px.clientAddr))
+	px.reqRaw = appendProxyRequest(px.reqRaw[:0], req, hostHdr)
+	px.Exchange.wroteRequest = false
+	px.Exchange.replayable = proxyRequestReplayable(req.Method, req.Headers, ds.config.TrustIdempotencyKey)
 
 	ip, port, err := resolveAuthority(authority)
 	if err != nil {
-		w.proxyRetryOrFail(px, err)
-		return px.c.proxyEx != nil || !px.finished
+		return proxyRefusal{}, err
 	}
 
 	px.Exchange.ip = ip
 	px.Exchange.port = port
-	px.Exchange.key = poolKey{authority: authority, tls: b.TLS, skipVerify: b.TLSSkipVerify}
+	px.Exchange.key = poolKey{authority: authority, tls: b.TLS, skipVerify: b.TLSSkipVerify, trust: b.trust}
 	// The connect timeout bounds reaching the backend; once the request is on
 	// the wire h1Proto.attach re-arms the deadline to the read timeout, which
 	// each subsequent read then refreshes.
@@ -288,8 +557,14 @@ func (w *epollWorker) proxyAttempt(px *proxyExchange) bool {
 	px.retried = false
 
 	b.ActiveConns.Add(1)
+	px.starting = true
 	w.be.startExchange(&px.Exchange)
-	return true
+	px.starting = false
+	if px.finished {
+		b.ActiveConns.Add(-1)
+		return proxyRefusal{}, px.Exchange.err
+	}
+	return proxyRefusal{}, nil
 }
 
 // appendProxyStreamHead writes the head of a relayed response. A response of
@@ -348,24 +623,21 @@ func (w *epollWorker) proxyMaybeCache(px *proxyExchange, status int, headers res
 	if !manual && !px.reqCacheOK {
 		return
 	}
-	cachePath := px.path
-	if q := px.c.req.Query; q != "" {
-		cachePath = px.path + "?" + q
-	}
-	host := stripPort(px.c.req.Host)
+	cachePath := px.cacheKey
+	host := px.cacheHost
 	// A cache entry outlives the exchange, so this is one of the few places that
 	// needs the headers as strings. putEntry copies the slice it is given.
 	stored := w.headerStrings(headers)
 	ctype := proxyContentType(stored)
 	if manual {
-		px.pe.Cache.PutManual(px.method, host, cachePath, status, stored, ctype, body,
-			hooked.cacheTTL, hooked.cacheMaxHits, hooked.cacheCompress, hooked.cacheCompressMin)
+		px.cache.putManual(px.method, host, cachePath, status, stored, ctype, body,
+			hooked.cacheTTL, hooked.cacheMaxHits, hooked.cacheCompress, hooked.cacheCompressMin, px.cachePutOptions())
 		return
 	}
 	if !proxyCacheResponseAllowed(stored) {
 		return
 	}
-	px.pe.Cache.Put(px.method, host, cachePath, status, stored, ctype, body)
+	px.cache.put(px.method, host, cachePath, status, stored, ctype, body, px.cachePutOptions())
 }
 
 // headerStrings materialises headers for the consumers that genuinely need
@@ -399,33 +671,48 @@ func (w *epollWorker) proxyFailNow(c *epollConn, status int, msg string) int {
 	return proxyStartServed
 }
 
-// proxyFailExchange answers the client with an error and discards the exchange.
-func (w *epollWorker) proxyFailExchange(px *proxyExchange, status int, msg string) {
-	c := px.c
-	if c != nil && c.generation == px.cGen && c.fd >= 0 {
-		c.resp.Reset()
-		c.resp.Status(status).String(msg)
-		c.proxyEx = nil
+func (w *epollWorker) proxyRecordFailure(px *proxyExchange, err error) {
+	if px.b == nil {
+		return
 	}
-	w.pxPut(px)
+	px.ds.outlier.recordFailure(px.b)
+	if onError := px.pe.errorHook(); onError != nil {
+		perr := ProxyError{
+			Domain:     px.ds.config.Domain,
+			Backend:    px.b.Addr,
+			ClientAddr: px.clientAddr,
+			Method:     px.method,
+			Path:       px.path,
+			Attempt:    px.attempt + 1,
+			Err:        err,
+		}
+		w.guardUserHook(nil, func() { onError(perr) })
+	}
+	px.b = nil
+}
+
+func proxyNextAttempt(px *proxyExchange, err error) int {
+	maxRetries := px.ds.config.MaxRetries
+	if maxRetries > len(px.ds.backends)-1 {
+		maxRetries = len(px.ds.backends) - 1
+	}
+	attemptErr := fpAttemptError(err, px.Exchange.wroteRequest, false)
+	if px.attempt >= maxRetries || !proxyMayRetry(px.Exchange.replayable, attemptErr) {
+		return proxyFailureStatus(attemptErr)
+	}
+	px.attempt++
+	return 0
+}
+
+func (w *epollWorker) proxyRetry(px *proxyExchange, err error) proxyRefusal {
+	if status := proxyNextAttempt(px, err); status != 0 {
+		return proxyRefusalFor(status)
+	}
+	return w.proxyAttempt(px)
 }
 
 func (w *epollWorker) proxyRetryOrFail(px *proxyExchange, err error) {
-	if px.b != nil {
-		px.b.ActiveConns.Add(-1)
-		if px.pe.OnError != nil {
-			px.pe.OnError(ProxyError{
-				Domain:     px.ds.config.Domain,
-				Backend:    px.b.Addr,
-				ClientAddr: px.clientAddr,
-				Method:     px.method,
-				Path:       px.path,
-				Attempt:    px.attempt + 1,
-				Err:        err,
-			})
-		}
-		px.b = nil
-	}
+	w.proxyRecordFailure(px, err)
 
 	// With the client already gone there is nobody to answer or retry for.
 	if px.c == nil {
@@ -437,16 +724,9 @@ func (w *epollWorker) proxyRetryOrFail(px *proxyExchange, err error) {
 		w.proxyAbort(px)
 		return
 	}
-	maxRetries := px.ds.config.MaxRetries
-	if maxRetries > len(px.ds.backends)-1 {
-		maxRetries = len(px.ds.backends) - 1
+	if r := w.proxyRetry(px, err); r.status != 0 {
+		w.proxyRefuse(px, r)
 	}
-	if px.attempt >= maxRetries {
-		w.proxyFinishClient(px, 502, respHeaders{}, []byte("All backends failed"), "text/plain; charset=utf-8")
-		return
-	}
-	px.attempt++
-	w.proxyAttempt(px)
 }
 
 // proxyAbort tears the client connection down when a failure arrives after the
@@ -505,7 +785,9 @@ func (w *epollWorker) proxyResume(c *epollConn) {
 	}
 	if c.readN > c.h1Off || c.tlsAppPending() {
 		w.serviceBuffered(c, false, false)
+		return
 	}
+	c.compactH1ReadBuffer()
 }
 
 // appendProxyResponseHead writes a status line and headers for a response the

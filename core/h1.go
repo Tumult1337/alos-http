@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -13,7 +15,7 @@ func init() {
 		200: "OK", 201: "Created", 202: "Accepted", 204: "No Content", 206: "Partial Content",
 		301: "Moved Permanently", 302: "Found", 303: "See Other", 304: "Not Modified", 307: "Temporary Redirect", 308: "Permanent Redirect",
 		400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found",
-		405: "Method Not Allowed", 408: "Request Timeout", 413: "Payload Too Large",
+		405: "Method Not Allowed", 408: "Request Timeout", 412: "Precondition Failed", 413: "Payload Too Large",
 		416: "Range Not Satisfiable", 426: "Upgrade Required", 429: "Too Many Requests", 431: "Request Header Fields Too Large",
 		500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
 	}
@@ -56,6 +58,24 @@ var (
 	connClose         = []byte("Connection: close\r\nServer: ALOS\r\n")
 )
 
+func appendContentTypeHeader(dst []byte, contentType string) []byte {
+	dst = append(dst, "Content-Type: "...)
+	dst = appendHeaderValueStripped(dst, contentType)
+	return append(dst, '\r', '\n')
+}
+
+func appendHeaderValueStripped(dst []byte, value string) []byte {
+	if !containsLineBreak(value, lineBreakCRLFNUL) {
+		return append(dst, value...)
+	}
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c != '\r' && c != '\n' && c != 0 {
+			dst = append(dst, c)
+		}
+	}
+	return dst
+}
+
 func ctPrefixLookup(ct string) []byte {
 	switch len(ct) {
 	case 25:
@@ -92,9 +112,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
 			buf = append(buf, pre...)
 		} else {
-			buf = append(buf, "Content-Type: "...)
-			buf = append(buf, resp.ContentType...)
-			buf = append(buf, '\r', '\n')
+			buf = appendContentTypeHeader(buf, resp.ContentType)
 		}
 	}
 
@@ -144,9 +162,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
 			inner = append(inner, pre...)
 		} else {
-			inner = append(inner, "Content-Type: "...)
-			inner = append(inner, resp.ContentType...)
-			inner = append(inner, '\r', '\n')
+			inner = appendContentTypeHeader(inner, resp.ContentType)
 		}
 	}
 	if headerBodyLen >= 0 {

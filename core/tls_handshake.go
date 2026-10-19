@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -73,16 +75,41 @@ func HSWrap(msgType byte, body []byte) []byte {
 
 // BuildServerHello constructs a framed TLS 1.3 ServerHello handshake message
 // carrying random, sessionID, the negotiated suiteID, and pubKey in a
-// supported_versions and X25519 key_share extension.
-func BuildServerHello(random, sessionID []byte, suiteID uint16, pubKey []byte) []byte {
-	const versionExtLen = 6
-	const keyShareEntryHeaderLen = 4
+// supported_versions and key_share extension for group.
+func BuildServerHello(random, sessionID []byte, suiteID, group uint16, pubKey []byte) []byte {
+	return buildServerHelloMessage(serverHelloSpec{random: random, sessionID: sessionID, suite: suiteID, group: group, share: pubKey})
+}
 
-	sidLen := len(sessionID)
-	pubLen := len(pubKey)
-	keyShareExtDataLen := keyShareEntryHeaderLen + pubLen
-	keyShareExtLen := 4 + keyShareExtDataLen
-	extsLen := versionExtLen + keyShareExtLen
+func buildHelloRetryRequest(sessionID []byte, suiteID uint16, group tlsGroup) []byte {
+	return buildServerHelloMessage(serverHelloSpec{random: helloRetryRequestRandom[:], sessionID: sessionID, suite: suiteID, group: uint16(group), retry: true})
+}
+
+type serverHelloSpec struct {
+	random    []byte
+	sessionID []byte
+	suite     uint16
+	group     uint16
+	share     []byte
+	retry     bool
+	psk       bool
+}
+
+func buildServerHelloMessage(spec serverHelloSpec) []byte {
+	const versionExtLen = 6
+	const extHeaderLen = 4
+	const groupLen = 2
+	const shareLenLen = 2
+	const pskExtLen = extHeaderLen + 2
+
+	sidLen := len(spec.sessionID)
+	keyShareExtDataLen := groupLen
+	if !spec.retry {
+		keyShareExtDataLen += shareLenLen + len(spec.share)
+	}
+	extsLen := versionExtLen + extHeaderLen + keyShareExtDataLen
+	if spec.psk {
+		extsLen += pskExtLen
+	}
 	bodyLen := 40 + sidLen + extsLen
 
 	out := make([]byte, 4+bodyLen)
@@ -95,14 +122,14 @@ func BuildServerHello(random, sessionID []byte, suiteID uint16, pubKey []byte) [
 	out[off] = 0x03
 	out[off+1] = 0x03
 	off += 2
-	copy(out[off:], random)
-	off += len(random)
+	copy(out[off:], spec.random)
+	off += len(spec.random)
 	out[off] = byte(sidLen)
 	off++
-	copy(out[off:], sessionID)
+	copy(out[off:], spec.sessionID)
 	off += sidLen
-	out[off] = byte(suiteID >> 8)
-	out[off+1] = byte(suiteID)
+	out[off] = byte(spec.suite >> 8)
+	out[off+1] = byte(spec.suite)
 	out[off+2] = 0x00
 	off += 3
 
@@ -122,12 +149,23 @@ func BuildServerHello(random, sessionID []byte, suiteID uint16, pubKey []byte) [
 	out[off+1] = 0x33
 	out[off+2] = byte(keyShareExtDataLen >> 8)
 	out[off+3] = byte(keyShareExtDataLen)
-	out[off+4] = 0x00
-	out[off+5] = 0x1d
-	out[off+6] = byte(pubLen >> 8)
-	out[off+7] = byte(pubLen)
-	off += 8
-	copy(out[off:], pubKey)
+	out[off+4] = byte(spec.group >> 8)
+	out[off+5] = byte(spec.group)
+	off += extHeaderLen + groupLen
+	if !spec.retry {
+		out[off] = byte(len(spec.share) >> 8)
+		out[off+1] = byte(len(spec.share))
+		copy(out[off+shareLenLen:], spec.share)
+		off += shareLenLen + len(spec.share)
+	}
+	if spec.psk {
+		out[off] = byte(tlsExtPreSharedKey >> 8)
+		out[off+1] = byte(tlsExtPreSharedKey & 0xff)
+		out[off+2] = 0x00
+		out[off+3] = 0x02
+		out[off+4] = byte(pskSelectedIdentityFirst >> 8)
+		out[off+5] = byte(pskSelectedIdentityFirst)
+	}
 	return out
 }
 
@@ -166,30 +204,35 @@ func BuildEncryptedExtensions(alpn string) []byte {
 // BuildCertificate constructs a framed TLS 1.3 Certificate handshake message from
 // chain, a list of DER-encoded certificates, with an empty extensions block for each entry.
 func BuildCertificate(chain [][]byte) []byte {
-	var entriesLen int
+	return buildCertificate13(chain, nil)
+}
+
+func buildCertificate13(chain [][]byte, leafStatus []byte) []byte {
+	leafExtLen := 0
+	if len(leafStatus) > 0 {
+		leafExtLen = 4 + len(leafStatus)
+	}
+	entriesLen := 0
 	for _, certDER := range chain {
 		entriesLen += 3 + len(certDER) + 2
 	}
+	if len(chain) > 0 {
+		entriesLen += leafExtLen
+	}
 	bodyLen := 1 + 3 + entriesLen
-	out := make([]byte, 4+bodyLen)
-	out[0] = 0x0b
-	out[1] = byte(bodyLen >> 16)
-	out[2] = byte(bodyLen >> 8)
-	out[3] = byte(bodyLen)
-	out[4] = 0x00
-	out[5] = byte(entriesLen >> 16)
-	out[6] = byte(entriesLen >> 8)
-	out[7] = byte(entriesLen)
-	off := 8
-	for _, certDER := range chain {
-		out[off] = byte(len(certDER) >> 16)
-		out[off+1] = byte(len(certDER) >> 8)
-		out[off+2] = byte(len(certDER))
-		copy(out[off+3:], certDER)
-		off += 3 + len(certDER)
-		out[off] = 0x00
-		out[off+1] = 0x00
-		off += 2
+	out := make([]byte, 0, 4+bodyLen)
+	out = append(out, tlsHSCertificate, byte(bodyLen>>16), byte(bodyLen>>8), byte(bodyLen))
+	out = append(out, 0x00, byte(entriesLen>>16), byte(entriesLen>>8), byte(entriesLen))
+	for i, certDER := range chain {
+		out = append(out, byte(len(certDER)>>16), byte(len(certDER)>>8), byte(len(certDER)))
+		out = append(out, certDER...)
+		if i > 0 || leafExtLen == 0 {
+			out = append(out, 0x00, 0x00)
+			continue
+		}
+		out = append(out, byte(leafExtLen>>8), byte(leafExtLen))
+		out = append(out, byte(tlsExtStatusRequest>>8), byte(tlsExtStatusRequest), byte(len(leafStatus)>>8), byte(len(leafStatus)))
+		out = append(out, leafStatus...)
 	}
 	return out
 }
@@ -292,7 +335,10 @@ var rsaPSSSchemes = [...]struct {
 // scheme. It returns the scheme and signature, or an error when the key type is
 // unsupported or the client offers no scheme the key can produce.
 func SignCertificateVerify(signer crypto.Signer, transcriptHash []byte, offered []uint16) (uint16, []byte, error) {
-	content := certificateVerifyContent(transcriptHash)
+	return signTLS13(signer, certificateVerifyContent(transcriptHash), offered)
+}
+
+func signTLS13(signer crypto.Signer, content []byte, offered []uint16) (uint16, []byte, error) {
 	switch k := signer.(type) {
 	case *ecdsa.PrivateKey:
 		scheme, h, ok := ecdsaScheme(k)
@@ -359,11 +405,32 @@ type ParsedClientHello struct {
 	SupportedGroups               []uint16
 	SignatureSchemes              []uint16
 	Random                        [32]byte
+	LegacyVersion                 uint16
 	MaxUDPPayload                 uint64
 	InitialMaxData                uint64
 	InitialMaxStreamDataBidiLocal uint64
+	ActiveConnIDLimit             uint64
+	quicTP                        quicPeerTransportParams
 
 	hasUncompressedPoint bool
+	extendedMasterSecret bool
+	secureRenegotiation  bool
+	renegotiatedConn     bool
+	fallbackSCSV         bool
+	pskDHE               bool
+	pskNotLast           bool
+	pskIdentities        int
+	pskBinders           int
+	pskBindersOffset     int
+	pskIdentity          []byte
+	pskBinder            []byte
+	sessionTicketOffered bool
+	sessionTicket        []byte
+	statusRequest        bool
+	keyShareCount        int
+	x25519Share          []byte
+	p256Share            []byte
+	mlkemShare           []byte
 
 	sessionIDBuf          [32]byte
 	x25519PubKeyBuf       [32]byte
@@ -399,7 +466,27 @@ func (ch *ParsedClientHello) Reset() {
 	ch.MaxUDPPayload = 0
 	ch.InitialMaxData = 0
 	ch.InitialMaxStreamDataBidiLocal = 0
+	ch.ActiveConnIDLimit = 0
+	ch.quicTP = quicPeerTransportParams{}
 	ch.hasUncompressedPoint = false
+	ch.extendedMasterSecret = false
+	ch.secureRenegotiation = false
+	ch.renegotiatedConn = false
+	ch.fallbackSCSV = false
+	ch.pskDHE = false
+	ch.pskNotLast = false
+	ch.pskIdentities = 0
+	ch.pskBinders = 0
+	ch.pskBindersOffset = 0
+	ch.pskIdentity = nil
+	ch.pskBinder = nil
+	ch.sessionTicketOffered = false
+	ch.statusRequest = false
+	ch.sessionTicket = nil
+	ch.keyShareCount = 0
+	ch.x25519Share = nil
+	ch.p256Share = nil
+	ch.mlkemShare = nil
 	ch.cipherSuitesOverflow = nil
 	ch.supportedVersOverflow = nil
 	ch.alpnProtosOverflow = nil
@@ -452,6 +539,7 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	}
 
 	result.Reset()
+	result.LegacyVersion = uint16(ch[0])<<8 | uint16(ch[1])
 	copy(result.Random[:], ch[2:34])
 	pos := 34
 
@@ -481,6 +569,12 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	suites := result.cipherSuitesDst(csLen / 2)
 	for i, j := 0, 0; i < csLen; i, j = i+2, j+1 {
 		suites[j] = uint16(ch[pos+i])<<8 | uint16(ch[pos+i+1])
+		switch suites[j] {
+		case tlsSCSVRenegotiation:
+			result.secureRenegotiation = true
+		case tlsSCSVFallback:
+			result.fallbackSCSV = true
+		}
 	}
 	result.CipherSuites = suites
 	pos += csLen
@@ -489,6 +583,13 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 		return ErrNoCompression
 	}
 	compLen := int(ch[pos])
+	if pos+1+compLen > len(ch) {
+		return ErrNoCompression
+	}
+	compression := ch[pos+1 : pos+1+compLen]
+	if indexByteFrom(compression, tlsCompressionNull, 0) < 0 {
+		return ErrBadCompression
+	}
 	pos += 1 + compLen
 
 	if pos+2 > len(ch) {
@@ -501,15 +602,22 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 	}
 	exts := ch[pos : pos+extTotalLen]
 
-	for i := 0; i < len(exts); {
+	var seen extensionSet
+	for i, extCount := 0, 0; i < len(exts); extCount++ {
 		if i+4 > len(exts) {
-			break
+			return ErrExtsTruncated
+		}
+		if extCount == maxClientHelloExtensions {
+			return ErrTooManyExtensions
 		}
 		extType := uint16(exts[i])<<8 | uint16(exts[i+1])
 		extLen := int(exts[i+2])<<8 | int(exts[i+3])
 		i += 4
 		if i+extLen > len(exts) {
-			break
+			return ErrExtsTruncated
+		}
+		if seen.seenBefore(extType) {
+			return ErrDuplicateExtension
 		}
 		extData := exts[i : i+extLen]
 
@@ -517,11 +625,15 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 		case 0x0000:
 			result.ServerName = parseSNI(extData)
 		case 0x0010:
-			result.ALPNProtos = parseALPN(result, extData)
+			protos, ok := parseALPN(result, extData)
+			if !ok {
+				return ErrBadALPN
+			}
+			result.ALPNProtos = protos
 		case 0x002b:
 			result.SupportedVersions = parseSupportedVersions(result, extData)
 		case 0x0033:
-			result.X25519PubKey = findX25519KeyShare(result, extData)
+			parseKeyShares(result, extData)
 		case 0x000a:
 			result.SupportedGroups = parseU16List(extData)
 		case 0x000d:
@@ -536,45 +648,154 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 			}
 		case 0x0039:
 			parseQUICTransportParams(result, extData)
+		case tlsExtExtendedMasterSecret:
+			result.extendedMasterSecret = true
+		case tlsExtRenegotiationInfo:
+			result.secureRenegotiation = true
+			result.renegotiatedConn = len(extData) != 1 || extData[0] != 0
+		case tlsExtSessionTicket:
+			result.sessionTicketOffered = true
+			result.sessionTicket = extData
+		case tlsExtStatusRequest:
+			result.statusRequest = len(extData) > 0 && extData[0] == ocspStatusTypeOCSP
+		case tlsExtPSKModes:
+			result.pskDHE = parsePSKModes(extData)
+		case tlsExtPreSharedKey:
+			result.pskNotLast = i+extLen != len(exts)
+			parsePreSharedKey(result, extData, tlsHandshakeHeaderLen+pos+i)
 		}
 		i += extLen
+	}
+	if len(compression) != 1 && result.SupportsTLS13() {
+		return ErrBadCompression
 	}
 
 	return nil
 }
 
+const (
+	tlsCompressionNull       = 0
+	maxClientHelloExtensions = 128
+	maxALPNProtocols         = 32
+	extensionSetLowTypes     = 128
+	extensionSetWordBits     = 64
+)
+
+var (
+	ErrDuplicateExtension = &staticError{"duplicate extension"}
+	ErrTooManyExtensions  = &staticError{"too many extensions"}
+	ErrBadCompression     = &staticError{"compression methods must be exactly null"}
+	ErrBadALPN            = &staticError{"malformed application_layer_protocol_negotiation"}
+)
+
+type extensionSet struct {
+	low   [extensionSetLowTypes / extensionSetWordBits]uint64
+	high  [maxClientHelloExtensions]uint16
+	nHigh int
+}
+
+func (s *extensionSet) seenBefore(extType uint16) bool {
+	if extType >= extensionSetLowTypes {
+		return s.seenHighBefore(extType)
+	}
+	word, bit := &s.low[extType/extensionSetWordBits], uint64(1)<<(extType%extensionSetWordBits)
+	dup := *word&bit != 0
+	*word |= bit
+	return dup
+}
+
+func (s *extensionSet) seenHighBefore(extType uint16) bool {
+	for _, t := range s.high[:s.nHigh] {
+		if t == extType {
+			return true
+		}
+	}
+	s.high[s.nHigh] = extType
+	s.nHigh++
+	return false
+}
+
+func clientHelloParseAlert(err error) tlsAlert {
+	if err == ErrDuplicateExtension || err == ErrBadCompression {
+		return alertIllegalParameter
+	}
+	return alertDecodeError
+}
+
 func parseQUICTransportParams(result *ParsedClientHello, data []byte) {
+	tp := &result.quicTP
+	tp.seen = true
+	tp.ackDelayExponent = quicDefaultAckDelayExponent
+	tp.maxAckDelayMs = quicDefaultMaxAckDelayMs
+	var seenIDs uint64
 	for pos := 0; pos < len(data); {
 		id, n := quicParseVarint(data[pos:])
 		if n == 0 {
+			tp.invalid = true
 			return
 		}
 		pos += n
 		plen, n2 := quicParseVarint(data[pos:])
-		if n2 == 0 {
+		if n2 == 0 || plen > uint64(len(data)-pos-n2) {
+			tp.invalid = true
 			return
 		}
 		pos += n2
-		if pos+int(plen) > len(data) {
-			return
-		}
-		switch id {
-		case 0x03, 0x04, 0x05:
-			v, n3 := quicParseVarint(data[pos:])
-			if n3 == 0 {
+		value := data[pos : pos+int(plen)]
+		pos += int(plen)
+		if id < quicTPTrackedIDs {
+			if seenIDs&(1<<id) != 0 {
+				tp.invalid = true
 				return
 			}
-			switch id {
-			case 0x03:
-				result.MaxUDPPayload = v
-			case 0x04:
-				result.InitialMaxData = v
-			case 0x05:
-				result.InitialMaxStreamDataBidiLocal = v
-			}
+			seenIDs |= 1 << id
 		}
-		pos += int(plen)
+		if !applyQUICTransportParam(result, id, value) {
+			tp.invalid = true
+			return
+		}
 	}
+}
+
+func applyQUICTransportParam(result *ParsedClientHello, id uint64, value []byte) bool {
+	switch id {
+	case quicTPOrigDstCID, quicTPStatelessResetToken, quicTPPreferredAddress, quicTPRetrySrcCID:
+		return false
+	case quicTPInitialSrcCID:
+		result.quicTP.initialSrcCID = value
+		result.quicTP.hasInitialSrcCID = true
+		return len(value) <= quicMaxCIDLen
+	case quicTPDisableActiveMigration:
+		return len(value) == 0
+	}
+	if !quicTPIsInteger(id) {
+		return true
+	}
+	v, n := quicParseVarint(value)
+	if n == 0 || n != len(value) {
+		return false
+	}
+	switch id {
+	case quicTPMaxUDPPayloadSize:
+		result.MaxUDPPayload = v
+		return v >= quicMinUDPPayloadSize
+	case quicTPInitialMaxData:
+		result.InitialMaxData = v
+	case quicTPInitialMaxStreamBidiL:
+		result.InitialMaxStreamDataBidiLocal = v
+	case quicTPActiveConnIDLimit:
+		result.ActiveConnIDLimit = v
+		return v >= quicMinActiveConnIDLimit
+	case quicTPAckDelayExponent:
+		result.quicTP.ackDelayExponent = v
+		return v <= quicMaxAckDelayExponent
+	case quicTPMaxAckDelay:
+		result.quicTP.maxAckDelayMs = v
+		return v < quicMaxAckDelayLimitMs
+	case quicTPInitialMaxStreamsBidi, quicTPInitialMaxStreamsUni:
+		return v <= quicMaxStreamsLimit
+	}
+	return true
 }
 
 func parseU16List(data []byte) []uint16 {
@@ -634,30 +855,26 @@ func parseSupportedVersions(ch *ParsedClientHello, data []byte) []uint16 {
 	return versions
 }
 
-func parseALPN(ch *ParsedClientHello, data []byte) []string {
+func parseALPN(ch *ParsedClientHello, data []byte) ([]string, bool) {
 	if len(data) < 2 {
-		return nil
+		return nil, false
 	}
 	listLen := int(data[0])<<8 | int(data[1])
-	if len(data) < 2+listLen {
-		return nil
+	if len(data) != 2+listLen || listLen == 0 {
+		return nil, false
 	}
-	list := data[2 : 2+listLen]
+	list := data[2:]
 	count := 0
 	for i := 0; i < len(list); {
-		if i >= len(list) {
-			break
-		}
 		pLen := int(list[i])
 		i++
-		if i+pLen > len(list) {
-			break
+		if pLen == 0 || i+pLen > len(list) {
+			return nil, false
 		}
-		count++
+		if count < maxALPNProtocols {
+			count++
+		}
 		i += pLen
-	}
-	if count == 0 {
-		return nil
 	}
 	protos := ch.alpnDst(count)
 	for i, j := 0, 0; i < len(list) && j < count; j++ {
@@ -666,34 +883,27 @@ func parseALPN(ch *ParsedClientHello, data []byte) []string {
 		protos[j] = string(list[i : i+pLen])
 		i += pLen
 	}
-	return protos
+	return protos, true
 }
 
-func findX25519KeyShare(ch *ParsedClientHello, data []byte) []byte {
+func parseKeyShares(ch *ParsedClientHello, data []byte) {
 	if len(data) < 2 {
-		return nil
+		return
 	}
 	listLen := int(data[0])<<8 | int(data[1])
 	if len(data) < 2+listLen {
-		return nil
+		return
 	}
 	entries := data[2 : 2+listLen]
-	for j := 0; j < len(entries); {
-		if j+4 > len(entries) {
-			break
-		}
-		group := uint16(entries[j])<<8 | uint16(entries[j+1])
+	for j := 0; j+4 <= len(entries); {
+		group := tlsGroup(uint16(entries[j])<<8 | uint16(entries[j+1]))
 		kLen := int(entries[j+2])<<8 | int(entries[j+3])
 		if j+4+kLen > len(entries) {
-			break
+			return
 		}
-		if group == 0x001d && kLen == 32 {
-			copy(ch.x25519PubKeyBuf[:], entries[j+4:j+4+32])
-			return ch.x25519PubKeyBuf[:]
-		}
+		ch.recordKeyShare(group, entries[j+4:j+4+kLen])
 		j += 4 + kLen
 	}
-	return nil
 }
 
 // NegotiateALPN returns "h2" if allowH2 is true and clientProtos contains it,

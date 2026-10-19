@@ -3,8 +3,8 @@
 package core
 
 import (
-	"log"
 	"net"
+	"syscall"
 
 	"github.com/guno1928/alosmap"
 )
@@ -28,14 +28,13 @@ func (s *Server) ListenAndServeQUIC() error {
 		numListeners = 1
 	}
 
-	log.Printf("=== ALOS QUIC Server (HTTP/3 epoll) ===")
-	log.Printf("Listening on %s (UDP recvfrom/sendto, %d listener(s))", addr, numListeners)
+	s.logger().Info("HTTP/3 listening", "addr", addr, "listeners", numListeners, "backend", "epoll")
 
 	connMap := alosmap.NewTyped[[20]byte, *QUICConn]().Prealloc(256)
 	return s.listenAndServeQUICEpoll(addr, connMap)
 }
 
-func (s *Server) handleQUICPacketIOUring(uc uringUDPSender, remoteAddr *net.UDPAddr, data []byte, pbuf *[]byte, connMap *quicConnMap) {
+func (s *Server) handleQUICPacketIOUring(uc uringUDPSender, from *syscall.RawSockaddrInet4, data []byte, pbuf *[]byte, connMap *quicConnMap) {
 	if len(data) < 5 {
 		if pbuf != nil {
 			quicRecvBufPool.Put(pbuf)
@@ -43,15 +42,10 @@ func (s *Server) handleQUICPacketIOUring(uc uringUDPSender, remoteAddr *net.UDPA
 		return
 	}
 
-	isLong := quicIsLongHeader(data)
-	if debugFlag.Load() {
-		log.Printf("[H3-DBG] handleQUICPacket: %d bytes from %s longHeader=%v", len(data), remoteAddr, isLong)
-	}
-
-	if isLong {
-		s.handleQUICLongPacketIOUring(uc, remoteAddr, data, pbuf, connMap)
+	if quicIsLongHeader(data) {
+		s.handleQUICLongPacketIOUring(uc, sockaddrToUDPAddr(from), data, pbuf, connMap)
 	} else {
-		s.handleQUICShortPacketIOUring(uc, remoteAddr, data, pbuf, connMap)
+		s.handleQUICShortPacketIOUring(uc, from, data, pbuf, connMap)
 	}
 }
 
@@ -59,7 +53,7 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 	hdr, _, err := quicParseLongHeader(data)
 	if err != nil {
 		if debugFlag.Load() {
-			log.Printf("[H3-DBG] handleLongPacket: parse error: %v (dataLen=%d)", err, len(data))
+			Dbg("[H3-DBG] handleLongPacket: parse error: %v (dataLen=%d)", err, len(data))
 		}
 		if pbuf != nil {
 			quicRecvBufPool.Put(pbuf)
@@ -68,13 +62,13 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 	}
 
 	if debugFlag.Load() {
-		log.Printf("[H3-DBG] handleLongPacket: type=%d ver=0x%08x dcid=%x scid=%x from %s",
+		Dbg("[H3-DBG] handleLongPacket: type=%d ver=0x%08x dcid=%x scid=%x from %s",
 			hdr.pktType, hdr.version, hdr.dcid, hdr.scid, remoteAddr)
 	}
 
 	if hdr.version != quicVersion1 {
 		if debugFlag.Load() {
-			log.Printf("[H3-DBG] handleLongPacket: unsupported version 0x%08x", hdr.version)
+			Dbg("[H3-DBG] handleLongPacket: unsupported version 0x%08x", hdr.version)
 		}
 		if pbuf != nil {
 			quicRecvBufPool.Put(pbuf)
@@ -89,7 +83,7 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 		if v, exists := connMap.Load(dcidKey); exists {
 			qc = v
 			if debugFlag.Load() {
-				log.Printf("[H3-DBG] handleLongPacket: existing conn for dcid=%x", hdr.dcid)
+				Dbg("[H3-DBG] handleLongPacket: existing conn for dcid=%x", hdr.dcid)
 			}
 		}
 		if len(data) < quicMinInitialDatagram && (qc == nil || !qc.addressValidated.Load()) {
@@ -100,18 +94,32 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 		}
 		if qc == nil {
 			if debugFlag.Load() {
-				log.Printf("[H3-DBG] handleLongPacket: NEW Initial from %s, creating conn", remoteAddr)
+				Dbg("[H3-DBG] handleLongPacket: NEW Initial from %s, creating conn", remoteAddr)
 			}
-			qc = s.createQUICConnIOUring(uc, remoteAddr, hdr.dcid, hdr.scid, connMap)
-			if qc == nil {
-				if debugFlag.Load() {
-					log.Printf("[H3-DBG] handleLongPacket: createQUICConnIOUring returned nil!")
+			admission := s.admitInitial(&hdr, remoteAddr.AddrPort())
+			if !admission.create {
+				if admission.reply != nil {
+					uc.sendTo(admission.reply, remoteAddr)
 				}
 				if pbuf != nil {
 					quicRecvBufPool.Put(pbuf)
 				}
 				return
 			}
+			qc = s.createQUICConnIOUring(uc, remoteAddr, hdr.dcid, hdr.scid, connMap)
+			if qc == nil {
+				if debugFlag.Load() {
+					Dbg("[H3-DBG] handleLongPacket: createQUICConnIOUring returned nil!")
+				}
+				if refusal := quicBuildInitialClose(hdr.dcid, hdr.scid, quicErrConnectionRefused); refusal != nil {
+					uc.sendTo(refusal, remoteAddr)
+				}
+				if pbuf != nil {
+					quicRecvBufPool.Put(pbuf)
+				}
+				return
+			}
+			qc.applyAdmission(admission)
 		}
 		qc.handlePacketPooled(data, pbuf)
 		return
@@ -119,12 +127,12 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 
 	if qc, exists := connMap.Load(dcidKey); exists {
 		if debugFlag.Load() {
-			log.Printf("[H3-DBG] handleLongPacket: forwarding type=%d to existing conn", hdr.pktType)
+			Dbg("[H3-DBG] handleLongPacket: forwarding type=%d to existing conn", hdr.pktType)
 		}
 		qc.handlePacketPooled(data, pbuf)
 	} else {
 		if debugFlag.Load() {
-			log.Printf("[H3-DBG] handleLongPacket: no conn found for dcid=%x type=%d", hdr.dcid, hdr.pktType)
+			Dbg("[H3-DBG] handleLongPacket: no conn found for dcid=%x type=%d", hdr.dcid, hdr.pktType)
 		}
 		if pbuf != nil {
 			quicRecvBufPool.Put(pbuf)
@@ -132,7 +140,7 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 	}
 }
 
-func (s *Server) handleQUICShortPacketIOUring(uc uringUDPSender, remoteAddr *net.UDPAddr, data []byte, pbuf *[]byte, connMap *quicConnMap) {
+func (s *Server) handleQUICShortPacketIOUring(uc uringUDPSender, from *syscall.RawSockaddrInet4, data []byte, pbuf *[]byte, connMap *quicConnMap) {
 	if len(data) < 1+quicConnIDLen {
 		if pbuf != nil {
 			quicRecvBufPool.Put(pbuf)
@@ -144,12 +152,15 @@ func (s *Server) handleQUICShortPacketIOUring(uc uringUDPSender, remoteAddr *net
 
 	qc, exists := connMap.Load(dcidKey)
 	if !exists {
+		if reset := s.statelessResetFor(data); reset != nil {
+			uc.sendTo(reset, sockaddrToUDPAddr(from))
+		}
 		if pbuf != nil {
 			quicRecvBufPool.Put(pbuf)
 		}
 		return
 	}
-	qc.handlePacketPooled(data, pbuf)
+	qc.handlePacketFromPooled(data, pbuf, sockaddrToAddrPort(from))
 }
 
 func newQUICConnIOUring(server *Server, uc uringUDPSender, remoteAddr *net.UDPAddr, dcid, scid []byte) *QUICConn {
@@ -159,20 +170,51 @@ func newQUICConnIOUring(server *Server, uc uringUDPSender, remoteAddr *net.UDPAd
 	return qc
 }
 
-func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAddr, dcid, scid []byte, connMap *quicConnMap) *QUICConn {
+func (s *Server) admitQUICConn(remoteAddr *net.UDPAddr) (ipKey string, ok bool) {
+	limits := s.limits.Load()
+	if limiter := s.perIPConnLimiter.Load(); limiter != nil && limits.MaxConnsPerIP > 0 && !s.trustedProxies.active {
+		ipKey = extractIP(remoteAddr.String())
+		if !limiter.acquire(ipKey, limits.MaxConnsPerIP) {
+			return "", false
+		}
+	}
+	if !tryAcquireQUICHandshakeSlot(limits) {
+		s.releaseQUICConnIP(ipKey)
+		return "", false
+	}
 	if !s.tryTrackConn() {
+		quicHandshakingConns.Add(-1)
+		s.releaseQUICConnIP(ipKey)
+		return "", false
+	}
+	return ipKey, true
+}
+
+func (s *Server) releaseQUICConnIP(ipKey string) {
+	if ipKey != "" {
+		s.perIPConnLimiter.Load().release(ipKey)
+	}
+}
+
+func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAddr, dcid, scid []byte, connMap *quicConnMap) *QUICConn {
+	ipKey, admitted := s.admitQUICConn(remoteAddr)
+	if !admitted {
 		return nil
 	}
 	clientKeys, serverKeys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
+		quicHandshakingConns.Add(-1)
 		s.releaseTrackedConn()
+		s.releaseQUICConnIP(ipKey)
 		if debugFlag.Load() {
-			log.Printf("[QUIC] derive initial keys: %v", err)
+			Dbg("[QUIC] derive initial keys: %v", err)
 		}
 		return nil
 	}
 
 	qc := newQUICConnIOUring(s, uc, remoteAddr, dcid, scid)
+	qc.handshakeCounted.Store(true)
+	qc.connMap = connMap
 	qc.keys[quicSpaceInitial] = clientKeys
 	qc.sendKeys[quicSpaceInitial] = serverKeys
 
@@ -187,12 +229,10 @@ func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAdd
 	s.quicTimers.add(qc, s.done)
 
 	quicActiveConns.Add(1)
-	quicHandshakingConns.Add(1)
 	Stats.ActiveConns.Add(1)
-	qc.handshakeCounted.Store(true)
 	Stats.TotalConns.Add(1)
 	if debugFlag.Load() {
-		log.Printf("[QUIC] new io_uring connection from %s dcid=%x scid=%x tlsState=%v keys=%v",
+		Dbg("[QUIC] new io_uring connection from %s dcid=%x scid=%x tlsState=%v keys=%v",
 			remoteAddr, dcid, qc.srcCID(), qc.tlsState != nil, qc.keys[quicSpaceInitial] != nil)
 	}
 
@@ -202,9 +242,11 @@ func (s *Server) createQUICConnIOUring(uc uringUDPSender, remoteAddr *net.UDPAdd
 		quicActiveConns.Add(-1)
 		Stats.ActiveConns.Add(-1)
 		s.releaseTrackedConn()
+		s.releaseQUICConnIP(ipKey)
 		qc.clearHandshaking()
 		connMap.Delete(dcidKey)
 		connMap.Delete(srcCIDKey)
+		qc.unregisterIssuedCIDs(connMap)
 		if origKey != dcidKey {
 			connMap.Delete(origKey)
 		}

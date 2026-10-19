@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -77,7 +79,7 @@ func TestQUICStreamReassembly_OutOfOrder(t *testing.T) {
 	if len(s.recvBuf) != 0 {
 		t.Fatalf("out-of-order frame should not be readable yet, got %q", s.recvBuf)
 	}
-	s.handleStreamFrame(quicStreamFrame{offset: 0, data: []byte("HELLO"), fin: true})
+	s.handleStreamFrame(quicStreamFrame{offset: 0, data: []byte("HELLO")})
 	if string(s.recvBuf) != "HELLOWORLD" {
 		t.Fatalf("expected reassembled \"HELLOWORLD\", got %q", s.recvBuf)
 	}

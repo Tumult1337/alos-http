@@ -343,7 +343,13 @@ srv.Router.GET("/download", func(req *core.Request, resp *core.Response) {
 })
 ```
 
+- Streamed responses (handlers that write through a `StreamWriter`, such as SSE, and proxied backend responses over 64 KiB or of unknown length) carry the server's CORS headers, but `OnResponse` hooks and `EnableCompress` compression are applied only to buffered responses.
+
 ## Status
 
 ALOS HTTP is an actively developed framework with a strong focus on performance-sensitive serving, proxying, and low-level protocol control. API surface may continue to evolve while the project is being expanded.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Copyright (c) 2026 guno1928.
 

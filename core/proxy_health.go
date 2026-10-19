@@ -1,7 +1,8 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,14 +64,14 @@ func (hc *healthChecker) loop() {
 					states[i].successCount++
 					if !b.Healthy.Load() && states[i].successCount >= hc.config.SuccessThreshold {
 						b.Healthy.Store(true)
-						log.Printf("[HEALTH] %s is now HEALTHY", b.Addr)
+						logger().Info("backend healthy", "backend", b.Addr)
 					}
 				} else {
 					states[i].successCount = 0
 					states[i].failCount++
 					if b.Healthy.Load() && states[i].failCount >= hc.config.FailThreshold {
 						b.Healthy.Store(false)
-						log.Printf("[HEALTH] %s is now UNHEALTHY", b.Addr)
+						logger().Warn("backend unhealthy", "backend", b.Addr)
 					}
 				}
 			}
@@ -83,18 +84,18 @@ func (hc *healthChecker) loop() {
 }
 
 func (hc *healthChecker) check(b *backend) bool {
-	return probeBackendHealth(b.Addr, b.TLS, b.TLSSkipVerify, hc.config)
+	return probeBackendHealth(b.Addr, b.TLS, b.TLSSkipVerify, b.trust, hc.config)
 }
 
-func probeBackendHealth(addr string, useTLS, skipVerify bool, cfg HealthCheckConfig) bool {
+func probeBackendHealth(addr string, useTLS, skipVerify bool, trust *upstreamTrust, cfg HealthCheckConfig) bool {
 	if cfg.Path == "" {
-		return probeBackendTCP(addr, useTLS, skipVerify, cfg.Timeout)
+		return probeBackendTCP(addr, useTLS, skipVerify, trust, cfg.Timeout)
 	}
-	return probeBackendHTTP(addr, useTLS, skipVerify, cfg)
+	return probeBackendHTTP(addr, useTLS, skipVerify, trust, cfg)
 }
 
-func probeBackendTCP(addr string, useTLS, skipVerify bool, timeout time.Duration) bool {
-	conn, err := dialBackendConn(addr, useTLS, skipVerify, timeout)
+func probeBackendTCP(addr string, useTLS, skipVerify bool, trust *upstreamTrust, timeout time.Duration) bool {
+	conn, err := dialBackendConn(addr, useTLS, skipVerify, trust, timeout)
 	if err != nil {
 		return false
 	}
@@ -102,8 +103,8 @@ func probeBackendTCP(addr string, useTLS, skipVerify bool, timeout time.Duration
 	return true
 }
 
-func probeBackendHTTP(addr string, useTLS, skipVerify bool, cfg HealthCheckConfig) bool {
-	conn, err := dialBackendConn(addr, useTLS, skipVerify, cfg.Timeout)
+func probeBackendHTTP(addr string, useTLS, skipVerify bool, trust *upstreamTrust, cfg HealthCheckConfig) bool {
+	conn, err := dialBackendConn(addr, useTLS, skipVerify, trust, cfg.Timeout)
 	if err != nil {
 		return false
 	}

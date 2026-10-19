@@ -1,8 +1,10 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"encoding/hex"
-	"log"
+	"fmt"
 	"sync/atomic"
 )
 
@@ -15,13 +17,13 @@ var debugFlag atomic.Bool
 // Example: SetDebugFlag(false)
 func SetDebugFlag(on bool) { debugFlag.Store(on) }
 
-// Dbg logs a formatted message prefixed with "[DEBUG] " when debug logging
+// Dbg logs a formatted message at slog.LevelDebug when debug logging
 // is enabled via SetDebugFlag; it is a no-op otherwise.
 //
 // Example: Dbg("accepted %d bytes from %s", n, addr)
 func Dbg(format string, v ...interface{}) {
 	if debugFlag.Load() {
-		log.Printf("[DEBUG] "+format, v...)
+		logger().Debug(fmt.Sprintf(format, v...))
 	}
 }
 
@@ -35,8 +37,8 @@ func DbgHex(label string, data []byte) {
 		return
 	}
 	if len(data) <= 48 {
-		log.Printf("[DEBUG] %s: (%d bytes)\n%s", label, len(data), hex.Dump(data))
+		logger().Debug(label, "bytes", len(data), "hex", hex.EncodeToString(data))
 	} else {
-		log.Printf("[DEBUG] %s: %d bytes", label, len(data))
+		logger().Debug(label, "bytes", len(data))
 	}
 }

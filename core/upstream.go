@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -16,6 +16,20 @@ type UpstreamResponse = fpResponse
 // UpstreamConfig tunes the loops, pooling and timeouts. Zero fields take
 // documented defaults.
 type UpstreamConfig = fpConfig
+
+var (
+	ErrUpstreamTimeout        = errFPTimeout
+	ErrUpstreamConnClosed     = errFPConnClosed
+	ErrUpstreamDialFailed     = errFPDialFailed
+	ErrUpstreamBadResponse    = errFPBadResponse
+	ErrUpstreamBodyTooLarge   = errFPBodyTooLarge
+	ErrUpstreamHeaderTooLarge = errFPHeaderTooLarge
+	ErrUpstreamClientClosed   = errFPClientClosed
+	ErrUpstreamBadAuthority   = errFPBadAuthority
+	ErrUpstreamDNSFailed      = errFPDNSFailed
+	ErrUpstreamTooManyConns   = errFPTooManyConns
+	ErrUpstreamBodySource     = errFPBodySource
+)
 
 // NewUpstreamClient starts the event loops and returns a client ready to use.
 // Callers should keep one client for the lifetime of the process so that

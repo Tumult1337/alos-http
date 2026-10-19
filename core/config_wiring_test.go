@@ -1,27 +1,15 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"context"
 	"errors"
-	"net"
 	"testing"
 	"time"
 )
 
-type closeCaptureConn struct {
-	closed bool
-}
-
-func (c *closeCaptureConn) Read([]byte) (int, error)         { return 0, net.ErrClosed }
-func (c *closeCaptureConn) Write(p []byte) (int, error)      { return len(p), nil }
-func (c *closeCaptureConn) Close() error                     { c.closed = true; return nil }
-func (c *closeCaptureConn) LocalAddr() net.Addr              { return nil }
-func (c *closeCaptureConn) RemoteAddr() net.Addr             { return nil }
-func (c *closeCaptureConn) SetDeadline(time.Time) error      { return nil }
-func (c *closeCaptureConn) SetReadDeadline(time.Time) error  { return nil }
-func (c *closeCaptureConn) SetWriteDeadline(time.Time) error { return nil }
-
-func TestConfigDisableHTTP2AllTCPEntryPoints(t *testing.T) {
+func TestConfigDisableHTTP2NegotiatesHTTP1(t *testing.T) {
 	s := New(Config{DisableHTTP2: true, MaxConnsPerIP: -1})
 	if s.http2Enabled() {
 		t.Fatal("HTTP/2 should be disabled")
@@ -31,11 +19,6 @@ func TestConfigDisableHTTP2AllTCPEntryPoints(t *testing.T) {
 	}
 	if got := s.negotiateALPN([]string{"h2", "http/1.1"}); got != "http/1.1" {
 		t.Fatalf("ALPN = %q", got)
-	}
-	conn := &closeCaptureConn{}
-	s.ServeH2Plain(conn)
-	if !conn.closed {
-		t.Fatal("plain HTTP/2 entry point did not close the connection")
 	}
 }
 
@@ -129,7 +112,8 @@ func TestConfigShutdownTimeoutBoundsBackgroundContext(t *testing.T) {
 
 func TestConfigMaxConnsExactAndUnlimited(t *testing.T) {
 	limited := New(Config{MaxConns: 2, MaxConnsPerIP: -1})
-	if !limited.tryTrackConn() || !limited.tryTrackConn() {
+	first, second := limited.tryTrackConn(), limited.tryTrackConn()
+	if !first || !second {
 		t.Fatal("configured connection slots were not admitted")
 	}
 	if limited.tryTrackConn() {

@@ -1,12 +1,16 @@
+//go:build linux && amd64
+
 package core
 
 import (
 	"errors"
-	"log"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/guno1928/turbo"
 )
 
 // HTTPRoute defines an HTTP (non-TLS) routing rule for the server. When the
@@ -41,19 +45,15 @@ var httpRouteEngine = &ProxyEngine{}
 // timeouts and non-blocking relaying to a path that had none.
 func newHTTPRouteDomain(addr, hostHeader string) *domainState {
 	cfg := DomainConfig{
-		Domain:     addr,
-		HostHeader: hostHeader,
-		Backends:   []BackendConfig{{Addr: addr}},
+		Domain:       addr,
+		HostHeader:   hostHeader,
+		PreserveHost: hostHeader == "",
+		Backends:     []BackendConfig{{Addr: addr}},
 	}
 	cfg.normalize()
 	b := &backend{Addr: addr}
 	b.Healthy.Store(true)
-	backends := []*backend{b}
-	return &domainState{
-		config:   cfg,
-		backends: backends,
-		balancer: newBalancer(cfg.LoadBalancer, backends),
-	}
+	return newDomainState(cfg, []*backend{b})
 }
 
 type httpRoutesSnapshot struct {
@@ -105,6 +105,8 @@ func normalizeRouteAddr(addr string) string {
 //
 // Example: hr.SetRoutes([]HTTPRoute{{PathPrefix: "/api/", Backend: "10.0.0.5:3000"}})
 func (hr *HTTPRouter) SetRoutes(routes []HTTPRoute) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
 	entries := make([]httpRouteEntry, len(routes))
 	for i, r := range routes {
 		addr := normalizeRouteAddr(r.Backend)
@@ -191,32 +193,78 @@ func (s *Server) startHTTPRedirect() error {
 			_ = ln.Close()
 		}
 	}(listeners)
+	budget := &httpRedirectBudget{}
 	for _, ln := range listeners {
 		ln := ln
-		go s.serveHTTPRedirectListener(ln)
+		go s.serveHTTPRedirectListener(ln, budget)
 	}
-	log.Printf("[HTTP] %d redirect listener(s) started on %s", len(listeners), addr)
+	s.logger().Info("HTTP redirect listening", "addr", addr, "listeners", len(listeners))
 	return nil
 }
 
-func (s *Server) serveHTTPRedirectListener(listener net.Listener) {
+const (
+	acceptRetryMinDelay = 5 * time.Millisecond
+	acceptRetryMaxDelay = time.Second
+)
+
+func nextAcceptRetryDelay(prev time.Duration) time.Duration {
+	if prev <= 0 {
+		return acceptRetryMinDelay
+	}
+	return min(prev*2, acceptRetryMaxDelay)
+}
+
+const httpRedirectConnShare = 8
+
+type httpRedirectBudget struct {
+	active atomic.Int64
+}
+
+func (b *httpRedirectBudget) tryAcquire(maxConns int64) bool {
+	n := b.active.Add(1)
+	if maxConns > 0 && n > max(maxConns/httpRedirectConnShare, 1) {
+		b.active.Add(-1)
+		return false
+	}
+	return true
+}
+
+func (b *httpRedirectBudget) release() {
+	b.active.Add(-1)
+}
+
+func (s *Server) serveHTTPRedirectListener(listener net.Listener, budget *httpRedirectBudget) {
+	var retryDelay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if s.doneClosed() || errors.Is(err, net.ErrClosed) {
 				return
 			}
-			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			return
+			retryDelay = nextAcceptRetryDelay(retryDelay)
+			turbo.Sleep(retryDelay)
+			continue
 		}
-		go s.serveHTTPRedirectConn(conn)
+		retryDelay = 0
+		go s.serveHTTPRedirectConn(conn, budget)
 	}
 }
 
-func (s *Server) serveHTTPRedirectConn(conn net.Conn) {
+func (s *Server) serveHTTPRedirectConn(conn net.Conn, budget *httpRedirectBudget) {
+	limits := s.limits.Load()
+	if !budget.tryAcquire(limits.MaxConns) {
+		conn.Close()
+		return
+	}
+	defer budget.release()
+	if limiter := s.perIPConnLimiter.Load(); limiter != nil && limits.MaxConnsPerIP > 0 && !s.trustedProxies.active {
+		key := extractIP(conn.RemoteAddr().String())
+		if !limiter.acquire(key, limits.MaxConnsPerIP) {
+			conn.Close()
+			return
+		}
+		defer limiter.release(key)
+	}
 	if !s.tryTrackConn() {
 		conn.Close()
 		return
@@ -255,29 +303,25 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 		return
 	}
 
-	if s.httpRouter != nil {
-		route := s.httpRouter.match(path)
-		if route != nil {
-			s.proxyHTTPRoute(conn, buf, route, host, path)
+	if hr := s.httpRouter.Load(); hr != nil {
+		route := hr.match(sanitizeRequestPath(path))
+		if route != nil && route.ds != nil {
+			s.proxyHTTPRoute(conn, buf, route.ds)
 			return
 		}
 	}
 
 	if hasPrefix(path, "/.well-known/acme-challenge/") {
 		if debugFlag.Load() {
-			log.Printf("[HTTP] ACME challenge request from %s: %s%s", conn.RemoteAddr(), host, path)
+			Dbg("[HTTP] ACME challenge request from %s: %s%s", conn.RemoteAddr(), host, path)
 		}
 
 		ai := s.acme.Load()
 		if ai != nil && ai.acmeNode != "" {
 			if debugFlag.Load() {
-				log.Printf("[HTTP] proxying ACME challenge to node %s", ai.acmeNode)
+				Dbg("[HTTP] proxying ACME challenge to node %s", ai.acmeNode)
 			}
-			route := &httpRouteEntry{
-				pathPrefix: "/.well-known/acme-challenge/",
-				addr:       normalizeRouteAddr(ai.acmeNode),
-			}
-			s.proxyHTTPRoute(conn, buf, route, host, path)
+			s.proxyHTTPRoute(conn, buf, newHTTPRouteDomain(normalizeRouteAddr(ai.acmeNode), ""))
 			return
 		}
 
@@ -285,17 +329,17 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 			resp, ok := ai.HandleHTTP01(path)
 			if ok {
 				if debugFlag.Load() {
-					log.Printf("[HTTP] ACME challenge SERVED: %s (len=%d)", path, len(resp))
+					Dbg("[HTTP] ACME challenge SERVED: %s (len=%d)", path, len(resp))
 				}
 				_ = writeFull(conn, buildACMEResponse(resp))
 				return
 			}
 			if debugFlag.Load() {
-				log.Printf("[HTTP] ACME challenge NOT FOUND in handler: %s", path)
+				Dbg("[HTTP] ACME challenge NOT FOUND in handler: %s", path)
 			}
 		} else {
 			if debugFlag.Load() {
-				log.Printf("[HTTP] ACME challenge request but ACME not enabled: %s", path)
+				Dbg("[HTTP] ACME challenge request but ACME not enabled: %s", path)
 			}
 		}
 
@@ -319,80 +363,166 @@ func (s *Server) handleHTTPRedirect(conn net.Conn) {
 	_ = writeFull(conn, resp)
 }
 
-func (s *Server) proxyHTTPRoute(clientConn net.Conn, rawReq []byte, route *httpRouteEntry, host, path string) {
-	backendConn, err := DialTCP4(route.addr, 5*time.Second)
-	if err != nil {
-		log.Printf("[HTTP-ROUTE] failed to connect to %s for %s: %v", route.addr, path, err)
-		_ = writeFull(clientConn, []byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+func (s *Server) proxyHTTPRoute(conn net.Conn, raw []byte, ds *domainState) {
+	req := &Request{}
+	headerEnd, contentLength, hasContentLength, _, reject, chunked, tooLarge, ok := parseH1RequestHead(raw, req, s.limits.Load().MaxHeaderSize, s.config.MaxHeaderCount)
+	switch {
+	case tooLarge:
+		writeHTTPRouteStatus(conn, 431)
+		return
+	case !ok || reject != h1RejectNone || req.expect == h1ExpectUnknown || !httpRouteTargetSafe(req):
+		writeHTTPRouteStatus(conn, 400)
+		return
+	case hasContentLength && s.requestBodyTooLarge(contentLength):
+		writeHTTPRouteStatus(conn, 413)
 		return
 	}
-	defer backendConn.Close()
-
-	if route.hostHeader != "" {
-		rawReq = rewriteHostHeader(rawReq, route.hostHeader)
+	switch {
+	case chunked:
+		body, status, err := s.readHTTPRouteChunkedBody(conn, raw[headerEnd:], req.expect == h1ExpectContinue)
+		if status != 0 {
+			writeHTTPRouteStatus(conn, status)
+		}
+		if status != 0 || err != nil {
+			return
+		}
+		req.Body = body
+	case hasContentLength && contentLength > 0:
+		body, err := readHTTPRouteBody(conn, raw, headerEnd, contentLength, req.expect == h1ExpectContinue)
+		if err != nil {
+			return
+		}
+		req.Body = body
 	}
+	req.Path, _ = splitPathQuery(req.RawPath)
+	req.Host = req.cachedHost
+	req.setOwnedRemoteAddr(conn.RemoteAddr().String())
+	if s.trustedProxies.active {
+		applyTrustedRealIP(req, s.trustedProxies)
+	}
+	req.server = s
+	req.conn = conn
+	req.connTakenOver = true
+	resp := &Response{}
+	resp.lazyReq = req
 
-	backendConn.SetWriteDeadline(timeNow().Add(10 * time.Second))
-	err = writeFull(backendConn, rawReq)
-	if err != nil {
-		log.Printf("[HTTP-ROUTE] write to %s failed: %v", route.addr, err)
-		_ = writeFull(clientConn, []byte("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	b := ds.backends[0]
+	err := httpRouteEngine.forwardRequestFP(req, resp, b, &ds.config)
+	if sw := req.StreamWriter; sw != nil {
+		releaseStreamWriter(sw)
 		return
 	}
-
-	backendConn.SetReadDeadline(timeNow().Add(30 * time.Second))
-	rbp := LargeBufPool.Get().(*[]byte)
-	readBuf := (*rbp)[:cap(*rbp)]
-	for {
-		n, rerr := backendConn.Read(readBuf)
-		if n > 0 {
-			if err := writeFull(clientConn, readBuf[:n]); err != nil {
-				break
-			}
-		}
-		if rerr != nil {
-			break
-		}
+	if err != nil {
+		s.logger().Warn("HTTP route backend failed", "backend", b.Addr, "path", req.Path, "err", err)
+		writeHTTPRouteStatus(conn, proxyFailureStatus(err))
+		return
 	}
-	*rbp = readBuf
-	putBoxedBufCapped(&LargeBufPool, rbp, largeBufPoolMaxCap)
+	_ = writeFull(conn, appendPlainResponseClose(resp, nil))
 }
 
-func rewriteHostHeader(raw []byte, newHost string) []byte {
-	s := UnsafeString(raw)
-	hostIdx := -1
-	hostEnd := -1
-	rest := s
-	offset := 0
-	for {
-		nl := indexCRLF(rest)
-		if nl < 0 || nl == 0 {
-			break
+func writeHTTPRouteStatus(conn net.Conn, status int) {
+	out := make([]byte, 0, 96)
+	out = append(out, "HTTP/1.1 "...)
+	out = appendInt(out, status)
+	out = append(out, ' ')
+	out = append(out, statusText(status)...)
+	out = append(out, "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"...)
+	_ = writeFull(conn, out)
+}
+
+const (
+	httpRouteBodyGrowStep    = 64 << 10
+	httpRouteChunkedReadStep = 16 << 10
+)
+
+var httpRouteContinue = []byte("HTTP/1.1 100 Continue\r\n\r\n")
+
+func readHTTPRouteBody(conn net.Conn, raw []byte, headerEnd, contentLength int, sendContinue bool) ([]byte, error) {
+	need := headerEnd + contentLength
+	if len(raw) < need && sendContinue {
+		if err := writeFull(conn, httpRouteContinue); err != nil {
+			return nil, err
 		}
-		line := rest[:nl]
-		colon := indexByte(line, ':')
-		if colon > 0 && EqualFoldASCII(line[:colon], "host") {
-			hostIdx = offset + colon + 1
-			hostEnd = offset + nl
-			break
+	}
+	buf := raw
+	for len(buf) < need {
+		if len(buf) == cap(buf) {
+			buf = slices.Grow(buf, min(need-len(buf), max(len(buf), httpRouteBodyGrowStep)))
 		}
-		offset += nl + 2
-		rest = rest[nl+2:]
+		n, err := conn.Read(buf[len(buf):min(need, cap(buf))])
+		buf = buf[:len(buf)+n]
+		if err != nil && len(buf) < need {
+			return nil, err
+		}
 	}
-	if hostIdx < 0 {
-		return raw
+	return buf[headerEnd:need], nil
+}
+
+func (s *Server) readHTTPRouteChunkedBody(conn net.Conn, in []byte, sendContinue bool) (body []byte, status int, err error) {
+	var d chunkedDecoder
+	for !d.done() {
+		consumed, data, decodeErr := d.next(in)
+		if decodeErr != nil {
+			return nil, 400, nil
+		}
+		in = in[consumed:]
+		body = append(body, data...)
+		if s.requestBodyTooLarge(len(body)) {
+			return nil, 413, nil
+		}
+		if consumed > 0 {
+			continue
+		}
+		if sendContinue {
+			sendContinue = false
+			if err := writeFull(conn, httpRouteContinue); err != nil {
+				return nil, 0, err
+			}
+		}
+		in = slices.Grow(in, httpRouteChunkedReadStep)
+		n, readErr := conn.Read(in[len(in):cap(in)])
+		in = in[:len(in)+n]
+		if readErr != nil && n == 0 {
+			return nil, 0, readErr
+		}
 	}
-	bp := MediumBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	buf = append(buf, raw[:hostIdx]...)
-	buf = append(buf, ' ')
-	buf = append(buf, newHost...)
-	buf = append(buf, raw[hostEnd:]...)
-	result := make([]byte, len(buf))
-	copy(result, buf)
-	*bp = buf[:0]
-	MediumBufPool.Put(bp)
-	return result
+	return body, 0, nil
+}
+
+func httpRouteTargetSafe(req *Request) bool {
+	rawPath, _ := splitPathQuery(req.RawPath)
+	return hasCanonicalSegments(rawPath) && !hasEncodedPathDelimiter(rawPath) && indexByte(rawPath, '\\') < 0
+}
+
+func hasCanonicalSegments(p string) bool {
+	if len(p) == 0 || p[0] != '/' {
+		return false
+	}
+	start := 1
+	for i := 1; i <= len(p); i++ {
+		if i < len(p) && p[i] != '/' {
+			continue
+		}
+		seg := p[start:i]
+		if seg == "." || seg == ".." || seg == "" && i < len(p) {
+			return false
+		}
+		start = i + 1
+	}
+	return true
+}
+
+func hasEncodedPathDelimiter(p string) bool {
+	for i := 0; i+2 < len(p); i++ {
+		if p[i] != '%' {
+			continue
+		}
+		hi, lo := p[i+1], p[i+2]|0x20
+		if hi == '2' && (lo == 'e' || lo == 'f') || hi == '5' && lo == 'c' {
+			return true
+		}
+	}
+	return false
 }
 
 func buildACMEResponse(body []byte) []byte {

@@ -13,32 +13,32 @@ func xffReq(port, realIP string) *Request {
 
 func TestHandoffConn_ReleasesIPSlotOnClose(t *testing.T) {
 	s := New(Config{MaxConnsPerIP: 1})
-	defer s.perIPConnLimiter.Stop()
+	defer s.perIPConnLimiter.Load().Stop()
 
-	if !s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
+	if !s.perIPConnLimiter.Load().acquire("203.0.113.5", s.Limits().MaxConnsPerIP) {
 		t.Fatal("first acquire should succeed")
 	}
 
 	_, srvSide := net.Pipe()
-	tracked := s.trackHandoffConn(srvSide, "203.0.113.5", false)
+	tracked := s.trackHandoffConn(srvSide, "203.0.113.5", false, nil)
 	if tracked == nil {
 		t.Fatal("trackHandoffConn returned nil")
 	}
 
-	if s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
+	if s.perIPConnLimiter.Load().acquire("203.0.113.5", s.Limits().MaxConnsPerIP) {
 		t.Fatal("slot must stay held while the streamed connection is alive")
 	}
 
 	_ = tracked.Close()
 
-	if !s.perIPConnLimiter.acquire("203.0.113.5", s.maxConnsPerIP) {
+	if !s.perIPConnLimiter.Load().acquire("203.0.113.5", s.Limits().MaxConnsPerIP) {
 		t.Fatal("slot must be released once the streamed connection closes")
 	}
 }
 
 func TestAcquireIPConn_ProxyModeRewritesRealIPNoLimit(t *testing.T) {
 	s := New(Config{ProxyMode: true, MaxConnsPerIP: 2})
-	defer s.perIPConnLimiter.Stop()
+	defer s.perIPConnLimiter.Load().Stop()
 
 	req := xffReq("1", "203.0.113.9")
 	c1 := &epollConn{}
@@ -58,7 +58,7 @@ func TestAcquireIPConn_ProxyModeRewritesRealIPNoLimit(t *testing.T) {
 
 func TestAcquireIPConn_NonProxyDeferredToAccept(t *testing.T) {
 	s := New(Config{MaxConnsPerIP: 1})
-	defer s.perIPConnLimiter.Stop()
+	defer s.perIPConnLimiter.Load().Stop()
 	c := &epollConn{}
 	if !c.acquireIPConn(s, &Request{RemoteAddr: "10.0.0.1:1"}) {
 		t.Fatal("non-proxy acquireIPConn must return true (enforced at accept, not here)")
@@ -70,7 +70,7 @@ func TestAcquireIPConn_NonProxyDeferredToAccept(t *testing.T) {
 
 func TestAcquireIPConn_ProxyModeNoLimitAcrossConns(t *testing.T) {
 	s := New(Config{ProxyMode: true, MaxConnsPerIP: 1})
-	defer s.perIPConnLimiter.Stop()
+	defer s.perIPConnLimiter.Load().Stop()
 	c := &epollConn{}
 	if !c.acquireIPConn(s, xffReq("1", "203.0.113.1")) {
 		t.Fatal("first acquire should succeed")

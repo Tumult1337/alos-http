@@ -1,11 +1,19 @@
+//go:build linux && amd64
+
 package core
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
+	"math"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/alosmap"
+	"github.com/guno1928/turbo"
 )
 
 // SessionConfig configures the Sessions middleware.
@@ -139,19 +147,95 @@ func (s *Session) Regenerate() bool {
 }
 
 type sessionEntry struct {
-	data map[string]any
+	data      map[string]any
+	expiresAt int64
+}
+
+type sessionEvictionCandidate struct {
+	id    string
+	entry *sessionEntry
 }
 
 // MemorySessionStore is an in-memory SessionStore suitable for single-process use.
 type MemorySessionStore struct {
-	entries *alosmap.TypedMap[string, *sessionEntry]
+	entries       *alosmap.TypedMap[string, *sessionEntry]
+	maxEntries    int64
+	evictionBatch int64
+	tracked       atomic.Int64
+	evictMu       sync.Mutex
 }
+
+const (
+	memorySessionDefaultMaxEntries    = 100_000
+	memorySessionEvictionBatchDivisor = 8
+	memorySessionNeverExpires         = math.MaxInt64
+)
 
 // NewMemorySessionStore returns an empty in-memory SessionStore.
 func NewMemorySessionStore() *MemorySessionStore {
-	return &MemorySessionStore{
-		entries: alosmap.NewTyped[string, *sessionEntry]().Prealloc(256),
+	return NewMemorySessionStoreWithMaxEntries(memorySessionDefaultMaxEntries)
+}
+
+func NewMemorySessionStoreWithMaxEntries(maxEntries int) *MemorySessionStore {
+	if maxEntries <= 0 {
+		maxEntries = memorySessionDefaultMaxEntries
 	}
+	return &MemorySessionStore{
+		entries:       alosmap.NewTyped[string, *sessionEntry]().Prealloc(256),
+		maxEntries:    int64(maxEntries),
+		evictionBatch: max(1, int64(maxEntries)/memorySessionEvictionBatchDivisor),
+	}
+}
+
+func (s *MemorySessionStore) reserveEntry() {
+	for {
+		n := s.tracked.Load()
+		if n >= s.maxEntries {
+			s.makeRoom()
+			continue
+		}
+		if s.tracked.CompareAndSwap(n, n+1) {
+			return
+		}
+	}
+}
+
+func (s *MemorySessionStore) makeRoom() {
+	s.evictMu.Lock()
+	defer s.evictMu.Unlock()
+	if s.tracked.Load() < s.maxEntries {
+		return
+	}
+	s.entries.CleanupNow()
+	live := s.evictionCandidates()
+	remaining := int64(len(live))
+	if excess := remaining - (s.maxEntries - s.evictionBatch); excess > 0 {
+		slices.SortFunc(live, func(a, b sessionEvictionCandidate) int {
+			return cmp.Compare(a.entry.expiresAt, b.entry.expiresAt)
+		})
+		for _, victim := range live[:excess] {
+			if s.entries.CompareAndDelete(victim.id, victim.entry) {
+				remaining--
+			}
+		}
+	}
+	s.tracked.Store(remaining)
+}
+
+func (s *MemorySessionStore) evictionCandidates() []sessionEvictionCandidate {
+	live := make([]sessionEvictionCandidate, 0, min(s.maxEntries, int64(s.entries.Len())))
+	s.entries.Range(func(id string, entry *sessionEntry) bool {
+		live = append(live, sessionEvictionCandidate{id: id, entry: entry})
+		return true
+	})
+	return live
+}
+
+func sessionExpiresAt(ttl time.Duration) int64 {
+	if ttl <= 0 {
+		return memorySessionNeverExpires
+	}
+	return turbo.UnixNano() + int64(ttl)
 }
 
 // Get returns a copy of the stored session data for id, and whether it was found.
@@ -169,13 +253,20 @@ func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
 
 // Save stores a copy of data under id, expiring it after maxAge seconds (no expiry when maxAge <= 0).
 func (s *MemorySessionStore) Save(id string, data map[string]any, maxAge int) {
+	s.saveWithTTL(id, data, time.Duration(maxAge)*time.Second)
+}
+
+func (s *MemorySessionStore) saveWithTTL(id string, data map[string]any, ttl time.Duration) {
 	cp := make(map[string]any, len(data))
 	for k, v := range data {
 		cp[k] = v
 	}
-	entry := &sessionEntry{data: cp}
-	if maxAge > 0 {
-		s.entries.StoreWithTTL(id, entry, time.Duration(maxAge)*time.Second)
+	entry := &sessionEntry{data: cp, expiresAt: sessionExpiresAt(ttl)}
+	if !s.entries.Has(id) {
+		s.reserveEntry()
+	}
+	if ttl > 0 {
+		s.entries.StoreWithTTL(id, entry, ttl)
 	} else {
 		s.entries.Store(id, entry)
 	}
@@ -183,7 +274,9 @@ func (s *MemorySessionStore) Save(id string, data map[string]any, maxAge int) {
 
 // Delete removes the stored session data for id.
 func (s *MemorySessionStore) Delete(id string) {
-	s.entries.Delete(id)
+	if _, ok := s.entries.Delete(id); ok {
+		s.tracked.Add(-1)
+	}
 }
 
 func generateSessionID() (string, bool) {

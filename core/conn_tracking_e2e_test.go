@@ -1,4 +1,4 @@
-//go:build linux && amd64 && e2e
+//go:build linux && amd64
 
 package core
 
@@ -13,17 +13,25 @@ import (
 	"time"
 )
 
-var ctPort int32 = 18300
+var (
+	ctSlowEntered atomic.Int32
+	ctSlowRelease atomic.Pointer[chan struct{}]
+)
 
-func ctNextAddr() string {
-	p := atomic.AddInt32(&ctPort, 1)
-	return fmt.Sprintf(":%d", p)
+func ctHoldSlow() (release func()) {
+	gate := make(chan struct{})
+	ctSlowEntered.Store(0)
+	ctSlowRelease.Store(&gate)
+	return func() { close(gate) }
 }
 
 func ctRegister(s *Server) {
 	s.Router.GET("/x", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
 	s.Router.GET("/slow", func(req *Request, resp *Response) {
-		time.Sleep(700 * time.Millisecond)
+		ctSlowEntered.Add(1)
+		if gate := ctSlowRelease.Load(); gate != nil {
+			<-*gate
+		}
 		resp.Status(200).String("slow")
 	})
 	s.Router.GET("/large", func(req *Request, resp *Response) {
@@ -101,27 +109,28 @@ func ctWaitReady(addr string) bool {
 }
 
 func ctStart(t *testing.T, cfg Config) (*Server, string) {
-	addr := ctNextAddr()
+	addr := freeLoopbackAddr(t)
 	cfg.Addr = addr
 	cfg.PlainHTTP = true
 	cfg.WebSocketOriginMode = WSOriginOff
 	s := New(cfg)
 	ctRegister(s)
 	go func() { _ = s.ListenAndServeEpollH2(addr) }()
+	t.Cleanup(func() { stopServer(s) })
 	if !ctWaitReady(addr) {
 		t.Fatalf("server on %s did not come up", addr)
 	}
-	if s.perIPConnLimiter != nil {
+	if s.perIPConnLimiter.Load() != nil {
 		ctWaitCount(t, s, ctIP, 0, 5*time.Second, "server baseline must settle to zero after readiness checks")
 	}
 	return s, addr
 }
 
 func ctCount(s *Server, ip string) int64 {
-	if s.perIPConnLimiter == nil {
+	if s.perIPConnLimiter.Load() == nil {
 		return -1
 	}
-	if c, ok := s.perIPConnLimiter.m.Load(ip); ok {
+	if c, ok := s.perIPConnLimiter.Load().m.Load(ip); ok {
 		return c.n.Load()
 	}
 	return 0
@@ -285,7 +294,7 @@ func TestCTE2E_NoLeakUnderChurn(t *testing.T) {
 }
 
 func TestCTE2E_IdleTimeoutReapsAndReleases(t *testing.T) {
-	s, addr := ctStart(t, Config{Listeners: 1, MaxConnsPerIP: 1000, ReadTimeout: 30 * time.Second, IdleTimeout: 1 * time.Second})
+	s, addr := ctStart(t, Config{Listeners: 1, MaxConnsPerIP: 1000, ReadTimeout: 30 * time.Second, IdleTimeout: 150 * time.Millisecond})
 	ctWaitCount(t, s, ctIP, 0, 3*time.Second, "baseline")
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -303,7 +312,7 @@ func TestCTE2E_IdleTimeoutReapsAndReleases(t *testing.T) {
 }
 
 func TestCTE2E_ReadTimeoutClosesAndReleases(t *testing.T) {
-	s, addr := ctStart(t, Config{Listeners: 1, MaxConnsPerIP: 1000, ReadTimeout: 1 * time.Second, IdleTimeout: 30 * time.Second})
+	s, addr := ctStart(t, Config{Listeners: 1, MaxConnsPerIP: 1000, ReadTimeout: 150 * time.Millisecond, IdleTimeout: 30 * time.Second})
 	ctWaitCount(t, s, ctIP, 0, 3*time.Second, "baseline")
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -354,6 +363,7 @@ func TestCTE2E_RequestLimiter(t *testing.T) {
 	t.Run("concurrent over limit gets 429, in-flight complete", func(t *testing.T) {
 		var wg sync.WaitGroup
 		results := make([]string, 3)
+		release := ctHoldSlow()
 		for i := 0; i < 3; i++ {
 			wg.Add(1)
 			go func(idx int) {
@@ -361,8 +371,9 @@ func TestCTE2E_RequestLimiter(t *testing.T) {
 				results[idx] = ctReqStatus(t, addr, "/slow", "203.0.113.30")
 			}(i)
 		}
-		time.Sleep(200 * time.Millisecond)
-		over := ctReqStatus(t, addr, "/slow", "203.0.113.30")
+		waitFor(t, harnessIOTimeout, func() bool { return ctSlowEntered.Load() == 3 })
+		over := ctReqStatus(t, addr, "/x", "203.0.113.30")
+		release()
 		if !strings.Contains(over, "429") {
 			t.Fatalf("4th concurrent request from same real IP must be 429, got %q", over)
 		}
@@ -376,12 +387,15 @@ func TestCTE2E_RequestLimiter(t *testing.T) {
 
 	t.Run("different real IP is unaffected", func(t *testing.T) {
 		var wg sync.WaitGroup
+		release := ctHoldSlow()
 		for i := 0; i < 3; i++ {
 			wg.Add(1)
 			go func() { defer wg.Done(); ctReqStatus(t, addr, "/slow", "203.0.113.30") }()
 		}
-		time.Sleep(200 * time.Millisecond)
-		if other := ctReqStatus(t, addr, "/x", "203.0.113.31"); !strings.Contains(other, "200") {
+		waitFor(t, harnessIOTimeout, func() bool { return ctSlowEntered.Load() == 3 })
+		other := ctReqStatus(t, addr, "/x", "203.0.113.31")
+		release()
+		if !strings.Contains(other, "200") {
 			t.Fatalf("a different real IP must not be limited by another IP's in-flight requests, got %q", other)
 		}
 		wg.Wait()
@@ -399,7 +413,7 @@ func TestCTE2E_RequestLimiterIdleSafe(t *testing.T) {
 }
 
 func TestCTE2E_WriteTimeoutClosesAndReleases(t *testing.T) {
-	s, addr := ctStart(t, Config{Listeners: 1, MaxConnsPerIP: 1000, ReadTimeout: 30 * time.Second, WriteTimeout: 1 * time.Second, IdleTimeout: 30 * time.Second})
+	s, addr := ctStart(t, Config{Listeners: 1, MaxConnsPerIP: 1000, ReadTimeout: 30 * time.Second, WriteTimeout: 150 * time.Millisecond, IdleTimeout: 30 * time.Second})
 	ctWaitCount(t, s, ctIP, 0, 3*time.Second, "baseline")
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {

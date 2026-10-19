@@ -57,10 +57,48 @@ func (c *epollConn) h1Reject(out []byte, status int, msg string) []byte {
 	return appendPlainResponseClose(&c.resp, out)
 }
 
+func (c *epollConn) h1ServiceUnavailable(out []byte, keepAlive bool) []byte {
+	statsBlocked()
+	c.resp.Reset()
+	c.resp.Status(503).String("Service Unavailable")
+	return appendPlainResponseMode(&c.resp, out, keepAlive, true)
+}
+
+func (c *epollConn) h1BodyReadDeadline() int64 {
+	if c.h1BodyDeadline == 0 {
+		c.h1BodyDeadline = deadlineFrom(c.worker.readTO)
+	}
+	return c.h1BodyDeadline
+}
+
+const (
+	tlsDirectSealMinBody   = 16 << 10
+	tls12DirectSealMinBody = 2 * MaxRecordPayload
+)
+
+func (c *epollConn) directSealMinBody() int {
+	if c.tls12 != nil {
+		return tls12DirectSealMinBody
+	}
+	return tlsDirectSealMinBody
+}
+
+func (c *epollConn) h1AppendResponse(out []byte, keepAlive bool) []byte {
+	if !c.tls || c.resp.BodyLen() < c.directSealMinBody() || c.resp.transmittedBodyLen() == 0 {
+		return appendPlainResponseMode(&c.resp, out, keepAlive, true)
+	}
+	head := appendPlainResponseMode(&c.resp, out, keepAlive, false)
+	c.writeBuf = c.sealTLSAppDataParts(c.writeBuf, head, c.resp.bodyBytesUnsafe())
+	return head[:0]
+}
+
 func (c *epollConn) h1WriteResponse(keepAlive bool) {
 	if c.tls {
-		plain := appendPlainResponseMode(&c.resp, c.plainBuf[:0], keepAlive, true)
-		c.writeBuf = c.sealTLSAppData(c.writeBuf, plain)
+		addAltSvcHeader(&c.resp, c.worker.server)
+		plain := c.h1AppendResponse(c.plainBuf[:0], keepAlive)
+		if len(plain) > 0 {
+			c.writeBuf = c.sealTLSAppData(c.writeBuf, plain)
+		}
 		c.plainBuf = plain[:0]
 		return
 	}
@@ -99,6 +137,9 @@ func (c *epollConn) epollTLSHTTP1(srv *Server) int {
 	case h1StepDispatched:
 		c.h1OutEnd(out)
 		c.compactAppConsumed()
+		if c.h1BodyWantsInput() {
+			return epollTLSContinue
+		}
 		return epollActionNeedRead
 	}
 	c.h1OutEnd(out)
@@ -115,20 +156,31 @@ func (c *epollConn) compactAppConsumed() {
 
 func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 	maxRead := srv.effectiveReadCap()
-	proxyActive := srv.httpRouter != nil
+	proxyActive := srv.httpRouter.Load() != nil
+	if c.h1In != nil {
+		c.h1FeedBody(c.worker)
+	}
+	if c.dispatching {
+		return out, h1StepDispatched
+	}
 	for len(c.h1Unread()) > 0 {
 		if c.h1PendingWrite(out) > c.worker.maxPendingWrite {
 			return out, h1StepClose
 		}
 		data := c.h1Unread()
-		if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data); ok && !proxyActive {
-			if !srv.tryAcquireRequestSlot() {
-				return out, h1StepNeedInput
-			}
+		if len(data) >= 2 && data[0] == '\r' && data[1] == '\n' {
+			c.h1Advance(2)
+			continue
+		}
+		if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data, c.tls); ok && !proxyActive && !srv.shuttingDown.Load() {
 			Stats.TotalReqs.Add(1)
 			Stats.RawReqs.Add(1)
-			srv.releaseRequestSlot()
-			out = append(out, resp...)
+			if srv.tryAcquireRequestSlot() {
+				srv.releaseRequestSlot()
+				out = append(out, resp...)
+			} else {
+				out = c.h1ServiceUnavailable(out, !closeConn)
+			}
 			c.h1Advance(consumed)
 			if closeConn {
 				return out, h1StepClose
@@ -137,18 +189,24 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		}
 
 		c.req.resetFastH1()
-		headerEnd, contentLength, hasContentLength, closeConn, badTE, chunked, tooLarge, ok := ParseH1RequestHead(data, &c.req, srv.config.MaxHeaderSize, srv.config.MaxHeaderCount)
+		headerEnd, contentLength, hasContentLength, closeConn, reject, chunked, tooLarge, ok := parseH1RequestHead(data, &c.req, c.worker.maxHeaderSize, srv.config.MaxHeaderCount)
 		if tooLarge {
 			return c.h1Reject(out, 431, "Request Header Fields Too Large"), h1StepClose
 		}
 		if !ok {
 			return out, h1StepNeedInput
 		}
+		closeConn = closeConn || srv.shuttingDown.Load()
 		consumed := headerEnd
-		if badTE {
+		if reject != h1RejectNone {
+			Stats.H1Rejected.Add(1)
 			return c.h1Reject(out, 400, "Bad Request"), h1StepClose
 		}
-		if chunked {
+		if c.req.expect == h1ExpectUnknown {
+			return c.h1Reject(out, 417, "Expectation Failed"), h1StepClose
+		}
+		streamBody := c.worker.streamsH1Body(chunked, hasContentLength, contentLength)
+		if chunked && !streamBody {
 			if !c.reserveH1BodyBudget(srv, h1ChunkedBodyReservation(srv)) {
 				return c.h1Reject(out, 503, "Request Body Capacity Exhausted"), h1StepClose
 			}
@@ -163,58 +221,75 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			}
 			if status == 0 {
 				c.chunkScanPos = resume
-				if srv.config.MaxBodySize > 0 && int64(len(data)-headerEnd) > srv.config.MaxBodySize+chunkedFramingSlack {
+				if c.worker.bodyTooLarge(int64(len(data)-headerEnd) - chunkedFramingSlack) {
 					return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
 				}
-				c.deadline = deadlineFrom(c.worker.readTO)
-				return out, h1StepNeedInput
+				c.deadline = c.h1BodyReadDeadline()
+				return c.h1Continue(out), h1StepNeedInput
 			}
 			c.chunkScanPos = 0
-			decoded, dok := decodeChunkedInto(c.reqBodyCopy[:0], data[headerEnd:bodyEnd])
+			decoded, trailers, dok := decodeChunkedInto(c.reqBodyCopy[:0], data[headerEnd:bodyEnd])
 			if !dok {
 				return c.h1Reject(out, 400, "Bad Request"), h1StepClose
 			}
-			if srv.config.MaxBodySize > 0 && int64(len(decoded)) > srv.config.MaxBodySize {
+			if c.worker.bodyTooLarge(int64(len(decoded))) {
 				return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
 			}
 			c.reqBodyCopy = decoded
 			c.req.Body = decoded
+			c.req.trailers = trailers
 			consumed = bodyEnd
 		}
 		if hasContentLength {
 			if contentLength < 0 {
 				return c.h1Reject(out, 400, "Bad Request"), h1StepClose
 			}
-			if srv.config.MaxBodySize > 0 && int64(contentLength) > srv.config.MaxBodySize {
+			if c.worker.bodyTooLarge(int64(contentLength)) {
+				return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
+			}
+		}
+		if hasContentLength && !streamBody {
+			bodyEnd := headerEnd + contentLength
+			if bodyEnd < headerEnd {
+				return c.h1Reject(out, 400, "Bad Request"), h1StepClose
+			}
+			if bodyEnd > maxRead {
 				return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
 			}
 			if !c.reserveH1BodyBudget(srv, contentLength) {
 				return c.h1Reject(out, 503, "Request Body Capacity Exhausted"), h1StepClose
 			}
-			bodyEnd := headerEnd + contentLength
-			if bodyEnd < headerEnd {
-				return c.h1Reject(out, 400, "Bad Request"), h1StepClose
-			}
 			if bodyEnd > len(data) {
-				if !c.tls && c.h1Off+bodyEnd > cap(c.readBuf) && !c.growReadBuf(c.h1Off+bodyEnd, maxRead) {
-					return out, h1StepClose
+				if !c.tls && c.h1Off+bodyEnd > cap(c.readBuf) {
+					c.compactH1ReadBuffer()
+					if bodyEnd > cap(c.readBuf) && !c.growReadBuf(bodyEnd, maxRead) {
+						return c.h1Reject(out, 413, "Payload Too Large"), h1StepClose
+					}
 				}
-				c.deadline = deadlineFrom(c.worker.readTO)
-				return out, h1StepNeedInput
+				c.deadline = c.h1BodyReadDeadline()
+				return c.h1Continue(out), h1StepNeedInput
 			}
 			c.reqBodyCopy = append(c.reqBodyCopy[:0], data[headerEnd:bodyEnd]...)
 			c.req.Body = c.reqBodyCopy
 			consumed = bodyEnd
 		}
 
+		c.h1BodyDeadline = 0
 		Stats.TotalReqs.Add(1)
 		Stats.RawReqs.Add(1)
 		c.req.StreamWriter = nil
+		c.req.swFactory = nil
+		c.req.bodyStream = nil
 		c.req.conn = nil
 		c.req.server = srv
 		c.req.Host = c.req.cachedHost
-		c.req.RemoteAddr = c.remoteAddr
+		c.req.setOwnedRemoteAddr(c.remoteAddr)
 		c.req.IsTLS = c.tls
+		c.req.peerCerts = c.peerCerts
+		c.req.TLSVersion = c.tlsVersion
+		if srv.misdirectsClientAuth(c.tlsCertEntry, c.req.Host) {
+			return c.h1Reject(out, 421, "Misdirected Request"), h1StepClose
+		}
 		if !c.acquireIPConn(srv, &c.req) {
 			statsBlocked()
 			c.resp.resetFastH1()
@@ -226,6 +301,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		c.resp.lazyReq = &c.req
 
 		c.h1Advance(consumed)
+		c.h1ContinueSent = false
 		c.dispatching = true
 		c.inFlight++
 		gen := c.generation
@@ -234,29 +310,36 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		// A proxied request never leaves this thread: the backend socket joins
 		// the same epoll set, so no goroutine, wake-up or hand-off is involved.
 		// An upgrade answered with 101 turns the same pair into a byte tunnel.
-		if pe, ds := srv.matchProxyTarget(&c.req); ds != nil {
+		pe, ds := srv.matchProxyTarget(&c.req)
+		if ds != nil && !srv.proxyNeedsDispatch(pe, &c.req) {
 			c.h1OutEnd(out)
 			out = c.h1OutBegin()
-			if w.beginProxy(pe, ds, c, closeConn) == proxyStartPending {
+			start := w.beginProxy(pe, ds, c, closeConn)
+			if start == proxyStartPending {
 				return out, h1StepProxyInFlight
 			}
-			c.releaseH1BodyBudget()
-			c.dispatching = false
-			if c.inFlight > 0 {
-				c.inFlight--
+			if start == proxyStartServed {
+				c.releaseH1BodyBudget()
+				c.dispatching = false
+				if c.inFlight > 0 {
+					c.inFlight--
+				}
+				out = appendPlainResponseMode(&c.resp, out, !closeConn, true)
+				if closeConn {
+					return out, h1StepClose
+				}
+				continue
 			}
-			out = appendPlainResponseMode(&c.resp, out, !closeConn, true)
-			if closeConn {
-				return out, h1StepClose
-			}
-			continue
 		}
 		c.req.connTakenOver = false
-		if srv.config.InlineHandlers {
+		c.h1Cancel.attach(&c.req)
+		if srv.config.InlineHandlers && ds == nil {
+			c.h1OutEnd(out)
+			out = c.h1OutBegin()
 			c.req.attachConn = w.cachedInlineH1Attacher(c)
-			promoteRequestStrings(&c.req)
+			promoteRequestHead(&c.req, data[:headerEnd])
 			c.runH1Inline(srv)
-			if c.req.connTakenOver {
+			if c.req.connTakenOver || c.fd < 0 {
 				c.finishH1TakenOver()
 				return out, h1StepDetached
 			}
@@ -271,44 +354,70 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 				c.resp.Status(500).String("Streaming/Hijack unavailable")
 				return appendPlainResponseClose(&c.resp, out), h1StepClose
 			}
-			out = appendPlainResponseMode(&c.resp, out, !closeConn, true)
+			if c.h1LargeBody() {
+				c.h1OutEnd(out)
+				c.h1StartProgressiveBody(w, !closeConn)
+				return c.h1OutBegin(), h1StepDispatched
+			}
+			if c.tls {
+				addAltSvcHeader(&c.resp, srv)
+			}
+			out = c.h1AppendResponse(out, !closeConn)
 			if closeConn {
 				return out, h1StepClose
 			}
 			continue
 		}
 		c.req.attachConn = w.cachedH1Attacher(c, gen)
-		promoteRequestStrings(&c.req)
-		cc := c
-		fast := srv.fastDispatch.Load()
-		reqClose := closeConn
+		c.h1DispatchGen = gen
+		c.h1DispatchClose = closeConn
+		c.req.swFactory = c
+		promoteRequestHead(&c.req, data[:headerEnd])
+		if streamBody {
+			out = c.startH1BodyStream(w, out, chunked, contentLength)
+		}
+		c.h1DispatchFast = srv.fastDispatch.Load()
 		w.spawned++
-		go func() {
-			defer func() {
-				if r := recover(); r != nil {
-					cc.resp.resetFastH1()
-					cc.resp.Status(500).String("Internal Server Error")
-				}
-				w.postTask(func(w *epollWorker) { cc.finishH1Dispatch(w, gen, reqClose) })
-			}()
-			if fast {
-				handler := srv.Router.Lookup(cc.req.Method, cc.req.Path, &cc.req)
-				handler(&cc.req, &cc.resp)
-			} else {
-				srv.dispatch(&cc.req, &cc.resp)
-			}
-		}()
+		w.handlers.run(c.h1AsyncRunner())
 		return out, h1StepDispatched
 	}
 	return out, h1StepNeedInput
 }
 
-func (c *epollConn) runH1Inline(srv *Server) {
+func (c *epollConn) h1AsyncRunner() func() {
+	if c.h1AsyncFn == nil {
+		c.h1AsyncFn = c.runH1Async
+	}
+	return c.h1AsyncFn
+}
+
+func (c *epollConn) runH1Async() {
+	w := c.worker
+	srv := w.server
 	defer func() {
 		if r := recover(); r != nil {
+			srv.reportPanic(&c.req, r)
 			c.resp.resetFastH1()
 			c.resp.Status(500).String("Internal Server Error")
 		}
+		w.pushH1Done(c)
+	}()
+	if c.h1DispatchFast {
+		handler := srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)
+		handler(&c.req, &c.resp)
+		return
+	}
+	srv.dispatch(&c.req, &c.resp)
+}
+
+func (c *epollConn) runH1Inline(srv *Server) {
+	defer func() {
+		if r := recover(); r != nil {
+			srv.reportPanic(&c.req, r)
+			c.resp.resetFastH1()
+			c.resp.Status(500).String("Internal Server Error")
+		}
+		c.req.finishContext()
 	}()
 	if srv.fastDispatch.Load() {
 		handler := srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)
@@ -319,8 +428,10 @@ func (c *epollConn) runH1Inline(srv *Server) {
 }
 
 func (c *epollConn) finishH1TakenOver() {
-	if c.resp.IsStreamed() && !c.req.hijacked {
-		releaseStreamWriter(c.req.StreamWriter)
+	if !c.req.hijacked {
+		if c.resp.IsStreamed() {
+			releaseStreamWriter(c.req.StreamWriter)
+		}
 		if c.req.conn != nil {
 			_ = c.req.conn.Close()
 		}
@@ -336,10 +447,22 @@ func (c *epollConn) finishH1TakenOver() {
 }
 
 func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) {
+	c.req.finishContext()
+	if c.h1EndBodyStream() || w.server.shuttingDown.Load() {
+		reqClose = true
+	}
+	sw, _ := c.resp.sw.(*epollH1StreamWriter)
+	if sw != nil {
+		c.resp.sw = nil
+		c.req.StreamWriter = nil
+	}
 	if c.req.connTakenOver {
+		if sw != nil {
+			sw.release()
+		}
 		c.finishH1TakenOver()
 		if c.inFlight == 0 {
-			w.pool.put(c)
+			w.putTakenOver(c)
 		}
 		return
 	}
@@ -349,18 +472,33 @@ func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) 
 	}
 	c.req.attachConn = nil
 	if c.generation != gen || c.fd < 0 {
+		if sw != nil {
+			sw.fail(ErrStreamClosed)
+			sw.release()
+		}
 		if c.fd < 0 && c.inFlight == 0 {
 			w.pool.put(c)
 		}
 		return
 	}
 	c.dispatching = false
+	if sw != nil {
+		if sw.headerReady && !c.req.hijacked {
+			c.h1FinishStreamed(w, sw, !reqClose)
+			return
+		}
+		sw.release()
+	}
 	if c.req.hijacked || c.resp.IsStreamed() {
 		c.resp.Reset()
 		c.resp.Status(500).String("Streaming/Hijack unavailable")
 		c.h1WriteResponse(false)
 		c.closeAfter = true
 		w.markFlush(c)
+		return
+	}
+	if c.h1LargeBody() {
+		c.h1StartProgressiveBody(w, !reqClose)
 		return
 	}
 	c.h1WriteResponse(!reqClose)
@@ -396,39 +534,16 @@ func (c *epollConn) growReadBuf(minCap, maxRead int) bool {
 
 const chunkedFramingSlack = 1 << 16
 
-func decodeChunkedInto(dst, src []byte) ([]byte, bool) {
+func decodeChunkedInto(dst, src []byte) ([]byte, [][2]string, bool) {
+	d := chunkedDecoder{captureTrailers: true}
 	pos := 0
-	for {
-		nl := indexByteFrom(src, '\n', pos)
-		if nl < 0 {
-			return nil, false
+	for !d.done() {
+		n, data, err := d.next(src[pos:])
+		if err != nil || n == 0 {
+			return nil, nil, false
 		}
-		line := src[pos:nl]
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
-		}
-		if semi := indexByteFrom(line, ';', 0); semi >= 0 {
-			line = line[:semi]
-		}
-		line = trimASCIISpaceBytes(line)
-		size, ok := parseHex64Bytes(line)
-		if !ok {
-			return nil, false
-		}
-		pos = nl + 1
-		if size == 0 {
-			return dst, true
-		}
-		if size > int64(len(src)-pos) {
-			return nil, false
-		}
-		end := pos + int(size)
-		dst = append(dst, src[pos:end]...)
-		pos = end
-		nl2 := indexByteFrom(src, '\n', pos)
-		if nl2 < 0 {
-			return nil, false
-		}
-		pos = nl2 + 1
+		dst = append(dst, data...)
+		pos += n
 	}
+	return dst, d.trailers, true
 }

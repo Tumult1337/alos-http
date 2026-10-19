@@ -1,8 +1,10 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
 import (
+	"net/netip"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -11,6 +13,12 @@ const (
 	connHandshaking
 	connReady
 	connClosed
+	connResolving
+)
+
+const (
+	backendSocketEvents = unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP | unix.EPOLLET
+	dnsSocketEvents     = unix.EPOLLIN | unix.EPOLLET
 )
 
 const fpMaxBackendConns = 4096
@@ -47,9 +55,12 @@ type backendConn struct {
 	wbuf         byteBuffer
 	rbuf         byteBuffer
 	h1           h1Parser
+	dns          *fpDNSQuery
 	idleDeadline int64
 	openedSeq    uint32
 	reading      bool
+
+	uploadsWaiting int
 
 	// Pool limits inherited from the domain that opened or last reused this
 	// connection. Zero means fall back to the loop defaults.
@@ -77,15 +88,10 @@ func (l *beLoop) staleInBatch(c *backendConn) bool {
 
 func (l *beLoop) newConn(ex *Exchange) {
 	if l.liveConns >= fpMaxBackendConns {
-		l.finish(ex, fpErrTooManyConns)
+		l.finish(ex, errFPTooManyConns)
 		return
 	}
-	fd, err := dialNonBlocking(ex.ip, ex.port)
-	if err != nil {
-		l.finish(ex, fpErrDialFailed)
-		return
-	}
-	c := &backendConn{fd: fd, be: l, key: ex.key, state: connConnecting, openedSeq: l.seq}
+	c := &backendConn{fd: -1, be: l, key: ex.key, state: connConnecting}
 	c.adoptLimits(ex)
 	c.transport = l.newTransport(ex)
 	if ex.key.h2 {
@@ -95,21 +101,53 @@ func (l *beLoop) newConn(ex *Exchange) {
 	} else {
 		c.proto = &l.h1proto
 	}
+	l.liveConns++
+	l.assign(c, ex)
+	var err error
+	if ex.ip.IsValid() {
+		err = l.dialBackend(c, ex.ip, ex.port)
+	} else {
+		err = l.startResolve(c, ex)
+	}
+	if err != nil {
+		l.closeConn(c, err)
+	}
+}
+
+func (l *beLoop) dialBackend(c *backendConn, ip netip.Addr, port uint16) error {
+	fd, err := dialNonBlocking(ip, port)
+	if err != nil {
+		return errFPDialFailed
+	}
+	c.state = connConnecting
+	if err := l.adoptSocket(c, fd, backendSocketEvents); err != nil {
+		return errFPDialFailed
+	}
+	return nil
+}
+
+func (l *beLoop) adoptSocket(c *backendConn, fd int, events uint32) error {
+	ev := unix.EpollEvent{Events: events, Fd: int32(fd), Pad: epollFDClassBackend}
+	if err := unix.EpollCtl(l.ep, unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
+		_ = unix.Close(fd)
+		return err
+	}
 	l.ensureFD(fd)
 	l.conns[fd] = c
-	l.liveConns++
-	ev := unix.EpollEvent{
-		Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP | unix.EPOLLET,
-		Fd:     int32(fd),
-		Pad:    epollFDClassBackend,
-	}
-	if err := unix.EpollCtl(l.ep, unix.EPOLL_CTL_ADD, fd, &ev); err != nil {
-		l.conns[fd] = nil
-		_ = unix.Close(fd)
-		l.finish(ex, fpErrDialFailed)
+	c.fd = fd
+	c.openedSeq = l.seq
+	return nil
+}
+
+func (l *beLoop) releaseSocket(c *backendConn) {
+	if c.fd < 0 {
 		return
 	}
-	l.assign(c, ex)
+	_ = unix.Close(c.fd)
+	if c.fd < len(l.conns) {
+		l.conns[c.fd] = nil
+	}
+	c.fd = -1
 }
 
 func (l *beLoop) assign(c *backendConn, ex *Exchange) {
@@ -136,7 +174,7 @@ func (c *backendConn) send(p []byte) {
 
 func (l *beLoop) onConnConnected(c *backendConn) {
 	if err := socketError(c.fd); err != nil {
-		l.closeConn(c, fpErrDialFailed)
+		l.closeConn(c, errFPDialFailed)
 		return
 	}
 	c.state = connHandshaking
@@ -167,8 +205,35 @@ func (l *beLoop) readableUntil(c *backendConn, peerHungUp bool) {
 		return
 	}
 	c.reading = true
+	defer l.endRead(c)
+	if c.dns != nil {
+		l.dnsReadable(c)
+		return
+	}
 	l.readLoop(c, peerHungUp)
+}
+
+func (l *beLoop) endRead(c *backendConn) {
 	c.reading = false
+	if r := recover(); r != nil {
+		l.afterPanic(c, r)
+	}
+}
+
+func (l *beLoop) recoverSweep(c *backendConn) {
+	if r := recover(); r != nil {
+		l.afterPanic(c, r)
+	}
+}
+
+func (l *beLoop) afterPanic(c *backendConn, recovered any) {
+	defer func() {
+		if again := recover(); again != nil {
+			l.panicReporter.reportPanic(nil, again)
+		}
+	}()
+	l.panicReporter.reportPanic(nil, recovered)
+	l.closeConn(c, errFPBadResponse)
 }
 
 func (l *beLoop) readLoop(c *backendConn, peerHungUp bool) {
@@ -218,7 +283,7 @@ func (l *beLoop) readLoop(c *backendConn, peerHungUp bool) {
 func (l *beLoop) peerClosed(c *backendConn) {
 	if c.tunnelClient != nil {
 		l.sink.closeTunnelPeer(c)
-		l.closeConn(c, fpErrConnClosed)
+		l.closeConn(c, errFPConnClosed)
 		return
 	}
 	if c.state == connReady && !c.key.h2 && c.cur != nil {
@@ -227,7 +292,7 @@ func (l *beLoop) peerClosed(c *backendConn) {
 			return
 		}
 	}
-	l.closeConn(c, fpErrConnClosed)
+	l.closeConn(c, errFPConnClosed)
 }
 
 func (l *beLoop) pauseBackendRead(c *backendConn) {
@@ -261,15 +326,20 @@ func (l *beLoop) flushWrites(c *backendConn) {
 	for c.state != connClosed {
 		p := c.wbuf.unread()
 		if len(p) == 0 {
+			l.wakeWaitingUploads(c)
 			return
 		}
 		n, err := socketSend(c.fd, p)
 		if n > 0 {
 			c.wbuf.consume(n)
+			if c.state == connReady && c.cur != nil {
+				c.cur.wroteRequest = true
+			}
 			continue
 		}
 		if err == unix.EAGAIN {
 			c.wbuf.compact()
+			l.wakeWaitingUploads(c)
 			return
 		}
 		if err == unix.EINTR {
@@ -286,12 +356,9 @@ func (l *beLoop) closeConn(c *backendConn, err error) {
 	}
 	c.state = connClosed
 	l.liveConns--
-	if c.fd >= 0 {
-		_ = unix.Close(c.fd)
-		if c.fd < len(l.conns) {
-			l.conns[c.fd] = nil
-		}
-		c.fd = -1
+	l.releaseSocket(c)
+	if c.dns != nil {
+		l.dnsAbandon(c)
 	}
 	l.removeIdle(c)
 	if c.key.h2 && l.h2conns[c.key] == c {
@@ -309,9 +376,9 @@ func (l *beLoop) closeConn(c *backendConn, err error) {
 
 func (l *beLoop) failOrRetry(ex *Exchange, err error, c *backendConn) {
 	if err == nil {
-		err = fpErrConnClosed
+		err = errFPConnClosed
 	}
-	if c.reused && !c.gotBytes && !ex.retried && err != fpErrTimeout {
+	if c.reused && !c.gotBytes && !ex.retried && err != errFPTimeout && (!ex.wroteRequest || ex.replayable) {
 		ex.retried = true
 		l.startExchange(ex)
 		return
@@ -325,6 +392,9 @@ func (l *beLoop) finish(ex *Exchange, err error) {
 	}
 	ex.finished = true
 	ex.err = err
+	if ex.pipe != nil {
+		ex.pipe.deliverBuffered(&ex.resp, err)
+	}
 	if ex.done != nil {
 		close(ex.done)
 		return

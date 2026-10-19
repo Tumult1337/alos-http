@@ -1,11 +1,17 @@
+//go:build linux && amd64
+
 package core
 
 import (
+	"errors"
 	"fmt"
 	"html"
+	"io/fs"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 )
 
 // StaticConfig configures the file server returned by Static.
@@ -29,8 +35,6 @@ type StaticConfig struct {
 	Index  string
 	Browse bool
 }
-
-const maxStaticFileSize = 64 << 20
 
 func sanitizeStaticPath(p string) (string, bool) {
 	if strings.ContainsAny(p, "\x00\\") {
@@ -65,12 +69,10 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 	if err != nil {
 		absRoot = cfg.Root
 	}
+	root := newStaticRoot(absRoot)
 
 	return func(req *Request, resp *Response) {
-		reqPath := req.Path
-		if strings.HasPrefix(reqPath, urlPrefix) {
-			reqPath = reqPath[len(urlPrefix):]
-		}
+		reqPath := strings.TrimPrefix(req.Path, urlPrefix)
 		if reqPath == "" {
 			reqPath = "/"
 		}
@@ -85,9 +87,7 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
-		if strings.HasPrefix(cleanRel, "/") {
-			cleanRel = cleanRel[1:]
-		}
+		cleanRel = strings.TrimPrefix(cleanRel, "/")
 
 		fullPath := filepath.Join(absRoot, filepath.FromSlash(cleanRel))
 
@@ -105,11 +105,9 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			resp.Status(403).String("Forbidden")
 			return
 		}
-		if resolved, rerr := filepath.EvalSymlinks(absFullPath); rerr == nil {
-			if resolved != absRoot && !strings.HasPrefix(resolved, rootWithSep) {
-				resp.Status(403).String("Forbidden")
-				return
-			}
+		if status := root.contains(absFullPath); status != 0 {
+			resp.Status(status).String(http.StatusText(status))
+			return
 		}
 
 		info, err := os.Stat(absFullPath)
@@ -120,14 +118,7 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 
 		if info.IsDir() {
 			indexPath := filepath.Join(absFullPath, cfg.Index)
-			if indexInfo, err := os.Stat(indexPath); err == nil && !indexInfo.IsDir() {
-				data, err := os.ReadFile(indexPath)
-				if err != nil {
-					resp.Status(500).String("Internal Server Error")
-					return
-				}
-				mime := detectMIME(indexPath)
-				resp.Status(200).SetHeader("Content-Type", mime).SetBody(data)
+			if root.contains(indexPath) == 0 && serveStaticFile(req, resp, indexPath) {
 				return
 			}
 
@@ -150,6 +141,9 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 				b.WriteString("</h1><ul>")
 				for _, entry := range entries {
 					name := entry.Name()
+					if _, listable := sanitizeStaticPath(name); !listable {
+						continue
+					}
 					if entry.IsDir() {
 						name += "/"
 					}
@@ -164,18 +158,78 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
-		if fi, serr := os.Stat(absFullPath); serr == nil && fi.Size() > maxStaticFileSize {
-			resp.Status(413).String("File Too Large")
-			return
+		if !serveStaticFile(req, resp, absFullPath) {
+			resp.Status(404).String("Not Found")
 		}
-		data, err := os.ReadFile(absFullPath)
-		if err != nil {
-			resp.Status(500).String("Internal Server Error")
-			return
-		}
-		mime := detectMIME(absFullPath)
-		resp.Status(200).SetHeader("Content-Type", mime).SetBody(data)
 	}
+}
+
+type staticRoot struct {
+	abs      string
+	resolved atomic.Pointer[staticRootDir]
+}
+
+type staticRootDir struct {
+	dir        string
+	dirWithSep string
+}
+
+func newStaticRoot(absRoot string) *staticRoot {
+	root := &staticRoot{abs: absRoot}
+	root.resolved.Store(newStaticRootDir(evalStaticRoot(absRoot)))
+	return root
+}
+
+func evalStaticRoot(absRoot string) string {
+	dir, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return absRoot
+	}
+	return dir
+}
+
+func newStaticRootDir(dir string) *staticRootDir {
+	return &staticRootDir{dir: dir, dirWithSep: strings.TrimSuffix(dir, string(os.PathSeparator)) + string(os.PathSeparator)}
+}
+
+func (d *staticRootDir) holds(resolved string) bool {
+	return resolved == d.dir || strings.HasPrefix(resolved, d.dirWithSep)
+}
+
+func (root *staticRoot) contains(path string) int {
+	resolved, err := filepath.EvalSymlinks(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return http.StatusNotFound
+	}
+	if err != nil {
+		return http.StatusForbidden
+	}
+	current := root.resolved.Load()
+	if current.holds(resolved) {
+		return 0
+	}
+	if dir := evalStaticRoot(root.abs); dir != current.dir {
+		fresh := newStaticRootDir(dir)
+		root.resolved.Store(fresh)
+		if fresh.holds(resolved) {
+			return 0
+		}
+	}
+	return http.StatusForbidden
+}
+
+func serveStaticFile(req *Request, resp *Response, path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	_ = resp.serveContent(req, f, fi, detectMIME(path), nil)
+	return true
 }
 
 // StaticDir serves the directory root under urlPrefix using default StaticConfig; it is shorthand for Static(urlPrefix, StaticConfig{Root: root}).

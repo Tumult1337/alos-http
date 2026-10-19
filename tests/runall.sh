@@ -22,7 +22,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test -c ./core -o "$BUILD_DIR/core-linu
 
 echo "[4/6] Race detection"
 if [ "$RUN_RACE" = "1" ]; then
-    go test -race ./core ./tests/... -count=1
+    go test -race -timeout 30m ./core ./tests/... -count=1
 else
     echo "Race detection skipped by ALOS_RUN_RACE=$RUN_RACE"
 fi

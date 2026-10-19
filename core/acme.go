@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -9,9 +11,10 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
-	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,6 +24,7 @@ import (
 	"time"
 
 	"github.com/guno1928/alosmap"
+	"github.com/guno1928/turbo"
 	"golang.org/x/crypto/acme"
 )
 
@@ -56,13 +60,18 @@ type ACMEConfig struct {
 }
 
 const (
-	acmeRetryInterval   = 5 * time.Minute
-	acmeRetryMax        = 3
 	acmeLongWait        = 24 * time.Hour
 	acmeAuthzRetryMax   = 5
 	acmeRenewBefore     = 30 * 24 * time.Hour
 	acmeRenewCheckEvery = 6 * time.Hour
+	acmeMinWake         = time.Minute
+
+	acmeRenewalProbeTimeout  = 2 * ariFetchTimeout
+	acmeARITimeoutRetry      = 15 * time.Minute
+	acmeRenewLifetimeDivisor = 3
 )
+
+var errACMEPanicked = &staticError{"ACME operation panicked"}
 
 type acmeIntegration struct {
 	server   *Server
@@ -82,6 +91,12 @@ type acmeIntegration struct {
 	localIPs   atomic.Pointer[[]net.IP]
 	stop       chan struct{}
 	registered atomic.Bool
+
+	schedule   acmeSchedule
+	httpClient *http.Client
+	now        func() time.Time
+	obtainCert func(domain string) error
+	sleep      func(d time.Duration) bool
 }
 
 type acmeChallenge struct {
@@ -91,12 +106,15 @@ type acmeChallenge struct {
 
 func acmePrintf(format string, args ...any) {
 	if debugFlag.Load() {
-		log.Printf(format, args...)
+		Dbg(format, args...)
 		return
 	}
 	lower := strings.ToLower(format)
-	if strings.Contains(lower, "failed") || strings.Contains(lower, "warning") || strings.Contains(lower, "obtained cert") || strings.Contains(lower, "renewal failed") || strings.Contains(lower, "renewal succeeded") {
-		log.Printf(format, args...)
+	switch {
+	case strings.Contains(lower, "failed") || strings.Contains(lower, "warning"):
+		logger().Warn(fmt.Sprintf(format, args...))
+	case strings.Contains(lower, "obtained cert") || strings.Contains(lower, "renewal succeeded"):
+		logger().Info(fmt.Sprintf(format, args...))
 	}
 }
 
@@ -141,7 +159,11 @@ func newACMEIntegration(cfg ACMEConfig, s *Server) *acmeIntegration {
 			Key:          key,
 			DirectoryURL: directoryURL,
 		},
+		httpClient: &http.Client{Timeout: ariFetchTimeout},
+		now:        wallNow,
 	}
+	ai.obtainCert = ai.obtain
+	ai.sleep = ai.sleepUnlessStopped
 
 	acmePrintf("[ACME] account email: %s", cfg.Email)
 	acmePrintf("[ACME] LE directory: %s", directoryURL)
@@ -312,14 +334,8 @@ func (ai *acmeIntegration) HandleHTTP01(path string) ([]byte, bool) {
 		return nil, false
 	}
 	token := path[len(prefix):]
-
-	for i := 0; i < len(token); i++ {
-		if token[i] == '/' || token[i] == '\\' || token[i] == '.' || token[i] == 0 {
-			acmePrintf("[ACME] HTTP-01 challenge rejected: invalid token characters")
-			return nil, false
-		}
-	}
-	if token == "" {
+	if !validACMEToken(token) {
+		acmePrintf("[ACME] HTTP-01 challenge rejected: invalid token characters")
 		return nil, false
 	}
 
@@ -362,19 +378,43 @@ func (ai *acmeIntegration) Stop() {
 }
 
 func (ai *acmeIntegration) runLoop() {
+	defer ai.recoverPanic()
 	ai.primeInitial()
+	for ai.sleep(ai.renewAllRecovered()) {
+		ai.refreshLocalIPs()
+	}
+}
 
-	ticker := time.NewTicker(acmeRenewCheckEvery)
-	defer ticker.Stop()
+func (ai *acmeIntegration) recoverPanic() {
+	if r := recover(); r != nil {
+		ai.server.reportPanic(nil, r)
+	}
+}
 
-	for {
-		select {
-		case <-ai.stop:
-			return
-		case <-ticker.C:
-			ai.refreshLocalIPs()
-			ai.renewAll()
+func (ai *acmeIntegration) renewAllRecovered() (wake time.Duration) {
+	wake = acmeMinWake
+	defer ai.recoverPanic()
+	return ai.renewAll()
+}
+
+func (ai *acmeIntegration) obtainCertRecovered(domain string) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			ai.server.reportPanic(nil, r)
+			err = errACMEPanicked
 		}
+	}()
+	return ai.obtainCert(domain)
+}
+
+func (ai *acmeIntegration) sleepUnlessStopped(d time.Duration) bool {
+	timer := turbo.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ai.stop:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -408,7 +448,7 @@ func (ai *acmeIntegration) initialObtainAll() {
 		if ai.tryLoadCached(domain) {
 			continue
 		}
-		ai.obtainWithRetry(domain)
+		go ai.obtainWithRetry(domain)
 	}
 }
 
@@ -654,40 +694,29 @@ func (ai *acmeIntegration) getAuthorizationWithRetry(ctx context.Context, orderU
 }
 
 func (ai *acmeIntegration) obtainWithRetry(domain string) {
-	if !ai.domainPointsHere(domain) {
-		acmePrintf("[ACME] %s does not point to this machine, will retry in 24h", domain)
-		go ai.deferredObtain(domain)
-		return
-	}
-
-	for attempt := 1; attempt <= acmeRetryMax; attempt++ {
-		acmePrintf("[ACME] obtaining cert for %s (attempt %d/%d)", domain, attempt, acmeRetryMax)
-		err := ai.obtain(domain)
+	defer ai.recoverPanic()
+	for failures := 0; ; {
+		if !ai.domainPointsHere(domain) {
+			acmePrintf("[ACME] %s does not point to this machine, will retry in 24h", domain)
+			if !ai.sleep(acmeLongWait) {
+				return
+			}
+			ai.refreshLocalIPs()
+			continue
+		}
+		acmePrintf("[ACME] obtaining cert for %s (attempt %d)", domain, failures+1)
+		err := ai.obtainCertRecovered(domain)
 		if err == nil {
 			return
 		}
-		acmePrintf("[ACME] attempt %d/%d for %s FAILED: %v", attempt, acmeRetryMax, domain, err)
-		if attempt < acmeRetryMax {
-			acmePrintf("[ACME] waiting 5 minutes before retry...")
-			select {
-			case <-ai.stop:
-				return
-			case <-time.After(acmeRetryInterval):
-			}
+		failures++
+		delay := acmeRetryDelay(err, failures)
+		acmePrintf("[ACME] attempt %d for %s FAILED: %v; retrying in %s", failures, domain, err, delay.Round(time.Second))
+		if !ai.sleep(delay) {
+			return
 		}
+		ai.refreshLocalIPs()
 	}
-	acmePrintf("[ACME] all %d attempts exhausted for %s, will retry in 24h", acmeRetryMax, domain)
-	go ai.deferredObtain(domain)
-}
-
-func (ai *acmeIntegration) deferredObtain(domain string) {
-	select {
-	case <-ai.stop:
-		return
-	case <-time.After(acmeLongWait):
-	}
-	ai.refreshLocalIPs()
-	ai.obtainWithRetry(domain)
 }
 
 func (ai *acmeIntegration) ensureRegistered(ctx context.Context) error {
@@ -758,6 +787,11 @@ func (ai *acmeIntegration) obtain(domain string) error {
 		if chal == nil {
 			acmePrintf("[ACME] no http-01 challenge offered for %s", domain)
 			return &staticError{"no http-01 challenge offered for " + domain}
+		}
+
+		if !validACMEToken(chal.Token) {
+			acmePrintf("[ACME] CA offered an http-01 token outside the base64url alphabet for %s", domain)
+			return &staticError{"invalid http-01 token offered for " + domain}
 		}
 
 		keyAuth, err := ai.client.HTTP01ChallengeResponse(chal.Token)
@@ -872,46 +906,144 @@ func (ai *acmeIntegration) obtain(domain string) error {
 	return nil
 }
 
+func validACMEToken(token string) bool {
+	if token == "" {
+		return false
+	}
+	for i := 0; i < len(token); i++ {
+		c := token[i]
+		if !(c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+			return false
+		}
+	}
+	return true
+}
+
 func (ai *acmeIntegration) cleanupChallenge(domain, token string) {
 	ai.challenges.Delete(domain)
+	if !validACMEToken(token) {
+		return
+	}
 	tokenFile := filepath.Join(ai.challengeDir, token)
 	if err := os.Remove(tokenFile); err != nil && !os.IsNotExist(err) {
 		acmePrintf("[ACME] WARNING: failed to remove challenge file %s: %v", tokenFile, err)
 	}
 }
 
-func (ai *acmeIntegration) renewDomainOnce(domain string) {
-	if err := ai.obtain(domain); err != nil {
-		acmePrintf("[ACME] renewal FAILED for %s: %v", domain, err)
-		acmePrintf("[ACME] renewal for %s will retry on the next scheduled check in %s", domain, acmeRenewCheckEvery)
-		return
+func (ai *acmeIntegration) renewDomainOnce(domain string, st *acmeRenewalState) time.Duration {
+	err := ai.obtainCertRecovered(domain)
+	ai.schedule.mu.Lock()
+	defer ai.schedule.mu.Unlock()
+	if err != nil {
+		delay := st.recordFailure(err, ai.now())
+		acmePrintf("[ACME] renewal FAILED for %s: %v; retrying in %s", domain, err, delay.Round(time.Second))
+		return delay
 	}
+	st.recordSuccess()
 	acmePrintf("[ACME] renewal SUCCEEDED for %s", domain)
+	return 0
 }
 
-func (ai *acmeIntegration) renewAll() {
+func (ai *acmeIntegration) renewAll() time.Duration {
 	acmePrintf("[ACME] renewal check started")
-	ai.server.certStore.certs.Range(func(key string, entry *CertEntry) bool {
-		if entry.Source != CertACME {
+	nextWake := acmeRenewCheckEvery
+	ai.server.certStore.certs.Range(func(domain string, entry *CertEntry) bool {
+		if entry.Source != CertACME || len(entry.ChainDER) == 0 {
 			return true
 		}
 		leaf, err := x509.ParseCertificate(entry.ChainDER[0])
 		if err != nil {
-			acmePrintf("[ACME] failed to parse cert for %s during renewal check: %v", key, err)
+			acmePrintf("[ACME] failed to parse cert for %s during renewal check: %v", domain, err)
 			return true
 		}
-		remaining := time.Until(leaf.NotAfter)
-		daysLeft := int(remaining.Hours() / 24)
-		domain := key
-		if remaining > acmeRenewBefore {
-			acmePrintf("[ACME] cert for %s OK (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
+		ctx, cancel := context.WithTimeout(context.Background(), acmeRenewalProbeTimeout)
+		st, renewAt, nextPoll := ai.renewalTime(ctx, domain, leaf)
+		cancel()
+		now := ai.now()
+		if !nextPoll.IsZero() {
+			nextWake = min(nextWake, nextPoll.Sub(now))
+		}
+		if wait := renewAt.Sub(now); wait > 0 {
+			acmePrintf("[ACME] cert for %s OK (expires %s, renewal at %s)", domain, leaf.NotAfter.Format("2006-01-02"), renewAt.Format(time.RFC3339))
+			nextWake = min(nextWake, wait)
 			return true
 		}
-		acmePrintf("[ACME] cert for %s NEEDS RENEWAL (%d days remaining, expires %s)", domain, daysLeft, leaf.NotAfter.Format("2006-01-02"))
-		ai.renewDomainOnce(domain)
+		acmePrintf("[ACME] cert for %s NEEDS RENEWAL (expires %s)", domain, leaf.NotAfter.Format("2006-01-02"))
+		if retry := ai.renewDomainOnce(domain, st); retry > 0 {
+			nextWake = min(nextWake, retry)
+		}
 		return true
 	})
 	acmePrintf("[ACME] renewal check complete")
+	return max(nextWake, acmeMinWake)
+}
+
+func (ai *acmeIntegration) renewalInfoEndpoint(ctx context.Context) string {
+	ai.schedule.mu.Lock()
+	read, url := ai.schedule.directoryRead, ai.schedule.renewalInfoURL
+	ai.schedule.mu.Unlock()
+	if read {
+		return url
+	}
+	url, err := fetchRenewalInfoURL(ctx, ai.httpClient, ai.client.DirectoryURL)
+	if err != nil {
+		acmePrintf("[ACME] WARNING: reading the ACME directory for renewalInfo failed: %v", err)
+		return ""
+	}
+	ai.schedule.mu.Lock()
+	ai.schedule.renewalInfoURL, ai.schedule.directoryRead = url, true
+	ai.schedule.mu.Unlock()
+	return url
+}
+
+func (ai *acmeIntegration) renewalTime(ctx context.Context, domain string, leaf *x509.Certificate) (st *acmeRenewalState, renewAt, nextPoll time.Time) {
+	infoURL := ai.renewalInfoEndpoint(ctx)
+	certID, hasID := ariCertID(leaf)
+	now := ai.now()
+	ai.schedule.mu.Lock()
+	st = ai.schedule.state(domain)
+	if st.certID != certID {
+		*st = acmeRenewalState{certID: certID}
+	}
+	pollDue := infoURL != "" && hasID && !now.Before(st.nextPoll)
+	ai.schedule.mu.Unlock()
+
+	var window ariWindow
+	var poll time.Duration
+	var err error
+	if pollDue {
+		window, poll, err = fetchRenewalWindow(ctx, ai.httpClient, infoURL, certID, now)
+	}
+
+	ai.schedule.mu.Lock()
+	defer ai.schedule.mu.Unlock()
+	if pollDue && err != nil {
+		acmePrintf("[ACME] WARNING: renewalInfo for %s failed: %v", domain, err)
+		st.nextPoll = now.Add(ariDefaultPoll)
+		if errors.Is(err, context.DeadlineExceeded) {
+			st.nextPoll = now.Add(acmeARITimeoutRetry)
+		}
+	} else if pollDue {
+		if st.renewAt.IsZero() || !window.contains(st.renewAt) {
+			st.renewAt = window.pick()
+		}
+		st.nextPoll = now.Add(poll)
+	}
+	renewAt = st.renewAt
+	if renewAt.IsZero() {
+		renewAt = leaf.NotAfter.Add(-acmeRenewBefore)
+	} else if latest := latestRenewal(leaf); renewAt.After(latest) {
+		renewAt = latest
+	}
+	if st.retryAt.After(renewAt) {
+		renewAt = st.retryAt
+	}
+	return st, renewAt, st.nextPoll
+}
+
+func latestRenewal(leaf *x509.Certificate) time.Time {
+	margin := min(acmeRenewBefore, leaf.NotAfter.Sub(leaf.NotBefore)/acmeRenewLifetimeDivisor)
+	return leaf.NotAfter.Add(-margin)
 }
 
 func (ai *acmeIntegration) addDomain(domain string) {

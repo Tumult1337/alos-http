@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 const maxAckRanges = 32
@@ -7,6 +9,9 @@ type pnRange struct {
 }
 
 func (qc *QUICConn) recordRecvPN(space int, pn uint64) bool {
+	if pn < qc.ackFloor[space] {
+		return false
+	}
 	rs := qc.ackRanges[space]
 	idx := len(rs)
 	for i := range rs {
@@ -35,6 +40,7 @@ func (qc *QUICConn) recordRecvPN(space int, pn uint64) bool {
 	}
 	if len(merged) > maxAckRanges {
 		merged = merged[:maxAckRanges]
+		qc.ackFloor[space] = max(qc.ackFloor[space], merged[maxAckRanges-1].lo)
 	}
 	qc.ackRanges[space] = merged
 	return true

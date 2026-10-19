@@ -269,10 +269,7 @@ func TestInLoopProxyOverH2RetriesFailedBackend(t *testing.T) {
 // the backend, so a slow upstream must not stall other streams or grow the
 // goroutine count per in-flight request.
 func TestInLoopProxyOverH2SlowBackendDoesNotBlockOthers(t *testing.T) {
-	slow := newInloopOrigin(t, func(req *http.Request, conn net.Conn, br *bufio.Reader) {
-		time.Sleep(300 * time.Millisecond)
-		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nslow")
-	})
+	slow := newHeldOrigin(t, "slow")
 	fast := newInloopOrigin(t, echoBodyOrigin("fast"))
 
 	addr := startInloopTLSProxyMulti(t, []DomainConfig{
@@ -282,7 +279,7 @@ func TestInLoopProxyOverH2SlowBackendDoesNotBlockOthers(t *testing.T) {
 
 	slowClient := h2ProxyClient("slow.test")
 	var wg sync.WaitGroup
-	for i := 0; i < 24; i++ {
+	for i := 0; i < slowBackendClients; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -294,7 +291,7 @@ func TestInLoopProxyOverH2SlowBackendDoesNotBlockOthers(t *testing.T) {
 			}
 		}()
 	}
-	time.Sleep(150 * time.Millisecond)
+	waitFor(t, harnessIOTimeout, func() bool { return slow.arrived.Load() == slowBackendClients })
 
 	var slowest time.Duration
 	for i := 0; i < 5; i++ {
@@ -307,6 +304,7 @@ func TestInLoopProxyOverH2SlowBackendDoesNotBlockOthers(t *testing.T) {
 			slowest = d
 		}
 	}
+	slow.releaseAll()
 	wg.Wait()
 	if slowest > 250*time.Millisecond {
 		t.Fatalf("a fast H2 request took %v while a slow backend was in flight; the worker is still being blocked", slowest)

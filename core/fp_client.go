@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package core
 
@@ -11,8 +11,9 @@ import (
 )
 
 type fpClient struct {
-	cfg   fpConfig
-	loops []*eventLoop
+	cfg     fpConfig
+	loops   []*eventLoop
+	maxIdle atomic.Int64
 
 	closed atomic.Bool
 }
@@ -20,11 +21,13 @@ type fpClient struct {
 func fpNew(cfg fpConfig) (*fpClient, error) {
 	cfg.fill(runtime.GOMAXPROCS(0))
 	c := &fpClient{cfg: cfg}
+	c.maxIdle.Store(int64(cfg.MaxIdlePerBackend))
 	for i := 0; i < cfg.Loops; i++ {
 		l, err := newEventLoop(&c.cfg)
 		if err != nil {
 			return nil, err
 		}
+		l.liveMaxIdle = &c.maxIdle
 		c.loops = append(c.loops, l)
 		go l.run()
 	}
@@ -53,41 +56,66 @@ func (c *fpClient) DoStream(req *UpstreamRequest, sink *UpstreamStream) (int, er
 }
 
 func (c *fpClient) exchange(req *fpRequest, sink *UpstreamStream) (*Exchange, error) {
+	ex, _, err := c.start(req, sink, nil)
+	if err != nil {
+		return nil, err
+	}
+	<-ex.done
+	return ex, ex.err
+}
+
+func (c *fpClient) start(req *fpRequest, sink *UpstreamStream, pipe *respPipe) (*Exchange, *eventLoop, error) {
 	if c.closed.Load() {
-		return nil, fpErrClientClosed
+		return nil, nil, errFPClientClosed
 	}
 	if req.Method == "" {
 		req.Method = "GET"
 	}
 	host, port, err := splitAuthority(req.Authority, req.Scheme)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	ip, err := fpResolveIPv4(host)
+	ip, err := fpResolve(host)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ex := &Exchange{
-		req:      req,
-		sink:     sink,
-		done:     make(chan struct{}),
-		deadline: turbo.UnixNano() + c.cfg.RequestTimeout.Nanoseconds(),
-		ip:       ip,
-		port:     port,
+		req:        req,
+		sink:       sink,
+		pipe:       pipe,
+		done:       make(chan struct{}),
+		ip:         ip,
+		port:       port,
+		replayable: proxyRequestReplayable(req.Method, req.Headers, false),
 		key: poolKey{
 			authority:  req.Authority,
 			tls:        req.Scheme == "https",
 			h2:         req.H2,
 			skipVerify: req.SkipVerify,
+			trust:      req.trust,
 		},
 	}
+	c.armTimeouts(ex, turbo.UnixNano())
 	l := c.loopFor(ex.key)
-	l.submit(ex)
-	<-ex.done
-	if ex.err != nil {
-		return nil, ex.err
+	if req.BodySource != nil {
+		ex.body = newUpstreamBody(req)
+		ex.retried = true
+		go ex.body.pump(l, ex)
 	}
-	return ex, nil
+	ex.queued.Store(true)
+	l.submit(ex)
+	return ex, l, nil
+}
+
+func (c *fpClient) armTimeouts(ex *Exchange, now int64) {
+	ex.deadline = now + c.cfg.RequestTimeout.Nanoseconds()
+	if d := ex.req.DialTimeout; d > 0 {
+		ex.deadline = now + d.Nanoseconds()
+		ex.readTimeoutNano = c.cfg.RequestTimeout.Nanoseconds()
+	}
+	if r := ex.req.ReadTimeout; r > 0 {
+		ex.readTimeoutNano = r.Nanoseconds()
+	}
 }
 
 // loopFor maps an origin onto a bounded set of event loops, trading pooled
@@ -119,7 +147,14 @@ func (c *fpClient) loopFor(key poolKey) *eventLoop {
 }
 
 // Close marks the client as closed, causing subsequent calls to Do to
-// return fpErrClientClosed.
+// return errFPClientClosed.
+func (c *fpClient) SetMaxIdlePerBackend(n int) {
+	if n <= 0 {
+		n = defaultMaxIdle
+	}
+	c.maxIdle.Store(int64(n))
+}
+
 func (c *fpClient) Close() {
 	if c.closed.Swap(true) {
 		return

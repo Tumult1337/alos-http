@@ -1,3 +1,5 @@
+//go:build linux && amd64
+
 package core
 
 import (
@@ -14,12 +16,11 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"hash"
-	"log"
 	"math/big"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/ericlagergren/aegis"
@@ -37,6 +38,8 @@ type CipherSuiteConfig struct {
 	HashLen  int
 	MakeAEAD func(key []byte) (cipher.AEAD, error)
 
+	noQUICHeaderProtection bool
+
 	emptyTranscriptHash []byte
 	zeroHashInput       []byte
 	earlySecret         []byte
@@ -50,19 +53,24 @@ type CipherSuiteConfig struct {
 	labelServerHSTraffic  hkdfLabelTemplate
 	labelClientAppTraffic hkdfLabelTemplate
 	labelServerAppTraffic hkdfLabelTemplate
+	labelResBinder        hkdfLabelTemplate
+	labelResMaster        hkdfLabelTemplate
+	labelResumption       hkdfLabelTemplate
+	labelTrafficUpdate    hkdfLabelTemplate
 }
 
 // SupportedSuites lists, in negotiation-preference order, the TLS 1.3 cipher suites
-// this server supports: a private AEGIS-128L suite (ID 0x1306), followed by the
+// this server supports: TLS_AEGIS_128L_SHA256 (ID 0x1307, TLS over TCP only), followed by the
 // standard suites TLS_AES_128_GCM_SHA256 (0x1301), TLS_AES_256_GCM_SHA384 (0x1302),
 // and TLS_CHACHA20_POLY1305_SHA256 (0x1303).
 var SupportedSuites = [4]CipherSuiteConfig{
 	{
-		ID: 0x1306, KeyLen: 16, IVLen: 16,
+		ID: tlsAEGIS128LSHA256, KeyLen: 16, IVLen: 16,
 		HashFn: sha256.New, HashLen: 32,
 		MakeAEAD: func(key []byte) (cipher.AEAD, error) {
 			return aegis.New(key)
 		},
+		noQUICHeaderProtection: true,
 	},
 	{
 		ID: 0x1301, KeyLen: 16, IVLen: 12,
@@ -98,7 +106,18 @@ var SupportedSuites = [4]CipherSuiteConfig{
 // NegotiateSuite returns the first entry in SupportedSuites, in server preference
 // order, whose ID appears in clientIDs, or nil if none match.
 func NegotiateSuite(clientIDs []uint16) *CipherSuiteConfig {
+	return negotiateSuite(clientIDs, false)
+}
+
+func negotiateQUICSuite(clientIDs []uint16) *CipherSuiteConfig {
+	return negotiateSuite(clientIDs, true)
+}
+
+func negotiateSuite(clientIDs []uint16, forQUIC bool) *CipherSuiteConfig {
 	for i := range SupportedSuites {
+		if forQUIC && SupportedSuites[i].noQUICHeaderProtection {
+			continue
+		}
 		for _, cid := range clientIDs {
 			if SupportedSuites[i].ID == cid {
 				return &SupportedSuites[i]
@@ -129,46 +148,68 @@ type TrafficAEAD struct {
 	seq       uint64
 	nonceSize int
 	staticLen int
+	scratch   trafficAEADScratch
+	suite     *CipherSuiteConfig
+	secret    [maxTrafficSecretLen]byte
 }
+
+const (
+	tlsAEGIS128LSHA256  = 0x1307
+	maxTrafficSecretLen = sha512.Size384
+)
 
 type trafficAEADScratch struct {
 	nonce [16]byte
 	ad    [5]byte
 }
 
-var trafficAEADScratchPool = sync.Pool{
-	New: func() any {
-		s := &trafficAEADScratch{}
-		s.ad[0] = 0x17
-		s.ad[1] = 0x03
-		s.ad[2] = 0x03
-		return s
-	},
-}
-
 // NewTrafficAEAD derives the traffic key and IV from secret using cs's HKDF label
 // templates and constructs a TrafficAEAD ready to encrypt or decrypt records under
 // cs's AEAD algorithm.
 func NewTrafficAEAD(_ func() hash.Hash, secret []byte, cs *CipherSuiteConfig) (*TrafficAEAD, error) {
+	t := &TrafficAEAD{}
+	if err := t.install(secret, cs); err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func (t *TrafficAEAD) install(secret []byte, cs *CipherSuiteConfig) error {
 	var keyBuf [64]byte
 	var ivBuf [64]byte
 	key := cs.labelKey.ExpandTo(cs.HashFn, secret, nil, keyBuf[:0])
 	iv := cs.labelIV.ExpandTo(cs.HashFn, secret, nil, ivBuf[:0])
 	a, err := cs.MakeAEAD(key)
+	clear(keyBuf[:])
 	if err != nil {
-		return nil, err
+		return err
 	}
 	staticLen := cs.IVLen - 8
-	t := &TrafficAEAD{aead: a, oh: a.Overhead(), nonceSize: cs.IVLen, staticLen: staticLen}
+	*t = TrafficAEAD{aead: a, oh: a.Overhead(), nonceSize: cs.IVLen, staticLen: staticLen, suite: cs}
 	copy(t.iv[:], iv)
 	t.ivLow = binary.BigEndian.Uint64(t.iv[staticLen:])
-	return t, nil
+	copy(t.secret[:], secret)
+	return nil
 }
+
+func (t *TrafficAEAD) nextGeneration(next *TrafficAEAD) error {
+	cs := t.suite
+	var secretBuf [64]byte
+	secret := cs.labelTrafficUpdate.ExpandTo(cs.HashFn, t.secret[:cs.HashLen], nil, secretBuf[:0])
+	err := next.install(secret, cs)
+	clear(secretBuf[:])
+	return err
+}
+
+func (t *TrafficAEAD) keyWornOut() bool { return t != nil && t.seq >= tls13RecordsPerKeyLimit }
 
 func (t *TrafficAEAD) prepareRecord(sp *trafficAEADScratch, recordLen uint16) {
 	sl := t.staticLen
 	copy(sp.nonce[:sl], t.iv[:sl])
 	binary.BigEndian.PutUint64(sp.nonce[sl:], t.ivLow^t.seq)
+	sp.ad[0] = 0x17
+	sp.ad[1] = 0x03
+	sp.ad[2] = 0x03
 	sp.ad[3] = byte(recordLen >> 8)
 	sp.ad[4] = byte(recordLen)
 }
@@ -186,11 +227,10 @@ func (t *TrafficAEAD) Encrypt(plaintext []byte) []byte {
 		ciphertextLen = 0xFFFF
 	}
 	recordLen := uint16(ciphertextLen)
-	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
+	sp := &t.scratch
 	t.prepareRecord(sp, recordLen)
 	ct := t.aead.Seal(plaintext[:0], sp.nonce[:t.nonceSize], plaintext, sp.ad[:])
 	t.seq++
-	trafficAEADScratchPool.Put(sp)
 	return ct
 }
 
@@ -203,11 +243,10 @@ func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 		ciphertextLen = 0xFFFF
 	}
 	recordLen := uint16(ciphertextLen)
-	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
+	sp := &t.scratch
 	t.prepareRecord(sp, recordLen)
 	dst = t.aead.Seal(dst, sp.nonce[:t.nonceSize], plaintext, sp.ad[:])
 	t.seq++
-	trafficAEADScratchPool.Put(sp)
 	return dst
 }
 
@@ -215,15 +254,13 @@ func (t *TrafficAEAD) EncryptAppend(dst, plaintext []byte) []byte {
 // record nonce, returning the plaintext and advancing the internal sequence number on success.
 func (t *TrafficAEAD) Decrypt(ciphertext []byte) ([]byte, error) {
 	recordLen := uint16(len(ciphertext))
-	sp := trafficAEADScratchPool.Get().(*trafficAEADScratch)
+	sp := &t.scratch
 	t.prepareRecord(sp, recordLen)
 	pt, err := t.aead.Open(ciphertext[:0], sp.nonce[:t.nonceSize], ciphertext, sp.ad[:])
 	if err != nil {
-		trafficAEADScratchPool.Put(sp)
 		return nil, err
 	}
 	t.seq++
-	trafficAEADScratchPool.Put(sp)
 	return pt, nil
 }
 
@@ -322,8 +359,11 @@ func LoadOrGenerateCert(certFile, keyFile string) ([]byte, crypto.Signer, error)
 
 	certDER, privKey, err := loadCertFromDisk(certFile, keyFile)
 	if err == nil {
-		log.Printf("Loaded existing TLS certificate from %s", certFile)
+		logger().Info("TLS certificate loaded", "file", certFile)
 		return certDER, privKey, nil
+	}
+	if errors.Is(err, errCertKeyMismatch) {
+		return nil, nil, err
 	}
 
 	certDER, privKey, err = GenerateCert()
@@ -332,9 +372,9 @@ func LoadOrGenerateCert(certFile, keyFile string) ([]byte, crypto.Signer, error)
 	}
 
 	if saveErr := saveCertToDisk(certFile, keyFile, certDER, privKey); saveErr != nil {
-		log.Printf("[WARN] could not save cert to disk: %v (will regenerate on next restart)", saveErr)
+		logger().Warn("generated TLS certificate not saved; a new one is generated at the next start", "file", certFile, "err", saveErr)
 	} else {
-		log.Printf("Generated and saved new TLS certificate to %s", certFile)
+		logger().Info("TLS certificate generated", "file", certFile)
 	}
 
 	return certDER, privKey, nil
@@ -372,9 +412,14 @@ func loadCertFromDisk(certFile, keyFile string) ([]byte, crypto.Signer, error) {
 	if time.Now().After(cert.NotAfter) {
 		return nil, nil, &staticError{"certificate expired"}
 	}
+	if pub, ok := privKey.Public().(interface{ Equal(crypto.PublicKey) bool }); !ok || !pub.Equal(cert.PublicKey) {
+		return nil, nil, fmt.Errorf("%s and %s: %w", certFile, keyFile, errCertKeyMismatch)
+	}
 
 	return certBlock.Bytes, privKey, nil
 }
+
+var errCertKeyMismatch = errors.New("TLS private key does not match the certificate")
 
 func saveCertToDisk(certFile, keyFile string, certDER []byte, privKey crypto.Signer) error {
 	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})

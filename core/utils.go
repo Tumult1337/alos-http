@@ -1,8 +1,10 @@
+//go:build linux && amd64
+
 package core
 
 import (
-	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -23,7 +25,7 @@ var (
 	dnsResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			return dialTCP4Direct(address, timeoutFromContext(ctx, 5*time.Second))
+			return dialTCPDirect("tcp4", address, timeoutFromContext(ctx, 5*time.Second))
 		},
 	}
 )
@@ -68,7 +70,7 @@ func DialTCP4(addr string, timeout time.Duration) (net.Conn, error) {
 	}
 
 	if net.ParseIP(host) != nil {
-		return dialTCP4Direct(addr, timeout)
+		return dialTCPDirect("tcp4", addr, timeout)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
@@ -80,11 +82,11 @@ func DialTCP4(addr string, timeout time.Duration) (net.Conn, error) {
 	}
 
 	resolved := net.JoinHostPort(ip.String(), port)
-	return dialTCP4Direct(resolved, timeout)
+	return dialTCPDirect("tcp4", resolved, timeout)
 }
 
-func dialTCP4Direct(addr string, timeout time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp4", addr, timeout)
+func dialTCPDirect(network, addr string, timeout time.Duration) (net.Conn, error) {
+	conn, err := net.DialTimeout(network, addr, timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -213,6 +215,20 @@ func EqualFoldASCII(a, b string) bool {
 	return true
 }
 
+// headerNameIs compares a header name against a lowercase literal without
+// allocating, which strings.EqualFold would not guarantee.
+func headerNameIs(name, lower string) bool {
+	if len(name) != len(lower) {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		if asciiLower[name[i]] != lower[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // UnsafeString converts b to a string without copying, by reinterpreting its backing array. The returned string is only valid as long as b is not mutated.
 func UnsafeString(b []byte) string {
 	if len(b) == 0 {
@@ -278,22 +294,6 @@ func parseHex64Bytes(b []byte) (int64, bool) {
 		}
 	}
 	return n, true
-}
-
-func trimASCIISpaceBytes(b []byte) []byte {
-	start := 0
-	for start < len(b) && (b[start] == ' ' || b[start] == '\t' || b[start] == '\r' || b[start] == '\n') {
-		start++
-	}
-	end := len(b)
-	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\r' || b[end-1] == '\n') {
-		end--
-	}
-	return b[start:end]
-}
-
-func indexByteSlice(b []byte, c byte) int {
-	return bytes.IndexByte(b, c)
 }
 
 func trimASCIISpace(s string) string {
@@ -452,10 +452,14 @@ func StatusText(code int) string {
 		return "Method Not Allowed"
 	case 408:
 		return "Request Timeout"
+	case 412:
+		return "Precondition Failed"
 	case 413:
 		return "Payload Too Large"
 	case 416:
 		return "Range Not Satisfiable"
+	case 421:
+		return "Misdirected Request"
 	case 429:
 		return "Too Many Requests"
 	case 431:
@@ -512,10 +516,8 @@ func AppendJSONString(dst []byte, s string) []byte {
 }
 
 func splitPathQuery(raw string) (string, string) {
-	for i := 0; i < len(raw); i++ {
-		if raw[i] == '?' {
-			return raw[:i], raw[i+1:]
-		}
+	if i := strings.IndexByte(raw, '?'); i >= 0 {
+		return raw[:i], raw[i+1:]
 	}
 	return raw, ""
 }
@@ -523,16 +525,18 @@ func splitPathQuery(raw string) (string, string) {
 func sanitizeRequestPath(path string) string {
 	if nul := strings.IndexByte(path, 0); nul >= 0 {
 		path = path[:nul]
-	} else if cr := strings.IndexByte(path, '\r'); cr >= 0 {
+	}
+	if cr := strings.IndexByte(path, '\r'); cr >= 0 {
 		path = path[:cr]
-	} else if lf := strings.IndexByte(path, '\n'); lf >= 0 {
+	}
+	if lf := strings.IndexByte(path, '\n'); lf >= 0 {
 		path = path[:lf]
 	}
-	if len(path) == 0 {
-		return "/"
-	}
-
 	p, _ := splitPathQuery(path)
+	return sanitizeSplitPath(p)
+}
+
+func sanitizeSplitPath(p string) string {
 	if len(p) == 0 {
 		return "/"
 	}
@@ -586,28 +590,73 @@ func sanitizeRequestPath(path string) string {
 	return string(clean)
 }
 
-var badHostChar [256]bool
+const validHostChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~%!$&'()*+,;=:[]"
 
-func init() {
-	badHostChar['/'] = true
-	badHostChar['\\'] = true
-	badHostChar['\r'] = true
-	badHostChar['\n'] = true
-	badHostChar[0] = true
-}
-
-// ValidateHost reports whether host contains none of the disallowed characters: path separators, CR, LF, or NUL.
-func ValidateHost(host string) bool {
-	for i := 0; i < len(host); i++ {
-		if badHostChar[host[i]] {
-			return false
-		}
+var invalidHostChar = func() (table [256]byte) {
+	for i := range table {
+		table[i] = 1
 	}
-	return true
+	for i := 0; i < len(validHostChars); i++ {
+		table[validHostChars[i]] = 0
+	}
+	return table
+}()
+
+// ValidateHost reports whether every byte of host is allowed in an RFC 3986 host with an optional port: letters, digits, "-._~%!$&'()*+,;=", ':' and the IPv6 literal brackets.
+func ValidateHost(host string) bool {
+	var b0, b1, b2, b3 byte
+	i := 0
+	for ; i+4 <= len(host); i += 4 {
+		b0 |= invalidHostChar[host[i]]
+		b1 |= invalidHostChar[host[i+1]]
+		b2 |= invalidHostChar[host[i+2]]
+		b3 |= invalidHostChar[host[i+3]]
+	}
+	for ; i < len(host); i++ {
+		b0 |= invalidHostChar[host[i]]
+	}
+	return b0|b1|b2|b3 == 0
 }
+
+const crlfInlineScanMax = 32
+
+const (
+	lineBreakCRLF    uint64 = 0
+	lineBreakCRLFNUL uint64 = swarHigh
+)
 
 func containsCRLF(s string) bool {
-	return strings.IndexByte(s, '\r') >= 0 || strings.IndexByte(s, '\n') >= 0
+	return containsLineBreak(s, lineBreakCRLF)
+}
+
+func containsLineBreak(s string, nulMask uint64) bool {
+	if len(s) > crlfInlineScanMax {
+		return strings.IndexByte(s, '\r') >= 0 || strings.IndexByte(s, '\n') >= 0 || nulMask != 0 && strings.IndexByte(s, 0) >= 0
+	}
+	if len(s) < 8 {
+		for i := 0; i < len(s); i++ {
+			if c := s[i]; c <= '\r' && (c == '\r' || c == '\n' || c == 0 && nulMask != 0) {
+				return true
+			}
+		}
+		return false
+	}
+	b := unsafe.Slice(unsafe.StringData(s), len(s))
+	last := len(b) - 8
+	for i := 0; i < last; i += 8 {
+		if wordHasLineBreak(binary.LittleEndian.Uint64(b[i:]), nulMask) {
+			return true
+		}
+	}
+	return wordHasLineBreak(binary.LittleEndian.Uint64(b[last:]), nulMask)
+}
+
+func wordHasLineBreak(w, nulMask uint64) bool {
+	return swarZeroBytes(w^'\r'*swarOnes)|swarZeroBytes(w^'\n'*swarOnes)|swarZeroBytes(w)&nulMask != 0
+}
+
+func swarZeroBytes(v uint64) uint64 {
+	return (v - swarOnes) &^ v & swarHigh
 }
 
 var coarseNow atomic.Int64
@@ -615,7 +664,6 @@ var coarseNow atomic.Int64
 func init() {
 	coarseNow.Store(time.Now().UnixNano())
 	go func() {
-		defer func() { _ = recover() }()
 		ticker := time.NewTicker(time.Millisecond)
 		for range ticker.C {
 			coarseNow.Store(time.Now().UnixNano())
