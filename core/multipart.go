@@ -10,25 +10,25 @@ func parseMultipartInMem(body []byte, boundary string) (map[string][]string, map
 	dash := []byte("--" + boundary)
 	delim := []byte("\r\n--" + boundary)
 	pos := 0
-	if !bytes.HasPrefix(body, dash) {
-		i := bytes.Index(body, delim)
-		if i < 0 {
+	for {
+		if _, _, valid := multipartBoundaryLine(body[pos:], dash); valid {
+			break
+		}
+		next := bytes.Index(body[pos:], delim)
+		if next < 0 {
 			return values, files, errMultipartMalformed
 		}
-		pos = i + 2
+		pos += next + 2
 	}
 	for parts := 0; ; parts++ {
-		pos += len(dash)
-		if bytes.HasPrefix(body[pos:], []byte("--")) {
-			return values, files, nil
-		}
-		for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t') {
-			pos++
-		}
-		if !bytes.HasPrefix(body[pos:], []byte("\r\n")) {
+		consumed, final, valid := multipartBoundaryLine(body[pos:], dash)
+		if !valid {
 			return values, files, errMultipartMalformed
 		}
-		pos += 2
+		if final {
+			return values, files, nil
+		}
+		pos += consumed
 		if parts == maxMultipartParts {
 			return values, files, errMultipartTooManyParts
 		}
@@ -66,4 +66,25 @@ func parseMultipartInMem(body []byte, boundary string) (map[string][]string, map
 		}
 		pos += next + 2
 	}
+}
+
+func multipartBoundaryLine(body, dash []byte) (int, bool, bool) {
+	if !bytes.HasPrefix(body, dash) {
+		return 0, false, false
+	}
+	pos := len(dash)
+	final := bytes.HasPrefix(body[pos:], []byte("--"))
+	if final {
+		pos += 2
+	}
+	for pos < len(body) && (body[pos] == ' ' || body[pos] == '\t') {
+		pos++
+	}
+	if final && pos == len(body) {
+		return pos, true, true
+	}
+	if !bytes.HasPrefix(body[pos:], []byte("\r\n")) {
+		return 0, false, false
+	}
+	return pos + 2, final, true
 }
