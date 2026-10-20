@@ -578,6 +578,9 @@ func qpackEncodeResponseHeaders(status int, contentType string, contentLength in
 			enc.EncodeHeader(ToLowerASCII(name), headers[i][1])
 		}
 	}
+	if date := responseDateValue(status, headers); date != "" {
+		enc.EncodeHeader("date", date)
+	}
 	*bp = enc.buf
 	return bp
 }

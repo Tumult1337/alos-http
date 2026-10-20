@@ -39,6 +39,8 @@ type fpRequest struct {
 	H2          bool
 	DialTimeout time.Duration
 	ReadTimeout time.Duration
+
+	ensureResponseDate bool
 }
 
 type fpResponse struct {
