@@ -551,6 +551,7 @@ func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error)
 	// HEAD responses carry Content-Length but no body; the parser can only know
 	// that from the method, so it has to travel with the exchange.
 	px.Exchange.req.Method = req.Method
+	px.Exchange.req.ensureResponseDate = true
 	px.Exchange.resp = fpResponse{}
 	px.Exchange.err = nil
 	px.finished = false
@@ -584,6 +585,7 @@ func appendProxyStreamHead(dst []byte, status int, headers respHeaders, contentL
 		dst = headers.appendPair(dst, i)
 		dst = append(dst, "\r\n"...)
 	}
+	dst = appendProxyDate(dst, status, headers)
 	if contentLen >= 0 {
 		dst = append(dst, "Content-Length: "...)
 		dst = strconv.AppendInt(dst, contentLen, 10)
@@ -649,7 +651,7 @@ func (w *epollWorker) headerStrings(h respHeaders) [][2]string {
 	}
 	w.hdrStrings = w.hdrStrings[:0]
 	for _, kv := range h.raw {
-		w.hdrStrings = append(w.hdrStrings, [2]string{lowerHeaderName(kv[0]), string(kv[1])})
+		w.hdrStrings = append(w.hdrStrings, [2]string{lowerHeaderName(kv[0]), responseHeaderValue(kv[0], kv[1])})
 	}
 	return w.hdrStrings
 }
@@ -805,6 +807,7 @@ func appendProxyResponseHead(dst []byte, status int, headers respHeaders, bodyLe
 		dst = headers.appendPair(dst, i)
 		dst = append(dst, "\r\n"...)
 	}
+	dst = appendProxyDate(dst, status, headers)
 	if contentType != "" {
 		dst = append(dst, "Content-Type: "...)
 		dst = append(dst, contentType...)

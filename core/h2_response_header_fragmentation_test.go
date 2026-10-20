@@ -16,7 +16,7 @@ func responseHeaderBlockOfSize(t *testing.T, size int) ([][2]string, []byte) {
 		if padding+adjustment < 0 {
 			continue
 		}
-		headers := [][2]string{{"x-padding", strings.Repeat("\xff", padding+adjustment)}}
+		headers := [][2]string{{"x-padding", strings.Repeat("\xff", padding+adjustment)}, {"Date", "Tue, 15 Nov 1994 08:12:31 GMT"}}
 		encoder := HpackEncoder{}
 		encodeH2ResponseHeaders(&encoder, 200, "", 0, headers, "ALOS")
 		if len(encoder.Buf) == size {
@@ -125,12 +125,25 @@ func TestH2ResponseHeaderFragmentationBuffered(t *testing.T) {
 
 func TestH2ResponseHeaderFragmentationStatusOnly(t *testing.T) {
 	serverName := strings.Repeat("\xff", 16385)
-	encoder := HpackEncoder{}
-	encodeH2ResponseHeaders(&encoder, 431, "", 0, nil, serverName)
 	wire := appendH2StatusOnlyResponse(nil, 9, 431, serverName, H2DefaultMaxFrameSize)
 	got, body, _ := responseHeaderFlight(t, wire, 9, H2DefaultMaxFrameSize, true)
-	if !bytes.Equal(got, encoder.Buf) || len(body) != 0 {
-		t.Fatal("status-only encoded fields changed")
+	fields, err := newHpackDecoder(4096).Decode(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, server, length := "", "", ""
+	for _, field := range fields {
+		switch field[0] {
+		case ":status":
+			status = field[1]
+		case "server":
+			server = field[1]
+		case "content-length":
+			length = field[1]
+		}
+	}
+	if status != "431" || server != serverName || length != "0" || len(body) != 0 {
+		t.Fatal("status-only decoded fields changed")
 	}
 }
 

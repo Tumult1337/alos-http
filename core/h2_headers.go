@@ -3,6 +3,10 @@
 package core
 
 func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
+	encodeH2ResponseHeadersAt(enc, statusCode, contentType, contentLength, headers, serverName, responseDateValue(statusCode, headers))
+}
+
+func encodeH2ResponseHeadersAt(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName, date string) responseDateSpan {
 	enc.EncodeStatus(statusCode)
 
 	wroteContentType := false
@@ -78,4 +82,11 @@ func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType stri
 	if !wroteServer {
 		enc.encodeStaticFieldCached(hpackStaticServer, serverName)
 	}
+	var span responseDateSpan
+	if date != "" {
+		span.start = len(enc.Buf)
+		enc.EncodeHeaderFold("date", date)
+		span.end = len(enc.Buf)
+	}
+	return span
 }

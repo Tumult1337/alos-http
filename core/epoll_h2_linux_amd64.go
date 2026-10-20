@@ -271,21 +271,27 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 
 	if endStream && fastRoot && matchIndexedH2FastRootHeaderBlock(headerBlock) {
 		if srv.tryAcquireRequestSlot() {
-			Stats.TotalReqs.Add(1)
-			Stats.RawReqs.Add(1)
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast.forConn(c.tls), streamID, int(st.maxFrameSize))
+			if current := srv.currentH2RootDate(h2Fast); current != nil {
+				Stats.TotalReqs.Add(1)
+				Stats.RawReqs.Add(1)
+				c.writeBuf = appendFastH2RootResponse(c.writeBuf, current.forConn(c.tls), streamID, int(st.maxFrameSize))
+				srv.releaseRequestSlot()
+				return false
+			}
 			srv.releaseRequestSlot()
-			return false
 		}
 	}
 
 	if endStream && fastRoot && st.decoder.MemoizedRootRequest(headerBlock) {
 		if srv.tryAcquireRequestSlot() {
-			Stats.TotalReqs.Add(1)
-			Stats.RawReqs.Add(1)
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast.forConn(c.tls), streamID, int(st.maxFrameSize))
+			if current := srv.currentH2RootDate(h2Fast); current != nil {
+				Stats.TotalReqs.Add(1)
+				Stats.RawReqs.Add(1)
+				c.writeBuf = appendFastH2RootResponse(c.writeBuf, current.forConn(c.tls), streamID, int(st.maxFrameSize))
+				srv.releaseRequestSlot()
+				return false
+			}
 			srv.releaseRequestSlot()
-			return false
 		}
 	}
 
@@ -303,11 +309,14 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 	}
 	if endStream && fastRoot && isRoot {
 		if srv.tryAcquireRequestSlot() {
-			Stats.TotalReqs.Add(1)
-			Stats.RawReqs.Add(1)
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast.forConn(c.tls), streamID, int(st.maxFrameSize))
+			if current := srv.currentH2RootDate(h2Fast); current != nil {
+				Stats.TotalReqs.Add(1)
+				Stats.RawReqs.Add(1)
+				c.writeBuf = appendFastH2RootResponse(c.writeBuf, current.forConn(c.tls), streamID, int(st.maxFrameSize))
+				srv.releaseRequestSlot()
+				return false
+			}
 			srv.releaseRequestSlot()
-			return false
 		}
 	}
 	if len(headers) > h2MaxRequestFields {

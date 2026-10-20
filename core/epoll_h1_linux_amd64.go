@@ -172,20 +172,22 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			c.h1Advance(2)
 			continue
 		}
-		if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data, c.tls); ok && !proxyActive && !srv.shuttingDown.Load() {
-			Stats.TotalReqs.Add(1)
-			Stats.RawReqs.Add(1)
-			if srv.tryAcquireRequestSlot() {
-				srv.releaseRequestSlot()
-				out = append(out, resp...)
-			} else {
-				out = c.h1ServiceUnavailable(out, !closeConn)
+		if !proxyActive && !srv.shuttingDown.Load() {
+			if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data, c.tls); ok {
+				Stats.TotalReqs.Add(1)
+				Stats.RawReqs.Add(1)
+				if srv.tryAcquireRequestSlot() {
+					srv.releaseRequestSlot()
+					out = append(out, resp...)
+				} else {
+					out = c.h1ServiceUnavailable(out, !closeConn)
+				}
+				c.h1Advance(consumed)
+				if closeConn {
+					return out, h1StepClose
+				}
+				continue
 			}
-			c.h1Advance(consumed)
-			if closeConn {
-				return out, h1StepClose
-			}
-			continue
 		}
 
 		c.req.resetFastH1()

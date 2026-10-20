@@ -90,8 +90,9 @@ type h1Parser struct {
 	// into the connection's read buffer: that buffer is consumed and refilled
 	// while the body arrives, so by the time a buffered response is written to
 	// the client the header bytes there are long gone.
-	hdrBuf []byte
-	// hdr holds name/value slices of hdrBuf, names lowercased in place. They are
+	hdrBuf         []byte
+	receiptDateBuf []byte
+	// hdr holds name/value slices of owned buffers, names lowercased in place. They are
 	// valid until the next response head is parsed on this connection, which is
 	// after the current exchange has been completed.
 	hdr [][2][]byte
@@ -110,6 +111,7 @@ func (p *h1Parser) reset() {
 	p.trailerBytes = 0
 	p.hdr = p.hdr[:0]
 	p.strs = p.strs[:0]
+	p.receiptDateBuf = p.receiptDateBuf[:0]
 	// The body buffer is kept and refilled. completeH1 hands ownership away
 	// only for callers that read it after the exchange finishes.
 	p.body = p.body[:0]
@@ -245,6 +247,9 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				return false, err
 			}
 			c.rbuf.consume(idx + 4)
+			if c.cur.req.ensureResponseDate && (p.status == 101 || p.status >= 200) {
+				p.addReceiptDate()
+			}
 			if p.status == 101 {
 				if !p.upgradeGranted(c.cur) || !c.be.sink.beginTunnel(c, p) {
 					return false, errFPBadResponse
@@ -555,7 +560,7 @@ func (ex *Exchange) forwardedUpgrade() []byte {
 func (p *h1Parser) stringHeaders() [][2]string {
 	p.strs = p.strs[:0]
 	for _, h := range p.hdr {
-		p.strs = append(p.strs, [2]string{lowerHeaderName(h[0]), string(h[1])})
+		p.strs = append(p.strs, [2]string{lowerHeaderName(h[0]), responseHeaderValue(h[0], h[1])})
 	}
 	return p.strs
 }

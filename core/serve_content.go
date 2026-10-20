@@ -50,11 +50,15 @@ type httpDateEntry struct {
 var lastHTTPDate atomic.Pointer[httpDateEntry]
 
 func httpDate(unix int64) string {
-	if e := lastHTTPDate.Load(); e != nil && e.unix == unix {
+	return cachedHTTPDate(&lastHTTPDate, unix)
+}
+
+func cachedHTTPDate(cache *atomic.Pointer[httpDateEntry], unix int64) string {
+	if e := cache.Load(); e != nil && e.unix == unix {
 		return e.text
 	}
 	text := time.Unix(unix, 0).UTC().Format(http.TimeFormat)
-	lastHTTPDate.Store(&httpDateEntry{unix: unix, text: text})
+	cache.Store(&httpDateEntry{unix: unix, text: text})
 	return text
 }
 

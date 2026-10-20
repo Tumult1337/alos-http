@@ -277,6 +277,9 @@ func readUpgradeAnswer(conn net.Conn, p *h1Parser, method string, readTimeout ti
 			return false, -1, answeredUpgradeError(ErrProxyBadResponse)
 		}
 		if p.status == http.StatusSwitchingProtocols || p.status < http.StatusContinue || p.status >= http.StatusOK {
+			if p.status == http.StatusSwitchingProtocols || p.status >= http.StatusOK {
+				p.addReceiptDate()
+			}
 			return chunked, contentLen, nil
 		}
 	}

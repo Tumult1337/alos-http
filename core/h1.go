@@ -129,6 +129,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 		buf = append(buf, '\r', '\n')
 	}
 
+	buf = appendH1ResponseDate(buf, resp.StatusCode, resp.Headers)
 	ka, _ := serverConnHeaders(resp)
 	buf = append(buf, ka...)
 	buf = append(buf, '\r', '\n')
@@ -176,6 +177,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 		inner = append(inner, resp.Headers[i][1]...)
 		inner = append(inner, '\r', '\n')
 	}
+	inner = appendH1ResponseDate(inner, resp.StatusCode, resp.Headers)
 	ka, _ := serverConnHeaders(resp)
 	inner = append(inner, ka...)
 	inner = append(inner, '\r', '\n')

@@ -627,6 +627,7 @@ type Server struct {
 	plainRootFast     atomic.Pointer[plainRootFastResponse]
 	h2RootFast        atomic.Pointer[h2RootFastResponse]
 	rootFastMu        sync.Mutex
+	dateNow           func() int64
 	altSvc            atomic.Pointer[altSvcHeader]
 	trustedProxies    trustedProxyMatcher
 	perIPLimiter      *perIPRequestLimiter
@@ -656,16 +657,20 @@ type ipReqCounter struct {
 }
 
 type plainRootFastResponse struct {
-	getKeepAlive    []byte
-	getClose        []byte
-	getKeepAliveTLS []byte
-	getCloseTLS     []byte
-	handlerAltSvc   bool
-	tlsKeepAlive    []byte
-	tlsClose        []byte
+	dateUnix            int64
+	keepDate, closeDate responseDateSpan
+	getKeepAlive        []byte
+	getClose            []byte
+	getKeepAliveTLS     []byte
+	getCloseTLS         []byte
+	handlerAltSvc       bool
+	tlsKeepAlive        []byte
+	tlsClose            []byte
 }
 
 type h2RootFastResponse struct {
+	dateUnix      int64
+	date          responseDateSpan
 	headerPayload []byte
 	body          []byte
 	framed        []byte
@@ -1523,8 +1528,10 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
 		return nil
 	}
-	keepAlive := appendPlainResponseMode(&resp, make([]byte, 0, resp.BodyLen()+128), true, true)
-	closeResp := appendPlainResponseMode(&resp, make([]byte, 0, len(keepAlive)), false, true)
+	unix := s.responseDateUnix()
+	date := responseDateValueAt(resp.StatusCode, resp.Headers, unix)
+	keepAlive, keepDate := appendPlainResponseModeAt(&resp, make([]byte, 0, resp.BodyLen()+128), true, true, date)
+	closeResp, closeDate := appendPlainResponseModeAt(&resp, make([]byte, 0, len(keepAlive)), false, true, date)
 	if len(keepAlive) == 0 || len(closeResp) == 0 {
 		return nil
 	}
@@ -1535,6 +1542,7 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	copy(closeTLS, closeResp)
 	closeTLS[len(closeResp)] = 0x17
 	return &plainRootFastResponse{
+		dateUnix: unix, keepDate: keepDate, closeDate: closeDate,
 		getKeepAlive:    keepAlive,
 		getClose:        closeResp,
 		getKeepAliveTLS: keepAliveTLS,
@@ -1574,9 +1582,12 @@ func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
 	enc := HpackEncoder{}
 	headerPayload := make([]byte, 0, resp.BodyLen()+128)
 	enc.Reset(headerPayload)
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName)
+	unix := s.responseDateUnix()
+	date := responseDateValueAt(resp.StatusCode, resp.Headers, unix)
+	dateSpan := encodeH2ResponseHeadersAt(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName, date)
 
 	fastResp := newH2RootFastResponse(append([]byte(nil), enc.Buf...), append([]byte(nil), resp.transmittedBodyBytes()...))
+	fastResp.dateUnix, fastResp.date = unix, dateSpan
 	fastResp.handlerAltSvc = headersHaveFold(resp.Headers, altSvcHeaderName)
 	return fastResp
 }
