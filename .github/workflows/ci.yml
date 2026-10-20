@@ -107,6 +107,15 @@ jobs:
             go test -run '^$' -fuzz "^${target}\$" -fuzztime 30s ./core/
           done
 
+      - name: Preserve fuzz crashers
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: fuzz-crashers-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: core/testdata/fuzz/
+          if-no-files-found: warn
+          include-hidden-files: false
+
   test:
     runs-on: ubuntu-24.04
     timeout-minutes: 1
