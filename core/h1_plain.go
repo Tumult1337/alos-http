@@ -8,6 +8,11 @@ import (
 )
 
 func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
+	dst, _ = appendPlainResponseModeAt(resp, dst, keepAlive, includeBody, responseDateValue(resp.StatusCode, resp.Headers))
+	return dst
+}
+
+func appendPlainResponseModeAt(resp *Response, dst []byte, keepAlive bool, includeBody bool, date string) ([]byte, responseDateSpan) {
 	dst = appendStatusLine(dst, resp.StatusCode)
 
 	if resp.ContentType != "" {
@@ -50,6 +55,7 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 		dst = append(dst, '\r', '\n')
 	}
 
+	dst, dateSpan := appendH1Date(dst, date)
 	ka, cl := serverConnHeaders(resp)
 	if keepAlive {
 		dst = append(dst, ka...)
@@ -60,7 +66,7 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 	if includeBody && !suppressBody {
 		dst = resp.appendBody(dst)
 	}
-	return dst
+	return dst, dateSpan
 }
 
 func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
@@ -107,6 +113,10 @@ func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, 
 		return nil, 0, false, false
 	}
 	if !ok {
+		return nil, 0, false, false
+	}
+	fast = s.currentPlainRootDate(fast)
+	if fast == nil {
 		return nil, 0, false, false
 	}
 	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true

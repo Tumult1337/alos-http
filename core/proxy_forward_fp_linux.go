@@ -177,6 +177,8 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 	}
 
 	ex, err := client.exchange(&UpstreamRequest{
+		ensureResponseDate: true,
+
 		Scheme:      fpProxyScheme(b),
 		Authority:   fpProxyAuthority(b.Addr),
 		Method:      req.Method,
