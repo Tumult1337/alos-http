@@ -2,6 +2,8 @@
 
 package core
 
+import "github.com/guno1928/turbo"
+
 const (
 	h1StepNeedInput = iota
 	h1StepDispatched
@@ -88,7 +90,8 @@ func (c *epollConn) h1AppendResponse(out []byte, keepAlive bool) []byte {
 		return appendPlainResponseMode(&c.resp, out, keepAlive, true)
 	}
 	head := appendPlainResponseMode(&c.resp, out, keepAlive, false)
-	c.writeBuf = c.sealTLSAppDataParts(c.writeBuf, head, c.resp.bodyBytesUnsafe())
+	c.writeBuf = c.sealTLSResponseBody(c.writeBuf, head, c.resp.bodyBytesUnsafe())
+	c.resp.releaseSentBody()
 	return head[:0]
 }
 
@@ -155,6 +158,9 @@ func (c *epollConn) compactAppConsumed() {
 }
 
 func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
+	if c.ws != nil {
+		return c.wsServe(out)
+	}
 	maxRead := srv.effectiveReadCap()
 	proxyActive := srv.httpRouter.Load() != nil
 	if c.h1In != nil {
@@ -173,11 +179,10 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			continue
 		}
 		if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data, c.tls); ok && !proxyActive && !srv.shuttingDown.Load() {
-			Stats.TotalReqs.Add(1)
-			Stats.RawReqs.Add(1)
+			c.worker.reqs++
 			if srv.tryAcquireRequestSlot() {
 				srv.releaseRequestSlot()
-				out = append(out, resp...)
+				out = appendMemoizedResponse(out, resp)
 			} else {
 				out = c.h1ServiceUnavailable(out, !closeConn)
 			}
@@ -228,6 +233,10 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 				return c.h1Continue(out), h1StepNeedInput
 			}
 			c.chunkScanPos = 0
+			if c.readScratch {
+				c.ownReadBuf(c.worker)
+				data = c.h1Unread()
+			}
 			decoded, trailers, dok := decodeChunkedInto(c.reqBodyCopy[:0], data[headerEnd:bodyEnd])
 			if !dok {
 				return c.h1Reject(out, 400, "Bad Request"), h1StepClose
@@ -275,8 +284,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		}
 
 		c.h1BodyDeadline = 0
-		Stats.TotalReqs.Add(1)
-		Stats.RawReqs.Add(1)
+		c.worker.reqs++
 		c.req.StreamWriter = nil
 		c.req.swFactory = nil
 		c.req.bodyStream = nil
@@ -311,6 +319,9 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		// the same epoll set, so no goroutine, wake-up or hand-off is involved.
 		// An upgrade answered with 101 turns the same pair into a byte tunnel.
 		pe, ds := srv.matchProxyTarget(&c.req)
+		if ds != nil && c.readScratch {
+			promoteRequestHeadArena(&c.req, data[:headerEnd], &w.promote)
+		}
 		if ds != nil && !srv.proxyNeedsDispatch(pe, &c.req) {
 			c.h1OutEnd(out)
 			out = c.h1OutBegin()
@@ -333,50 +344,18 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		}
 		c.req.connTakenOver = false
 		c.h1Cancel.attach(&c.req)
-		if srv.config.InlineHandlers && ds == nil {
-			c.h1OutEnd(out)
-			out = c.h1OutBegin()
-			c.req.attachConn = w.cachedInlineH1Attacher(c)
-			promoteRequestHead(&c.req, data[:headerEnd])
-			c.runH1Inline(srv)
-			if c.req.connTakenOver || c.fd < 0 {
-				c.finishH1TakenOver()
-				return out, h1StepDetached
-			}
-			c.req.attachConn = nil
-			c.dispatching = false
-			if c.inFlight > 0 {
-				c.inFlight--
-			}
-			c.releaseH1BodyBudget()
-			if c.req.hijacked || c.resp.IsStreamed() {
-				c.resp.Reset()
-				c.resp.Status(500).String("Streaming/Hijack unavailable")
-				return appendPlainResponseClose(&c.resp, out), h1StepClose
-			}
-			if c.h1LargeBody() {
-				c.h1OutEnd(out)
-				c.h1StartProgressiveBody(w, !closeConn)
-				return c.h1OutBegin(), h1StepDispatched
-			}
-			if c.tls {
-				addAltSvcHeader(&c.resp, srv)
-			}
-			out = c.h1AppendResponse(out, !closeConn)
-			if closeConn {
-				return out, h1StepClose
-			}
-			continue
-		}
-		c.req.attachConn = w.cachedH1Attacher(c, gen)
+		c.req.attachConn = w.cachedH1Attacher(c)
 		c.h1DispatchGen = gen
 		c.h1DispatchClose = closeConn
 		c.req.swFactory = c
-		promoteRequestHead(&c.req, data[:headerEnd])
+		promoteRequestHeadArena(&c.req, data[:headerEnd], &w.promote)
 		if streamBody {
 			out = c.startH1BodyStream(w, out, chunked, contentLength)
 		}
 		c.h1DispatchFast = srv.fastDispatch.Load()
+		if ds == nil && !streamBody && w.inlineCandidate() && w.queueH1Inline(c) {
+			return out, h1StepDispatched
+		}
 		w.spawned++
 		w.handlers.run(c.h1AsyncRunner())
 		return out, h1StepDispatched
@@ -391,40 +370,42 @@ func (c *epollConn) h1AsyncRunner() func() {
 	return c.h1AsyncFn
 }
 
-func (c *epollConn) runH1Async() {
+func (c *epollConn) runH1Async() { c.runH1(false) }
+
+func (c *epollConn) runH1(inline bool) {
 	w := c.worker
 	srv := w.server
+	handler, route := c.h1Handler, c.h1Route
+	c.h1Handler, c.h1Route = nil, nil
+	var start int64
+	if route != nil {
+		start = turbo.Now()
+	}
+	returned := false
 	defer func() {
-		if r := recover(); r != nil {
+		r := recover()
+		if r != nil {
 			srv.reportPanic(&c.req, r)
 			c.resp.resetFastH1()
 			c.resp.Status(500).String("Internal Server Error")
+		}
+		if route != nil {
+			srv.Router.observeDemoted(route, turbo.Since(start))
+		}
+		if inline {
+			w.endInlineHandler(&c.h1InlineSeq, r == nil && !returned)
 		}
 		w.pushH1Done(c)
 	}()
-	if c.h1DispatchFast {
-		handler := srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)
+	switch {
+	case handler != nil:
 		handler(&c.req, &c.resp)
-		return
+	case c.h1DispatchFast:
+		srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)(&c.req, &c.resp)
+	default:
+		srv.dispatch(&c.req, &c.resp)
 	}
-	srv.dispatch(&c.req, &c.resp)
-}
-
-func (c *epollConn) runH1Inline(srv *Server) {
-	defer func() {
-		if r := recover(); r != nil {
-			srv.reportPanic(&c.req, r)
-			c.resp.resetFastH1()
-			c.resp.Status(500).String("Internal Server Error")
-		}
-		c.req.finishContext()
-	}()
-	if srv.fastDispatch.Load() {
-		handler := srv.Router.Lookup(c.req.Method, c.req.Path, &c.req)
-		handler(&c.req, &c.resp)
-		return
-	}
-	srv.dispatch(&c.req, &c.resp)
+	returned = true
 }
 
 func (c *epollConn) finishH1TakenOver() {
@@ -455,6 +436,13 @@ func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) 
 	if sw != nil {
 		c.resp.sw = nil
 		c.req.StreamWriter = nil
+	}
+	if ev := c.wsPending; ev != nil {
+		if sw != nil {
+			sw.release()
+		}
+		w.finishWSUpgrade(c, gen, ev)
+		return
 	}
 	if c.req.connTakenOver {
 		if sw != nil {
@@ -528,7 +516,7 @@ func (c *epollConn) growReadBuf(minCap, maxRead int) bool {
 	if !ok {
 		return false
 	}
-	c.readBuf = grown[:cap(grown)]
+	c.readBuf, c.readScratch = grown[:cap(grown)], false
 	return true
 }
 

@@ -63,6 +63,9 @@ func (w *epollWorker) backendEvent(fd int, evs uint32) {
 // resumeRelayIfDrained re-arms a backend read side that was disarmed because
 // this client could not keep up with a relayed response.
 func (w *epollWorker) resumeRelayIfDrained(c *epollConn) {
+	if c.ws != nil && c.tunnelPaused {
+		w.wsResumeIfDrained(c)
+	}
 	bc := c.pausedBackend
 	if bc == nil {
 		return
@@ -260,12 +263,15 @@ func (w *epollWorker) streamResponseChunk(c *backendConn, data []byte) {
 		w.be.closeConn(c, errFPClientClosed)
 		return
 	}
-	if px.streamChunked {
+	switch {
+	case px.streamChunked && !cc.tls:
+		cc.writeBuf = appendChunkFrame(cc.writeBuf, data)
+	case px.streamChunked:
 		scratch := w.beScratch[:0]
 		scratch = appendChunkFrame(scratch, data)
 		w.beScratch = scratch[:0]
 		w.clientAppend(cc, scratch)
-	} else {
+	default:
 		w.clientAppend(cc, data)
 	}
 	w.flush(cc)

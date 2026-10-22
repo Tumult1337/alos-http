@@ -79,12 +79,15 @@ func isConnectionSpecificResponseName(name string) bool {
 }
 
 const (
-	maxConnectionTokens = 16
-	asciiCaseBit        = 0x20
+	maxConnectionTokens    = 16
+	inlineConnectionTokens = 2
+	asciiCaseBit           = 0x20
 )
 
 type connectionTokens struct {
-	names    []string
+	inline   [inlineConnectionTokens]string
+	count    int
+	extra    []string
 	overflow map[string]struct{}
 }
 
@@ -111,8 +114,14 @@ func (t *connectionTokens) add(value string) {
 		if token == "" || isHopByHopFold(token) {
 			continue
 		}
-		if len(t.names) < maxConnectionTokens {
-			t.names = append(t.names, token)
+		if t.count < inlineConnectionTokens {
+			t.inline[t.count] = token
+			t.count++
+			continue
+		}
+		if t.count < maxConnectionTokens {
+			t.extra = append(t.extra, token)
+			t.count++
 			continue
 		}
 		if t.overflow == nil {
@@ -123,11 +132,16 @@ func (t *connectionTokens) add(value string) {
 }
 
 func (t *connectionTokens) nominates(name string) bool {
-	return len(t.names) != 0 && t.lookup(name)
+	return t.count != 0 && t.lookup(name)
 }
 
 func (t *connectionTokens) lookup(name string) bool {
-	for _, token := range t.names {
+	for _, token := range t.inline[:min(t.count, inlineConnectionTokens)] {
+		if EqualFoldASCII(token, name) {
+			return true
+		}
+	}
+	for _, token := range t.extra {
 		if EqualFoldASCII(token, name) {
 			return true
 		}

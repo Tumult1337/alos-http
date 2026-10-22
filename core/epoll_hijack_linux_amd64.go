@@ -141,51 +141,29 @@ func (w *epollWorker) detachConnFd(c *epollConn) (net.Conn, bool) {
 	return nc, true
 }
 
-func (w *epollWorker) cachedH1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
-	if c.h1AttacherFn == nil || c.h1AttacherGen != gen || c.h1AttacherInline {
-		c.h1AttacherFn = w.h1Attacher(c, gen)
-		c.h1AttacherGen = gen
-		c.h1AttacherInline = false
+func (w *epollWorker) cachedH1Attacher(c *epollConn) func(*Request) net.Conn {
+	if c.h1AttacherFn == nil {
+		c.h1AttacherFn = c.attachH1Async
 	}
 	return c.h1AttacherFn
 }
 
-func (w *epollWorker) cachedInlineH1Attacher(c *epollConn) func(*Request) net.Conn {
-	if c.h1AttacherFn == nil || !c.h1AttacherInline {
-		c.h1AttacherFn = w.inlineH1Attacher(c)
-		c.h1AttacherInline = true
-	}
-	return c.h1AttacherFn
-}
-
-func (w *epollWorker) h1Attacher(c *epollConn, gen uint32) func(*Request) net.Conn {
-	return func(req *Request) net.Conn {
-		if req.connTakenOver {
-			return req.conn
-		}
-		done := make(chan struct{})
-		w.postTask(func(w *epollWorker) {
-			defer close(done)
-			if c.fd < 0 || c.generation != gen {
-				return
-			}
-			w.handoffH1Conn(c, req)
-		})
-		<-done
+func (c *epollConn) attachH1Async(req *Request) net.Conn {
+	if req.connTakenOver {
 		return req.conn
 	}
-}
-
-func (w *epollWorker) inlineH1Attacher(c *epollConn) func(*Request) net.Conn {
-	return func(req *Request) net.Conn {
-		if req.connTakenOver {
-			return req.conn
+	c.worker.leaveInline(&c.h1InlineSeq)
+	gen := c.h1DispatchGen
+	done := make(chan struct{})
+	c.worker.postTask(func(w *epollWorker) {
+		defer close(done)
+		if c.fd < 0 || c.generation != gen {
+			return
 		}
-		if c.fd >= 0 {
-			w.handoffH1Conn(c, req)
-		}
-		return req.conn
-	}
+		w.handoffH1Conn(c, req)
+	})
+	<-done
+	return req.conn
 }
 
 func (w *epollWorker) handoffH1Conn(c *epollConn, req *Request) {

@@ -134,10 +134,13 @@ func etagHeaderMatches(req *Request, name, current string, strong bool) (present
 	return present, false
 }
 
-func headerUnixDate(req *Request, name string) (int64, bool) {
+func headerUnixDate(req *Request, name string, v *contentValidators) (int64, bool) {
 	value := req.Header(name)
 	if value == "" {
 		return 0, false
+	}
+	if value == v.lastModified {
+		return v.modUnix, true
 	}
 	t, err := http.ParseTime(value)
 	if err != nil {
@@ -152,7 +155,7 @@ func evaluatePreconditions(req *Request, v *contentValidators) preconditionResul
 		if !matched {
 			return preconditionFailed
 		}
-	} else if since, ok := headerUnixDate(req, "If-Unmodified-Since"); ok && v.modUnix > since {
+	} else if since, ok := headerUnixDate(req, "If-Unmodified-Since", v); ok && v.modUnix > since {
 		return preconditionFailed
 	}
 	if present, matched := etagHeaderMatches(req, "If-None-Match", v.etag, false); present {
@@ -163,7 +166,7 @@ func evaluatePreconditions(req *Request, v *contentValidators) preconditionResul
 			return preconditionFailed
 		}
 	} else if safeMethod {
-		if since, ok := headerUnixDate(req, "If-Modified-Since"); ok && v.modUnix <= since {
+		if since, ok := headerUnixDate(req, "If-Modified-Since", v); ok && v.modUnix <= since {
 			return preconditionNotModified
 		}
 	}
@@ -179,7 +182,7 @@ func ifRangeAllows(req *Request, v *contentValidators) bool {
 		tag, weak, rest, ok := scanETag(cond)
 		return ok && !weak && trimASCIISpace(rest) == "" && tag == v.etag
 	}
-	unix, ok := headerUnixDate(req, "If-Range")
+	unix, ok := headerUnixDate(req, "If-Range", v)
 	return ok && unix == v.modUnix
 }
 

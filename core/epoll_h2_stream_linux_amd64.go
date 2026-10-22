@@ -11,7 +11,7 @@ import (
 
 const (
 	h2StreamPendingCap     = 256 << 10
-	h2StreamSocketHighMark = 1 << 20
+	h2StreamSocketHighMark = 256 << 10
 	h2StreamPendingKeep    = 2 * h2StreamPendingCap
 )
 
@@ -63,6 +63,7 @@ type epollH2StreamWriter struct {
 	pumpQueued  bool
 	sendRST     bool
 	err         error
+	file        h2FileSend
 }
 
 func (c *epollConn) newH2StreamWriter(req *Request) StreamWriter {
@@ -232,6 +233,7 @@ func (sw *epollH2StreamWriter) release() {
 	sw.handlerDone, sw.registered, sw.pumpQueued, sw.sendRST = false, false, false, false
 	sw.endedEarly = false
 	sw.err = nil
+	sw.file.clear()
 	epollH2StreamWriterPool.Put(sw)
 }
 
@@ -255,7 +257,7 @@ func (c *epollConn) h2PumpTask(w *epollWorker, sw *epollH2StreamWriter) {
 }
 
 func (c *epollConn) h2PumpSealed(w *epollWorker, sw *epollH2StreamWriter) {
-	backlog := len(c.writeBuf) - c.writeSent
+	backlog := c.h2OutputBacklog()
 	if c.sealsH2Output() {
 		plain := c.h2PumpFrames(w.h2FinishScratch[:0], sw, backlog)
 		w.h2FinishScratch = plain[:0]
@@ -293,7 +295,7 @@ func (c *epollConn) h2PumpFrames(dst []byte, sw *epollH2StreamWriter, backlog in
 		if end {
 			flags |= H2FlagEndStream
 		}
-		dst = appendH2Frame(dst, H2FrameHeaders, flags, sw.streamID, sw.header)
+		dst = appendH2HeaderBlockFrame(dst, sw.streamID, flags, &st.encTable, sw.header)
 		sw.headersOut = true
 		if end {
 			sw.finished = true
@@ -326,6 +328,9 @@ func (c *epollConn) h2PumpFrames(dst []byte, sw *epollH2StreamWriter, backlog in
 		if end {
 			sw.finished = true
 		}
+	}
+	if sw.file.left > 0 && sw.bufferedLocked() == 0 {
+		dst = c.h2PumpFile(dst, sw, h2StreamSocketHighMark-backlog-(len(dst)-start), frameLimit)
 	}
 	switch {
 	case sw.bufferedLocked() == 0:
@@ -414,14 +419,14 @@ func (c *epollConn) h2PumpAll(w *epollWorker) bool {
 	if len(c.h2Streaming) == 0 {
 		return (len(c.h2.sending) != 0 || c.h2.peerGoingAway) && c.h2PumpBuffered()
 	}
-	before := len(c.writeBuf)
+	before, directBefore := len(c.writeBuf), c.h2.directSent
 	for _, sw := range c.h2Streaming {
 		c.h2PumpSealed(w, sw)
 	}
 	if len(c.h2.sending) != 0 {
 		c.h2ResumeSending(0)
 	}
-	return len(c.writeBuf) > before
+	return len(c.writeBuf) > before || c.h2.directSent != directBefore
 }
 
 func (c *epollConn) h2WindowOpened(w *epollWorker) {

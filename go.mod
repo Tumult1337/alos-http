@@ -3,11 +3,14 @@ module github.com/guno1928/alos-http
 go 1.26.9
 
 require (
+	filippo.io/edwards25519 v1.2.0
 	github.com/andybalholm/brotli v1.2.1
 	github.com/bytedance/sonic v1.15.2
 	github.com/ericlagergren/aegis v0.0.0-20250325060835-cd0defd64358
 	github.com/guno1928/alosmap v0.0.0-20260622010136-91db0f96eeae
 	github.com/guno1928/turbo v0.0.0-20260706091412-3b318c1e1ce7
+	github.com/klauspost/compress v1.20.3
+	github.com/molecule-man/go-brrr v1.3.0
 	github.com/zeebo/xxh3 v1.1.0
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0

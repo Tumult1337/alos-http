@@ -3,18 +3,14 @@
 package core
 
 import (
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -431,11 +427,11 @@ func SecurityHeaders(cfg SecurityHeadersConfig) MiddlewareFunc {
 
 // CompressConfig controls response compression.
 //
-// Level is the gzip/deflate compression level from 1 (fastest) to 9 (smallest); values outside 1–9 fall back to 6.
+// Level is the gzip/deflate compression level from 1 (fastest) to 9 (smallest); values outside 1–9 fall back to 2.
 //
 //	Example: Level: 1 favors speed over ratio.
 //	Example: Level: 9 favors ratio over speed.
-//	Example: Level: 0 is out of range and uses the default 6.
+//	Example: Level: 0 is out of range and uses the default 2.
 //
 // MinSize is the minimum body size in bytes to compress; smaller bodies are sent uncompressed. Values <= 0 fall back to 256.
 //
@@ -447,26 +443,10 @@ type CompressConfig struct {
 	BrotliLevel int
 }
 
-var gzipWriterPool = [10]sync.Pool{}
-var deflateWriterPool = [10]sync.Pool{}
-
-func init() {
-	for i := 1; i <= 9; i++ {
-		level := i
-		gzipWriterPool[i] = sync.Pool{
-			New: func() any {
-				w, _ := gzip.NewWriterLevel(io.Discard, level)
-				return w
-			},
-		}
-		deflateWriterPool[i] = sync.Pool{
-			New: func() any {
-				w, _ := flate.NewWriter(io.Discard, level)
-				return w
-			},
-		}
-	}
-}
+const (
+	defaultCompressLevel   = 2
+	defaultCompressMinSize = 256
+)
 
 // Compress returns middleware that brotli-, gzip- or deflate-compresses response bodies per the request's Accept-Encoding header, leaving streamed responses and bodies below cfg.MinSize untouched. See CompressConfig for defaults.
 //
@@ -474,25 +454,36 @@ func init() {
 // Example: app.Use(Compress(CompressConfig{Level: 6, MinSize: 512}))
 // Example: app.Use(Compress(CompressConfig{Level: 9, MinSize: 1024}))
 func Compress(cfg CompressConfig) MiddlewareFunc {
+	cfg = normalizeCompressConfig(cfg)
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
 			next(req, resp)
-			applyConfiguredCompression(req, resp, cfg)
+			applyNormalizedCompression(req, resp, &cfg)
 		}
 	}
 }
 
-func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig) {
-	level := cfg.Level
-	if level < 1 || level > 9 {
-		level = 6
+func normalizeCompressConfig(cfg CompressConfig) CompressConfig {
+	if cfg.Level < 1 || cfg.Level > 9 {
+		cfg.Level = defaultCompressLevel
 	}
-	minSize := cfg.MinSize
-	if minSize <= 0 {
-		minSize = 256
+	if cfg.MinSize <= 0 {
+		cfg.MinSize = defaultCompressMinSize
 	}
+	cfg.BrotliLevel = normalizeBrotliLevel(cfg.BrotliLevel)
+	return cfg
+}
 
-	if resp == nil || req == nil || resp.IsStreamed() || resp.StatusCode == http.StatusPartialContent {
+func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig) {
+	cfg = normalizeCompressConfig(cfg)
+	applyNormalizedCompression(req, resp, &cfg)
+}
+
+func applyNormalizedCompression(req *Request, resp *Response, cfg *CompressConfig) {
+	level := cfg.Level
+	minSize := cfg.MinSize
+
+	if resp == nil || req == nil || resp.IsStreamed() || resp.fileBody || resp.StatusCode == http.StatusPartialContent {
 		return
 	}
 	body := resp.transmittedBodyBytes()
@@ -512,7 +503,7 @@ func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig
 		return
 	}
 	if enc == encodingBrotli {
-		level = normalizeBrotliLevel(cfg.BrotliLevel)
+		level = cfg.BrotliLevel
 	}
 
 	bp := LargeBufPool.Get().(*[]byte)
@@ -556,24 +547,12 @@ func responseHasHeader(headers [][2]string, name string) bool {
 	}
 }
 
-var bytesWriterPool = sync.Pool{
-	New: func() any {
-		return &bytesWriter{}
-	},
-}
-
 type bytesWriter struct {
-	buf *[]byte
-}
-
-func newBytesWriter(buf *[]byte) *bytesWriter {
-	w := bytesWriterPool.Get().(*bytesWriter)
-	w.buf = buf
-	return w
+	buf []byte
 }
 
 func (w *bytesWriter) Write(p []byte) (int, error) {
-	*w.buf = append(*w.buf, p...)
+	w.buf = append(w.buf, p...)
 	return len(p), nil
 }
 

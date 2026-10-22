@@ -139,10 +139,14 @@ func (h *h1Proto) attach(c *backendConn) error {
 		l.serBuf = appendH1Request(l.serBuf[:0], c.cur.req)
 		out = l.serBuf
 	}
-	if err := c.transport.wrapOut(c, out); err != nil {
-		return err
+	if _, plain := c.transport.(*plainTransport); plain && c.wbuf.length() == 0 {
+		l.sendDirect(c, out)
+	} else {
+		if err := c.transport.wrapOut(c, out); err != nil {
+			return err
+		}
+		l.flushWrites(c)
 	}
-	l.flushWrites(c)
 	if ex := c.cur; ex != nil && ex.readTimeoutNano > 0 {
 		ex.deadline = l.nowNano() + ex.readTimeoutNano
 	}

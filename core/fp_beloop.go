@@ -28,7 +28,7 @@ type beLoop struct {
 	cfg       *fpConfig
 	sink      beSink
 	conns     []*backendConn
-	idle      map[poolKey][]*backendConn
+	idle      map[poolKey]*fpIdleList
 	h2conns   map[poolKey]*backendConn
 	scratch   []byte
 	serBuf    []byte
@@ -68,7 +68,7 @@ func (l *beLoop) init(ep int, cfg *fpConfig, sink beSink) {
 	l.ep = ep
 	l.cfg = cfg
 	l.sink = sink
-	l.idle = make(map[poolKey][]*backendConn)
+	l.idle = make(map[poolKey]*fpIdleList)
 	l.h2conns = make(map[poolKey]*backendConn)
 	l.dnsInflight = make(map[string]*backendConn)
 	l.scratch = make([]byte, loopScratchSize)
@@ -112,11 +112,9 @@ func (l *beLoop) startExchange(ex *Exchange) {
 		l.newConn(ex)
 		return
 	}
-	list := l.idle[ex.key]
-	for ex.body == nil && len(list) > 0 {
-		c := list[len(list)-1]
-		list = list[:len(list)-1]
-		l.idle[ex.key] = list
+	idle := l.idle[ex.key]
+	for ex.body == nil && idle != nil && len(idle.conns) > 0 {
+		c := idle.pop()
 		c.inIdle = false
 		if c.state != connReady {
 			continue
@@ -144,15 +142,31 @@ func (l *beLoop) removeIdle(c *backendConn) {
 		return
 	}
 	c.inIdle = false
-	list := l.idle[c.key]
+	idle := l.idle[c.key]
+	if idle == nil {
+		return
+	}
+	list := idle.conns
 	for i, v := range list {
 		if v == c {
 			list[i] = list[len(list)-1]
 			list[len(list)-1] = nil
-			l.idle[c.key] = list[:len(list)-1]
+			idle.conns = list[:len(list)-1]
 			return
 		}
 	}
+}
+
+type fpIdleList struct {
+	conns []*backendConn
+}
+
+func (il *fpIdleList) pop() *backendConn {
+	last := len(il.conns) - 1
+	c := il.conns[last]
+	il.conns[last] = nil
+	il.conns = il.conns[:last]
+	return c
 }
 
 func (l *beLoop) idlePut(c *backendConn) {
@@ -160,8 +174,12 @@ func (l *beLoop) idlePut(c *backendConn) {
 	if maxIdle <= 0 {
 		maxIdle = l.maxIdlePerBackend()
 	}
-	list := l.idle[c.key]
-	if len(list) >= maxIdle {
+	idle := l.idle[c.key]
+	if idle == nil {
+		idle = &fpIdleList{}
+		l.idle[c.key] = idle
+	}
+	if len(idle.conns) >= maxIdle {
 		l.closeConn(c, nil)
 		return
 	}
@@ -173,7 +191,7 @@ func (l *beLoop) idlePut(c *backendConn) {
 	c.inIdle = true
 	c.reused = false
 	c.idleDeadline = l.nowNano() + idleTimeout
-	l.idle[c.key] = append(list, c)
+	idle.conns = append(idle.conns, c)
 }
 
 func (l *beLoop) maxIdlePerBackend() int {

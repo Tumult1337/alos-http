@@ -117,12 +117,19 @@ func (c *epollConn) sendSessionTicket(srv *Server) {
 		return
 	}
 	c.ticket = nil
-	msg := srv.newSessionTicketMessage(p)
-	if msg == nil {
+	hdr := len(c.writeBuf)
+	out := ensureTailCap(c.writeBuf, tlsRecordHeaderLen+tlsSessionTicketRecordHint)
+	out, ok := srv.appendSessionTicketMessage(out[:hdr+tlsRecordHeaderLen], p)
+	if !ok {
+		c.writeBuf = out[:hdr]
 		return
 	}
-	c.writeBuf = appendTLSInnerRecord(c.writeBuf, c.appWriter, append(msg, tlsRecHandshake))
+	out = append(out, tlsRecHandshake)
+	out = ensureTailCap(out, c.appWriter.Overhead())
+	c.writeBuf = sealTLSInnerInPlace(out, c.appWriter, hdr)
 }
+
+const tlsSessionTicketRecordHint = 256
 
 func (c *epollConn) appendTLS12ServerFinish(srv *Server, dst []byte) []byte {
 	st := c.tls12

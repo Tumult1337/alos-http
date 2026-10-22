@@ -3,8 +3,113 @@
 package core
 
 import (
+	"bytes"
 	"net"
+	"net/http"
+	"sync/atomic"
+	"time"
+
+	"github.com/guno1928/turbo"
 )
+
+const httpDateLineLen = len("Date: ") + len(http.TimeFormat) + len("\r\n")
+
+type httpDateLine struct {
+	expiresMono int64
+	line        [httpDateLineLen]byte
+	ok200       [len(plainContentTypePresets)][]byte
+}
+
+var currentDateLine atomic.Pointer[httpDateLine]
+
+var plainContentTypePresets = [...][]byte{nil, ctPrefixJSON, ctPrefixTextPlain, ctPrefixTextHTML, ctPrefixOctet}
+
+func plainContentTypePreset(contentType string) int {
+	switch contentType {
+	case "":
+		return 0
+	case "application/json; charset=utf-8":
+		return 1
+	case "text/plain; charset=utf-8":
+		return 2
+	case "text/html; charset=utf-8":
+		return 3
+	case "application/octet-stream":
+		return 4
+	}
+	return -1
+}
+
+func newHTTPDateLine(unixNano, mono int64) *httpDateLine {
+	sec := unixNano / int64(time.Second)
+	d := &httpDateLine{expiresMono: mono + int64(time.Second) - unixNano%int64(time.Second)}
+	b := append(d.line[:0], dateHeaderPrefix...)
+	b = time.Unix(sec, 0).UTC().AppendFormat(b, http.TimeFormat)
+	_ = append(b, '\r', '\n')
+	head := append(append([]byte(nil), statusLines[http.StatusOK]...), d.line[:]...)
+	for i, ct := range plainContentTypePresets {
+		d.ok200[i] = append(head[:len(head):len(head)], ct...)
+	}
+	return d
+}
+
+const dateHeaderPrefix = "Date: "
+
+func currentHTTPDate() *httpDateLine {
+	d := currentDateLine.Load()
+	if d == nil || turbo.Now() >= d.expiresMono {
+		d = refreshHTTPDateLine()
+	}
+	return d
+}
+
+func currentHTTPDateLine() *[httpDateLineLen]byte {
+	return &currentHTTPDate().line
+}
+
+//go:noinline
+func refreshHTTPDateLine() *httpDateLine {
+	mono := turbo.Now()
+	d := newHTTPDateLine(turbo.UnixNano(), mono)
+	currentDateLine.Store(d)
+	return d
+}
+
+func appendDateUnlessSet(dst []byte, headers [][2]string) []byte {
+	if len(headers) != 0 && headersHaveFold(headers, "Date") {
+		return dst
+	}
+	return append(dst, currentHTTPDateLine()[:]...)
+}
+
+func appendH1HeaderFields(dst []byte, headers [][2]string) []byte {
+	for i := range headers {
+		dst = append(dst, headers[i][0]...)
+		dst = append(dst, ':', ' ')
+		dst = append(dst, headers[i][1]...)
+		dst = append(dst, '\r', '\n')
+	}
+	return dst
+}
+
+func appendMemoizedResponse(dst, memo []byte) []byte {
+	base := len(dst)
+	dst = append(dst, memo...)
+	refreshMemoizedDate(dst[base:])
+	return dst
+}
+
+func refreshMemoizedDate(response []byte) {
+	at := bytes.IndexByte(response, '\n') + 1
+	if at == 0 || len(response)-at < httpDateLineLen {
+		return
+	}
+	line := response[at : at+httpDateLineLen]
+	if string(line[:len(dateHeaderPrefix)]) != dateHeaderPrefix || string(line[httpDateLineLen-2:]) != "\r\n" {
+		return
+	}
+	copy(line, currentHTTPDateLine()[:])
+}
 
 var statusLines [600][]byte
 
@@ -107,6 +212,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 	headerBodyLen := resp.headerContentLength()
 
 	buf = appendStatusLine(buf, resp.StatusCode)
+	buf = appendDateUnlessSet(buf, resp.Headers)
 
 	if resp.ContentType != "" {
 		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
@@ -122,12 +228,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 		buf = append(buf, '\r', '\n')
 	}
 
-	for i := range resp.Headers {
-		buf = append(buf, resp.Headers[i][0]...)
-		buf = append(buf, ':', ' ')
-		buf = append(buf, resp.Headers[i][1]...)
-		buf = append(buf, '\r', '\n')
-	}
+	buf = appendH1HeaderFields(buf, resp.Headers)
 
 	ka, _ := serverConnHeaders(resp)
 	buf = append(buf, ka...)
@@ -158,6 +259,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	ibp := WriteBufPool.Get().(*[]byte)
 	inner := (*ibp)[:0]
 	inner = appendStatusLine(inner, resp.StatusCode)
+	inner = appendDateUnlessSet(inner, resp.Headers)
 	if resp.ContentType != "" {
 		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
 			inner = append(inner, pre...)
@@ -170,12 +272,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 		inner = appendUint(inner, int64(headerBodyLen))
 		inner = append(inner, '\r', '\n')
 	}
-	for i := range resp.Headers {
-		inner = append(inner, resp.Headers[i][0]...)
-		inner = append(inner, ':', ' ')
-		inner = append(inner, resp.Headers[i][1]...)
-		inner = append(inner, '\r', '\n')
-	}
+	inner = appendH1HeaderFields(inner, resp.Headers)
 	ka, _ := serverConnHeaders(resp)
 	inner = append(inner, ka...)
 	inner = append(inner, '\r', '\n')

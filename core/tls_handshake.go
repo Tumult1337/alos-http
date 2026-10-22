@@ -10,6 +10,8 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/sha512"
 	"errors"
 	"hash"
 )
@@ -270,7 +272,9 @@ var cvPrefix = func() [64]byte {
 	return p
 }()
 
-var cvContext = []byte("TLS 1.3, server CertificateVerify")
+const cvContextText = "TLS 1.3, server CertificateVerify"
+
+var cvContext = []byte(cvContextText)
 
 const (
 	sigECDSAP256SHA256 uint16 = 0x0403
@@ -297,8 +301,14 @@ func schemeOffered(offered []uint16, scheme uint16) bool {
 	return false
 }
 
+const certificateVerifyContentMax = len(cvPrefix) + len(cvContextText) + 1 + sha512.Size
+
 func certificateVerifyContent(transcriptHash []byte) []byte {
-	content := make([]byte, 64+len(cvContext)+1+len(transcriptHash))
+	return certificateVerifyContentInto(make([]byte, 64+len(cvContext)+1+len(transcriptHash)), transcriptHash)
+}
+
+func certificateVerifyContentInto(content, transcriptHash []byte) []byte {
+	content = content[:64+len(cvContext)+1+len(transcriptHash)]
 	copy(content, cvPrefix[:])
 	copy(content[64:], cvContext)
 	content[64+len(cvContext)] = 0x00
@@ -335,7 +345,11 @@ var rsaPSSSchemes = [...]struct {
 // scheme. It returns the scheme and signature, or an error when the key type is
 // unsupported or the client offers no scheme the key can produce.
 func SignCertificateVerify(signer crypto.Signer, transcriptHash []byte, offered []uint16) (uint16, []byte, error) {
-	return signTLS13(signer, certificateVerifyContent(transcriptHash), offered)
+	if len(transcriptHash) > sha512.Size {
+		return signTLS13(signer, certificateVerifyContent(transcriptHash), offered)
+	}
+	var buf [certificateVerifyContentMax]byte
+	return signTLS13(signer, certificateVerifyContentInto(buf[:], transcriptHash), offered)
 }
 
 func signTLS13(signer crypto.Signer, content []byte, offered []uint16) (uint16, []byte, error) {
@@ -378,6 +392,17 @@ func signTLS13(signer crypto.Signer, content []byte, offered []uint16) (uint16, 
 }
 
 func hashSum(h crypto.Hash, data []byte) []byte {
+	switch h {
+	case crypto.SHA256:
+		sum := sha256.Sum256(data)
+		return sum[:]
+	case crypto.SHA384:
+		sum := sha512.Sum384(data)
+		return sum[:]
+	case crypto.SHA512:
+		sum := sha512.Sum512(data)
+		return sum[:]
+	}
 	hh := h.New()
 	hh.Write(data)
 	return hh.Sum(nil)
@@ -437,9 +462,14 @@ type ParsedClientHello struct {
 	cipherSuitesSmall     [64]uint16
 	supportedVersSmall    [8]uint16
 	alpnProtosSmall       [4]string
+	groupsSmall           [16]uint16
+	sigSchemesSmall       [32]uint16
 	cipherSuitesOverflow  []uint16
 	supportedVersOverflow []uint16
 	alpnProtosOverflow    []string
+	groupsOverflow        []uint16
+	sigSchemesOverflow    []uint16
+	lastServerName        string
 }
 
 // SupportsTLS13 reports whether the client advertised TLS 1.3 (0x0304) in its supported_versions extension.
@@ -623,7 +653,7 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 
 		switch extType {
 		case 0x0000:
-			result.ServerName = parseSNI(extData)
+			result.ServerName = result.internServerName(parseSNI(extData))
 		case 0x0010:
 			protos, ok := parseALPN(result, extData)
 			if !ok {
@@ -635,9 +665,9 @@ func ParseClientHello(data []byte, result *ParsedClientHello) error {
 		case 0x0033:
 			parseKeyShares(result, extData)
 		case 0x000a:
-			result.SupportedGroups = parseU16List(extData)
+			result.SupportedGroups = parseU16ListInto(extData, result.groupsSmall[:], &result.groupsOverflow)
 		case 0x000d:
-			result.SignatureSchemes = parseU16List(extData)
+			result.SignatureSchemes = parseU16ListInto(extData, result.sigSchemesSmall[:], &result.sigSchemesOverflow)
 		case 0x000b:
 			if len(extData) > 1 {
 				for _, f := range extData[1:] {
@@ -798,7 +828,7 @@ func applyQUICTransportParam(result *ParsedClientHello, id uint64, value []byte)
 	return true
 }
 
-func parseU16List(data []byte) []uint16 {
+func parseU16ListInto(data []byte, small []uint16, overflow *[]uint16) []uint16 {
 	if len(data) < 2 {
 		return nil
 	}
@@ -806,20 +836,49 @@ func parseU16List(data []byte) []uint16 {
 	if 2+n > len(data) || n%2 != 0 {
 		return nil
 	}
-	out := make([]uint16, 0, n/2)
-	for i := 2; i+1 < 2+n; i += 2 {
-		out = append(out, uint16(data[i])<<8|uint16(data[i+1]))
+	count := n / 2
+	var out []uint16
+	if count <= len(small) {
+		out = small[:count]
+	} else {
+		if cap(*overflow) < count {
+			*overflow = make([]uint16, count)
+		}
+		out = (*overflow)[:count]
+	}
+	for i, j := 2, 0; j < count; i, j = i+2, j+1 {
+		out[j] = uint16(data[i])<<8 | uint16(data[i+1])
 	}
 	return out
 }
 
-func parseSNI(data []byte) string {
-	if len(data) < 2 {
+func (ch *ParsedClientHello) internServerName(name []byte) string {
+	if name == nil {
 		return ""
+	}
+	if string(name) != ch.lastServerName {
+		ch.lastServerName = string(name)
+	}
+	return ch.lastServerName
+}
+
+func internALPN(p []byte) string {
+	switch string(p) {
+	case "h2":
+		return "h2"
+	case "http/1.1":
+		return "http/1.1"
+	}
+	return string(p)
+}
+
+func parseSNI(data []byte) []byte {
+	if len(data) < 2 {
+		return nil
 	}
 	listLen := int(data[0])<<8 | int(data[1])
 	if len(data) < 2+listLen {
-		return ""
+		return nil
 	}
 	list := data[2 : 2+listLen]
 	for i := 0; i < len(list); {
@@ -833,11 +892,11 @@ func parseSNI(data []byte) string {
 			break
 		}
 		if nameType == 0x00 {
-			return string(list[i : i+nameLen])
+			return list[i : i+nameLen]
 		}
 		i += nameLen
 	}
-	return ""
+	return nil
 }
 
 func parseSupportedVersions(ch *ParsedClientHello, data []byte) []uint16 {
@@ -880,7 +939,7 @@ func parseALPN(ch *ParsedClientHello, data []byte) ([]string, bool) {
 	for i, j := 0, 0; i < len(list) && j < count; j++ {
 		pLen := int(list[i])
 		i++
-		protos[j] = string(list[i : i+pLen])
+		protos[j] = internALPN(list[i : i+pLen])
 		i += pLen
 	}
 	return protos, true

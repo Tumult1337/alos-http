@@ -5,10 +5,15 @@ package core
 import (
 	"strconv"
 	"sync"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
 	h1ProgressiveBodyThreshold = 512 << 10
+	h1DirectBodyMin            = 16 << 10
+	h1FirstSegmentMaxMSS       = 9216
+	h1FirstWriteOverMSS        = 1
 	h1OutSocketHighMark        = 1 << 20
 	h1StreamPendingCap         = 256 << 10
 	h1StreamPendingKeep        = 2 * h1StreamPendingCap
@@ -59,12 +64,22 @@ type epollH1StreamWriter struct {
 	handlerDone bool
 	pumpQueued  bool
 	err         error
+
+	fileFD       int
+	fileOff      int64
+	fileLeft     int64
+	fileBlocked  bool
+	fileProgress bool
+	fileNeedIO   bool
+	fileRef      *staticFD
 }
 
 func (c *epollConn) newStreamWriter(req *Request) StreamWriter {
 	if req.h2Stream != nil {
+		c.worker.leaveInline(&req.h2Stream.inlineSeq)
 		return c.newH2StreamWriter(req)
 	}
+	c.worker.leaveInline(&c.h1InlineSeq)
 	return c.newH1StreamWriter(req)
 }
 
@@ -132,18 +147,9 @@ func (sw *epollH1StreamWriter) WriteChunk(data []byte) error {
 	if sw.suppressBody {
 		return nil
 	}
-	if sw.maxWrite > 0 {
-		sw.written += int64(len(data))
-		if sw.written > sw.maxWrite {
-			sw.mustClose = true
-			return ErrBodyTooLarge
-		}
+	if err := sw.admitBody(int64(len(data))); err != nil {
+		return err
 	}
-	if sw.contentLength != h1NoContentLength && sw.bodyBytes+int64(len(data)) > sw.contentLength {
-		sw.mustClose = true
-		return ErrBodyTooLarge
-	}
-	sw.bodyBytes += int64(len(data))
 	if sw.limiter != nil {
 		sw.limiter.ThrottleDownload(int64(len(data)))
 	}
@@ -253,6 +259,11 @@ func (sw *epollH1StreamWriter) release() {
 	sw.pendingOff = 0
 	sw.headerReady, sw.ended, sw.finished, sw.handlerDone, sw.pumpQueued = false, false, false, false, false
 	sw.err = nil
+	sw.fileFD, sw.fileOff, sw.fileLeft, sw.fileBlocked, sw.fileProgress, sw.fileNeedIO = 0, 0, 0, false, false, false
+	if sw.fileRef != nil {
+		sw.fileRef.release()
+		sw.fileRef = nil
+	}
 	epollH1StreamWriterPool.Put(sw)
 }
 
@@ -274,15 +285,19 @@ func (c *epollConn) emitH1(data []byte) {
 		c.writeBuf = c.sealTLSAppData(c.writeBuf, data)
 		return
 	}
-	c.writeBuf = append(c.writeBuf, data...)
+	c.writeBuf = append(growIOBuf(c.writeBuf, len(data)), data...)
 }
 
 func (c *epollConn) h1OutRoom() int {
-	return h1OutSocketHighMark - (len(c.writeBuf) - c.writeSent)
+	mark := h1OutSocketHighMark
+	if c.tls {
+		mark = c.tlsSealBatch()
+	}
+	return mark - (len(c.writeBuf) - c.writeSent)
 }
 
 func (c *epollConn) h1PumpOut(w *epollWorker) bool {
-	before := len(c.writeBuf)
+	before := len(c.writeBuf) + len(c.bodyOut)
 	switch {
 	case c.h1Body != nil:
 		c.h1PumpBody()
@@ -295,21 +310,57 @@ func (c *epollConn) h1PumpOut(w *epollWorker) bool {
 		c.h1OutComplete = false
 		c.h1FinishOut(w)
 	}
-	return len(c.writeBuf) > before
+	return len(c.writeBuf)+len(c.bodyOut) > before
 }
 
 func (c *epollConn) h1PumpBody() {
+	if !c.tls {
+		c.h1HandOffBody()
+		return
+	}
 	room := c.h1OutRoom()
 	if room <= 0 {
 		return
 	}
 	n := min(room, len(c.h1Body)-c.h1BodyOff)
-	c.emitH1(c.h1Body[c.h1BodyOff : c.h1BodyOff+n])
+	c.writeBuf = c.sealTLSResponseBody(c.writeBuf, nil, c.h1Body[c.h1BodyOff:c.h1BodyOff+n])
 	c.h1BodyOff += n
 	if c.h1BodyOff == len(c.h1Body) {
 		c.h1Body, c.h1BodyOff = nil, 0
+		c.resp.releaseSentBody()
 		c.h1OutComplete = true
 	}
+}
+
+func (c *epollConn) h1HandOffBody() {
+	if len(c.bodyOut) > 0 {
+		return
+	}
+	if c.h1BodyOff < len(c.h1Body) {
+		end := len(c.h1Body)
+		if !c.h1FirstSegSent {
+			c.h1FirstSegSent = true
+			end = c.h1FirstSegmentEnd(end)
+		}
+		c.bodyOut = c.h1Body[c.h1BodyOff:end]
+		c.h1BodyOff = end
+		return
+	}
+	c.h1Body, c.h1BodyOff = nil, 0
+	c.resp.releaseSentBody()
+	c.h1OutComplete = true
+}
+
+func (c *epollConn) h1FirstSegmentEnd(end int) int {
+	mss, err := unix.GetsockoptInt(c.fd, unix.IPPROTO_TCP, unix.TCP_MAXSEG)
+	if err != nil || mss <= 0 || mss > h1FirstSegmentMaxMSS {
+		return end
+	}
+	n := c.h1BodyOff + mss + h1FirstWriteOverMSS - (len(c.writeBuf) - c.writeSent)
+	if n <= c.h1BodyOff || n >= end {
+		return end
+	}
+	return n
 }
 
 func (c *epollConn) h1PumpStream(sw *epollH1StreamWriter) {
@@ -323,6 +374,7 @@ func (c *epollConn) h1PumpStream(sw *epollH1StreamWriter) {
 		c.emitH1(sw.pending[sw.pendingOff : sw.pendingOff+n])
 		sw.pendingOff += n
 	}
+	c.h1PumpFile(sw)
 	switch {
 	case sw.bufferedLocked() == 0:
 		sw.pending, sw.pendingOff = sw.pending[:0], 0
@@ -330,7 +382,7 @@ func (c *epollConn) h1PumpStream(sw *epollH1StreamWriter) {
 		rest := copy(sw.pending, sw.pending[sw.pendingOff:])
 		sw.pending, sw.pendingOff = sw.pending[:rest], 0
 	}
-	done := sw.handlerDone && sw.ended && sw.bufferedLocked() == 0
+	done := sw.handlerDone && sw.ended && sw.bufferedLocked() == 0 && sw.fileLeft == 0
 	if done {
 		sw.finished = true
 	}
@@ -357,22 +409,31 @@ func (c *epollConn) h1FinishOut(w *epollWorker) {
 }
 
 func (c *epollConn) h1LargeBody() bool {
-	return c.resp.transmittedBodyLen() > h1ProgressiveBodyThreshold
+	n := c.resp.transmittedBodyLen()
+	if c.tls {
+		return n > c.tlsOneShotBodyMax()
+	}
+	return n >= h1DirectBodyMin
 }
 
 func (c *epollConn) h1StartProgressiveBody(w *epollWorker, keepAlive bool) {
 	if c.tls {
 		addAltSvcHeader(&c.resp, w.server)
 		head := appendPlainResponseMode(&c.resp, c.plainBuf[:0], keepAlive, false)
-		c.writeBuf = c.sealTLSAppData(c.writeBuf, head)
+		c.h1Body = c.resp.transmittedBodyBytes()
+		room := c.tlsFirstSeal() - (len(c.writeBuf) - c.writeSent)
+		c.h1BodyOff = min(len(c.h1Body), max(room-len(head), 0))
+		c.writeBuf = c.sealTLSResponseBody(c.writeBuf, head, c.h1Body[:c.h1BodyOff])
 		c.plainBuf = head[:0]
 	} else {
 		c.writeBuf = appendPlainResponseMode(&c.resp, c.writeBuf, keepAlive, false)
+		c.h1Body, c.h1BodyOff = c.resp.transmittedBodyBytes(), 0
 	}
 	c.dispatching = true
-	c.h1Body, c.h1BodyOff = c.resp.transmittedBodyBytes(), 0
 	c.h1OutKeepAlive = keepAlive
-	c.h1PumpOut(w)
+	if !c.tls {
+		c.h1PumpOut(w)
+	}
 	w.markFlush(c)
 }
 
@@ -396,6 +457,6 @@ func (c *epollConn) h1AbortOut() {
 			sw.release()
 		}
 	}
-	c.h1Body, c.h1BodyOff = nil, 0
+	c.h1Body, c.h1BodyOff, c.bodyOut = nil, 0, nil
 	c.h1OutKeepAlive, c.h1OutComplete, c.h1ResumeDue = false, false, false
 }

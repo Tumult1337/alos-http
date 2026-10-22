@@ -3,13 +3,13 @@
 package core
 
 import (
-	"compress/flate"
-	"compress/gzip"
 	"io"
 	"strings"
 	"sync"
 
-	"github.com/andybalholm/brotli"
+	"github.com/klauspost/compress/flate"
+	"github.com/klauspost/compress/gzip"
+	"github.com/molecule-man/go-brrr"
 )
 
 type encodingType uint8
@@ -44,12 +44,55 @@ var contentEncodingNames = [...]string{
 	encodingBrotli:  "br",
 }
 
-var brotliWriterPool [brotli.BestCompression + 1]sync.Pool
+type streamCompressor interface {
+	Reset(dst io.Writer)
+	Write(p []byte) (int, error)
+	Close() error
+}
+
+type pooledEncoder struct {
+	out bytesWriter
+	zw  streamCompressor
+	br  *brrr.Writer
+}
+
+var encoderPools [encodingBrotli + 1][brrr.BestCompression + 1]sync.Pool
 
 func init() {
-	for level := range brotliWriterPool {
-		brotliWriterPool[level].New = func() any { return brotli.NewWriterLevel(io.Discard, level) }
+	for level := 1; level <= flate.BestCompression; level++ {
+		encoderPools[encodingGzip][level].New = func() any {
+			e := &pooledEncoder{}
+			e.zw, _ = gzip.NewWriterLevel(&e.out, level)
+			return e
+		}
+		encoderPools[encodingDeflate][level].New = func() any {
+			e := &pooledEncoder{}
+			e.zw, _ = flate.NewWriter(&e.out, level)
+			return e
+		}
 	}
+	for level := range encoderPools[encodingBrotli] {
+		encoderPools[encodingBrotli][level].New = func() any {
+			e := &pooledEncoder{}
+			e.br, _ = brrr.NewWriter(&e.out, level)
+			e.zw = e.br
+			return e
+		}
+	}
+}
+
+func (e *pooledEncoder) appendCompressed(dst, body []byte) []byte {
+	e.out.buf = dst
+	if e.br != nil {
+		e.br.ResetWithSizeHint(&e.out, uint(len(body)))
+	} else {
+		e.zw.Reset(&e.out)
+	}
+	_, _ = e.zw.Write(body)
+	_ = e.zw.Close()
+	dst = e.out.buf
+	e.out.buf = nil
+	return dst
 }
 
 func negotiateEncoding(accept string, offered encodingSet) encodingType {
@@ -181,36 +224,20 @@ func parseQValue(s string) int16 {
 }
 
 func normalizeBrotliLevel(level int) int {
-	if level < 1 || level > brotli.BestCompression {
+	if level < 1 || level > brrr.BestCompression {
 		return defaultBrotliLevel
 	}
 	return level
 }
 
 func appendCompressed(dst, body []byte, enc encodingType, level int) []byte {
-	w := newBytesWriter(&dst)
-	switch enc {
-	case encodingGzip:
-		gw := gzipWriterPool[level].Get().(*gzip.Writer)
-		gw.Reset(w)
-		_, _ = gw.Write(body)
-		_ = gw.Close()
-		gzipWriterPool[level].Put(gw)
-	case encodingDeflate:
-		fw := deflateWriterPool[level].Get().(*flate.Writer)
-		fw.Reset(w)
-		_, _ = fw.Write(body)
-		_ = fw.Close()
-		deflateWriterPool[level].Put(fw)
-	case encodingBrotli:
-		bw := brotliWriterPool[level].Get().(*brotli.Writer)
-		bw.Reset(w)
-		_, _ = bw.Write(body)
-		_ = bw.Close()
-		brotliWriterPool[level].Put(bw)
+	pool := &encoderPools[enc][level]
+	e, ok := pool.Get().(*pooledEncoder)
+	if !ok {
+		return dst
 	}
-	w.buf = nil
-	bytesWriterPool.Put(w)
+	dst = e.appendCompressed(dst, body)
+	pool.Put(e)
 	return dst
 }
 

@@ -248,10 +248,8 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	if len(data) <= 256 {
 		innerLen := len(data) + 1
 		ciphertextLen := innerLen + overhead
-		var innerBuf [257]byte
-		inner := innerBuf[:innerLen]
-		copy(inner, data)
-		inner[innerLen-1] = 0x17
+		inner := append(acquirePooledBuf(&tlsScratchPool), data...)
+		inner = append(inner, 0x17)
 
 		obp := MediumBufPool.Get().(*[]byte)
 		out := (*obp)[:5]
@@ -261,6 +259,7 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 		out[3] = byte(ciphertextLen >> 8)
 		out[4] = byte(ciphertextLen)
 		out = writer.EncryptAppend(out, inner)
+		releasePooledBuf(&tlsScratchPool, inner, MaxRecordSize)
 
 		if owned, ok := conn.(ownedWriteConn); ok {
 			_, err := owned.WriteOwned(out, obp, writeOwnedReleaseMediumBuf)

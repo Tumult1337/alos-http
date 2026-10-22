@@ -18,6 +18,12 @@ const (
 	h2GoAwayMinPayload   = 8
 	h2MaxRequestFields   = 128
 
+	h2ParkedBytesHardFactor = 8
+
+	h2FrameHeaderLen    = 9
+	h2SealedDataMax     = MaxRecordPayload - 1 - h2FrameHeaderLen
+	h2DirectSealMinBody = H2DefaultMaxFrameSize
+
 	h2StatusHeaderListTooLarge = 431
 )
 
@@ -45,11 +51,22 @@ type tlsWorkerH2State struct {
 	rstCount     int
 	rstWindow    int64
 	sendingBytes int64
+	parkedBytes  int64
 	ctrlCount    int
 	ctrlWindow   int64
 
 	peerGoingAway bool
 	bodyReserved  atomic.Int64
+
+	encTable hpackEncTable
+
+	sealBatch     bool
+	sealedOut     []byte
+	sealedBacklog int
+	directSent    uint64
+	doneHead      *H2Stream
+	doneTail      *H2Stream
+	doneConnNext  *epollConn
 }
 
 func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
@@ -101,9 +118,11 @@ func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
 	st.rstCount = 0
 	st.rstWindow = 0
 	st.sendingBytes = 0
+	st.parkedBytes = 0
 	st.ctrlCount = 0
 	st.ctrlWindow = 0
 	st.peerGoingAway = false
+	st.encTable.reset()
 }
 
 func (st *tlsWorkerH2State) countReset() bool {
@@ -150,6 +169,7 @@ func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 
 func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uint32, maxFrame int) []byte {
 	off := len(dst)
+	headerEnd := off + 9 + len(fast.headerPayload)
 	if len(fast.framed) > 0 {
 		dst = append(dst, fast.framed...)
 		dst[off+5] = byte(streamID >> 24)
@@ -163,12 +183,16 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 			dst[dataOff+7] = byte(streamID >> 8)
 			dst[dataOff+8] = byte(streamID)
 		}
+		refreshH2DateField(dst[off+9 : headerEnd])
 		return dst
 	}
 	if len(fast.body) == 0 {
-		return appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, fast.headerPayload)
+		dst = appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, fast.headerPayload)
+		refreshH2DateField(dst[off+9 : headerEnd])
+		return dst
 	}
 	dst = appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders, streamID, fast.headerPayload)
+	refreshH2DateField(dst[off+9 : headerEnd])
 	remaining := fast.body
 	for len(remaining) > 0 {
 		chunk := remaining
@@ -186,15 +210,36 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 }
 
 func appendH2StatusOnlyResponse(dst []byte, streamID uint32, status int, serverName string) []byte {
+	return appendH2StatusOnlyResponseIndexed(dst, streamID, status, serverName, nil)
+}
+
+func appendH2StatusOnlyResponseIndexed(dst []byte, streamID uint32, status int, serverName string, tbl *hpackEncTable) []byte {
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, nil)}
 	payloadStart := len(enc.Buf)
-	encodeH2ResponseHeaders(&enc, status, "", 0, nil, serverName)
+	encodeH2ResponseHeadersIndexed(&enc, tbl, status, "", 0, nil, serverName)
+	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
+	return enc.Buf
+}
+
+func appendH2HeaderBlockFrame(dst []byte, streamID uint32, flags byte, tbl *hpackEncTable, block []byte) []byte {
+	if !tbl.pendingUpdate {
+		return appendH2Frame(dst, H2FrameHeaders, flags, streamID, block)
+	}
+	off := len(dst)
+	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
+	payloadStart := len(enc.Buf)
+	tbl.beginBlock(&enc)
+	enc.Buf = append(enc.Buf, block...)
 	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
 	return enc.Buf
 }
 
 func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, endStream bool) []byte {
+	return appendH2ResponseHeadersFrameIndexed(dst, streamID, resp, endStream, nil, respServerName(resp))
+}
+
+func appendH2ResponseHeadersFrameIndexed(dst []byte, streamID uint32, resp *Response, endStream bool, tbl *hpackEncTable, serverName string) []byte {
 	flags := byte(H2FlagEndHeaders)
 	if endStream {
 		flags |= H2FlagEndStream
@@ -202,7 +247,7 @@ func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, e
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
 	payloadStart := len(enc.Buf)
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, respServerName(resp))
+	encodeH2ResponseHeadersIndexed(&enc, tbl, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, serverName)
 	putH2FrameLength(enc.Buf[off:], len(enc.Buf)-payloadStart)
 	return enc.Buf
 }
@@ -307,6 +352,7 @@ func (st *tlsWorkerH2State) cancelBusyStream(id uint32, cause error) *H2Stream {
 func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
 	delete(st.sending, id)
 	st.sendingBytes -= int64(stream.stallBytes)
+	st.parkedBytes -= int64(stream.parkedBytes)
 	stream.Reset()
 	StreamPool.Put(stream)
 }
@@ -314,12 +360,26 @@ func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
 func appendH2Frame(dst []byte, typ, flags byte, streamID uint32, payload []byte) []byte {
 	pLen := len(payload)
 	off := len(dst)
-	needed := off + 9 + pLen
+	needed := off + h2FrameHeaderLen + pLen
 	if cap(dst) < needed {
-		dst = slices.Grow(dst, 9+pLen)
+		dst = slices.Grow(dst, h2FrameHeaderLen+pLen)
 	}
 	dst = dst[:needed]
-	frame := dst[off:]
+	putH2FrameHeader(dst[off:], typ, flags, streamID, pLen)
+	if pLen > 0 {
+		copy(dst[off+h2FrameHeaderLen:], payload)
+	}
+	return dst
+}
+
+func appendH2FrameHeader(dst []byte, typ, flags byte, streamID uint32, pLen int) []byte {
+	off := len(dst)
+	dst = slices.Grow(dst, h2FrameHeaderLen)[:off+h2FrameHeaderLen]
+	putH2FrameHeader(dst[off:], typ, flags, streamID, pLen)
+	return dst
+}
+
+func putH2FrameHeader(frame []byte, typ, flags byte, streamID uint32, pLen int) {
 	_ = frame[8]
 	frame[0] = byte(pLen >> 16)
 	frame[1] = byte(pLen >> 8)
@@ -330,8 +390,4 @@ func appendH2Frame(dst []byte, typ, flags byte, streamID uint32, payload []byte)
 	frame[6] = byte(streamID >> 16)
 	frame[7] = byte(streamID >> 8)
 	frame[8] = byte(streamID)
-	if pLen > 0 {
-		copy(frame[9:], payload)
-	}
-	return dst
 }

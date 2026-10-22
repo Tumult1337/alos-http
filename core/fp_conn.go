@@ -350,6 +350,31 @@ func (l *beLoop) flushWrites(c *backendConn) {
 	}
 }
 
+func (l *beLoop) sendDirect(c *backendConn, p []byte) {
+	for len(p) > 0 && c.state != connClosed {
+		n, err := socketSend(c.fd, p)
+		if n > 0 {
+			p = p[n:]
+			if c.state == connReady && c.cur != nil {
+				c.cur.wroteRequest = true
+			}
+			continue
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		if err == unix.EAGAIN {
+			c.wbuf.write(p)
+			break
+		}
+		l.closeConn(c, err)
+		return
+	}
+	if c.state != connClosed {
+		l.wakeWaitingUploads(c)
+	}
+}
+
 func (l *beLoop) closeConn(c *backendConn, err error) {
 	if c.state == connClosed {
 		return

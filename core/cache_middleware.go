@@ -54,7 +54,7 @@ import (
 //	Example: GzipMinBytes: 1024.
 //
 // GzipLevel is the gzip level used when Gzip is set; values outside 1–9 default
-// to 6.
+// to 2.
 //
 //	Example: GzipLevel: 9.
 //
@@ -123,7 +123,7 @@ func Cache(cfg CacheConfig) MiddlewareFunc {
 
 // NewResponseCache builds a ResponseCache from cfg, applying defaults for any
 // zero field (TTL 60s, Methods {"GET"}, MaxEntries 10000, MaxBodyBytes 1 MiB,
-// GzipMinBytes 512, GzipLevel 6, SweepInterval 15s) and starting the background
+// GzipMinBytes 512, GzipLevel 2, SweepInterval 15s) and starting the background
 // sweeper. Call Stop when done to end the sweeper goroutine.
 //
 // Example: rc := NewResponseCache(CacheConfig{})
@@ -145,7 +145,7 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 		cfg.GzipMinBytes = 512
 	}
 	if cfg.GzipLevel < 1 || cfg.GzipLevel > 9 {
-		cfg.GzipLevel = 6
+		cfg.GzipLevel = defaultCompressLevel
 	}
 	cfg.BrotliLevel = normalizeBrotliLevel(cfg.BrotliLevel)
 	if cfg.SweepInterval <= 0 {
@@ -223,7 +223,7 @@ func (ent *cachedResponse) negotiate(req *Request) encodingType {
 }
 
 func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *cachedResponse {
-	if resp == nil || resp.IsStreamed() {
+	if resp == nil || resp.IsStreamed() || resp.fileBody {
 		return nil
 	}
 	status := resp.StatusCode
@@ -287,13 +287,13 @@ func serveCached(resp *Response, ent *cachedResponse, enc encodingType) {
 	resp.ContentType = ent.contentType
 	switch enc {
 	case encodingGzip:
-		resp.SetBody(ent.gzipBody)
+		resp.referenceBody(ent.gzipBody)
 		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
 	case encodingBrotli:
-		resp.SetBody(ent.brotliBody)
+		resp.referenceBody(ent.brotliBody)
 		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
 	default:
-		resp.SetBody(ent.body)
+		resp.referenceBody(ent.body)
 	}
 	if ent.addVary {
 		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")

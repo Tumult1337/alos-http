@@ -51,10 +51,10 @@ func (c *epollConn) epollProcessTLS(srv *Server) int {
 
 func (c *epollConn) runTLSPhases(srv *Server) int {
 	if c.plainBuf == nil {
-		c.plainBuf = acquireIOBuf()
+		c.plainBuf = c.worker.acquireWriteBuf()
 	}
 	if c.appBuf == nil {
-		c.appBuf = acquireIOBuf()
+		c.appBuf = c.worker.acquireWriteBuf()
 	}
 	for {
 		var action int
@@ -135,22 +135,23 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	transcript.Write(retryPrefix)
 	transcript.Write(payload)
 
-	var earlyBuf, saltBuf [64]byte
+	sc := acquireTLS13HelloScratch()
+	defer releaseTLS13HelloScratch(sc)
 	session, alert, ok := srv.acceptResumption(resumeRequest{
 		ch:               c.clientHello,
 		cs:               cs,
 		policy:           policy,
 		transcriptPrefix: retryPrefix,
 		hello:            payload,
-	}, earlyBuf[:0])
+	}, sc.early[:0])
 	if !ok {
 		return c.failTLS(alert)
 	}
 	resumed := session.early != nil
 	hsSalt := cs.derivedFromEarly
 	if resumed {
-		hsSalt = cs.DeriveSecretTo(&cs.labelDerived, session.early, cs.emptyTranscriptHash, saltBuf[:0])
-		clear(earlyBuf[:])
+		hsSalt = cs.DeriveSecretTo(&cs.labelDerived, session.early, cs.emptyTranscriptHash, sc.salt[:0])
+		clear(sc.early[:])
 	}
 	requestCert := policy.requests() && !resumed
 	var staple *ocspStaple
@@ -180,9 +181,8 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 
 	var handshakeSecretBuf [64]byte
 	handshakeSecret := kx.extractHandshakeSecret(cs, hsSalt, handshakeSecretBuf[:0])
-	clear(saltBuf[:])
-	var hsHashBuf [64]byte
-	hsHash := transcript.Sum(hsHashBuf[:0])
+	clear(sc.salt[:])
+	hsHash := transcript.Sum(sc.hsHash[:0])
 	var clientHSSecretBuf [64]byte
 	clientHSSecret := cs.DeriveSecretTo(&cs.labelClientHSTraffic, handshakeSecret, hsHash, clientHSSecretBuf[:0])
 	var serverHSSecretBuf [64]byte
@@ -215,8 +215,7 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 		inner = append(inner, eeCert...)
 	}
 	if !resumed {
-		var cvHashBuf [64]byte
-		cvScheme, sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(cvHashBuf[:0]), c.clientHello.SignatureSchemes)
+		cvScheme, sig, err := SignCertificateVerify(certEntry.PrivKey, transcript.Sum(sc.cvHash[:0]), c.clientHello.SignatureSchemes)
 		if err != nil {
 			return c.failTLS(signFailureAlert(err))
 		}
@@ -224,9 +223,8 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 		inner = appendCertificateVerify(inner, cvScheme, sig)
 		transcript.Write(inner[cvStart:])
 	}
-	var finHashBuf [64]byte
 	var srvVerifyBuf [64]byte
-	srvVerifyData := cs.ComputeFinishedTo(serverHSSecret, transcript.Sum(finHashBuf[:0]), srvVerifyBuf[:0])
+	srvVerifyData := cs.ComputeFinishedTo(serverHSSecret, transcript.Sum(sc.finHash[:0]), srvVerifyBuf[:0])
 	finStart := len(inner)
 	inner = appendFinished(inner, srvVerifyData)
 	fin := inner[finStart:]
@@ -245,8 +243,7 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	derivedFromHS := cs.DeriveSecretTo(&cs.labelDerived, handshakeSecret, cs.emptyTranscriptHash, derivedFromHSBuf[:0])
 	var masterSecretBuf [64]byte
 	masterSecret := TLSExtractTo(cs.HashFn, derivedFromHS, cs.zeroHashInput, masterSecretBuf[:0])
-	var appHashBuf [64]byte
-	appHash := transcript.Sum(appHashBuf[:0])
+	appHash := transcript.Sum(sc.appHash[:0])
 	var clientAppSecretBuf [64]byte
 	clientAppSecret := cs.DeriveSecretTo(&cs.labelClientAppTraffic, masterSecret, appHash, clientAppSecretBuf[:0])
 	var serverAppSecretBuf [64]byte
@@ -273,14 +270,13 @@ func (c *epollConn) epollTLSClientHello(srv *Server) int {
 	c.expectedFinN = len(verify)
 	c.peerCerts = session.peerCerts
 	if !requestCert && srv.issuesTickets(c.clientHello) {
-		var clientFinBuf [tlsHandshakeHeaderLen + 64]byte
-		transcript.Write(appendFinished(clientFinBuf[:0], verify))
-		var resHashBuf [64]byte
-		c.ticket = newPendingTicket(cs, masterSecret, transcript.Sum(resHashBuf[:0]), c.clientHello.ServerName, selectedALPN, session.peerChain)
+		transcript.Write(appendFinished(sc.clientFin[:0], verify))
+		c.ticket = newPendingTicket(cs, masterSecret, transcript.Sum(sc.resHash[:0]), c.clientHello.ServerName, selectedALPN, session.peerChain)
 	}
 	c.hsReader = clientHSReader
 	c.appReader = clientAppReader
 	c.appWriter = serverAppWriter
+	c.sendSessionTicket(srv)
 	c.selectedALPN = selectedALPN
 	c.phase = tlsConnPhaseClientFinished
 	c.tlsRetry = nil
@@ -406,7 +402,11 @@ func (c *epollConn) epollTLSDecryptToApp(srv *Server) (int, bool) {
 			if len(content) > srv.effectiveReadCap()-len(c.appBuf) {
 				return epollActionCloseAfterFlush, false
 			}
-			c.appBuf = append(c.appBuf, content...)
+			if c.tls12 == nil {
+				c.appBuf = c.appBuf[:len(c.appBuf)+len(content)]
+			} else {
+				c.appBuf = append(c.appBuf, content...)
+			}
 			c.consumeCipher(totalLen)
 			c.tlsUselessRecords = 0
 			gotData = true
@@ -431,10 +431,13 @@ func (c *epollConn) openTLS13AppRecord(ct byte, payload []byte) (tlsAppRecord, [
 	default:
 		return tlsAppRecordFatal, nil, alertUnexpectedMessage
 	}
-	pt, err := c.appReader.Decrypt(payload)
+	c.appBuf = ensureTailCap(c.appBuf, len(payload))
+	base := len(c.appBuf)
+	pt, err := c.appReader.decryptAppend(c.appBuf, payload)
 	if err != nil {
 		return tlsAppRecordFatal, nil, alertBadRecordMAC
 	}
+	pt = pt[base:]
 	if len(pt) > MaxRecordPayload+1 {
 		return tlsAppRecordFatal, nil, alertRecordOverflow
 	}
@@ -529,19 +532,17 @@ func (c *epollConn) epollTLS12ClientHello(srv *Server, payload []byte, totalLen 
 	if !ok {
 		return c.failTLS(alertHandshakeFailure)
 	}
-	ecdhePriv, ecdhePub, err := tls12GenerateECDHE(curve)
-	if err != nil {
-		return c.failTLS(alertInternalError)
-	}
-
 	st := &tls12State{
 		suite:       suite,
 		curve:       curve,
-		ecdhePriv:   ecdhePriv,
 		transcript:  suite.newHash(),
 		ems:         c.clientHello.extendedMasterSecret,
 		issueTicket: srv.tickets != nil && c.clientHello.sessionTicketOffered,
 		sni:         c.clientHello.ServerName,
+	}
+	ecdhePub, err := st.generateECDHE(srv.x25519Pool)
+	if err != nil {
+		return c.failTLS(alertInternalError)
 	}
 	st.clientRandom = c.clientHello.Random
 	if !st.newServerRandom() {
@@ -556,12 +557,12 @@ func (c *epollConn) epollTLS12ClientHello(srv *Server, payload []byte, totalLen 
 		sessionTicket:        st.issueTicket,
 		ocspStaple:           staple != nil,
 	})
-	certMsg := buildTLS12Certificate(certEntry.ChainDER)
+	certMsg := certEntry.tls12CertificateMsg()
 	skeMsg, err := buildTLS12ServerKeyExchange(certEntry.PrivKey, st.clientRandom[:], st.serverRandom[:], curve, ecdhePub, c.clientHello.SignatureSchemes)
 	if err != nil {
 		return c.failTLS(signFailureAlert(err))
 	}
-	shdMsg := buildTLS12ServerHelloDone()
+	shdMsg := tls12ServerHelloDoneMsg[:]
 	if policy.requests() {
 		st.requestClientCert(policy)
 	}

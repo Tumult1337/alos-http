@@ -163,14 +163,31 @@ func newPendingTicket(cs *CipherSuiteConfig, masterSecret, resumptionHash []byte
 }
 
 func (s *Server) newSessionTicketMessage(p *pendingTicket) []byte {
+	msg, ok := s.appendSessionTicketMessage(nil, p)
+	if !ok {
+		return nil
+	}
+	return msg
+}
+
+func (s *Server) appendSessionTicketMessage(dst []byte, p *pendingTicket) ([]byte, bool) {
 	cs := p.suite
 	var pskBuf [64]byte
 	psk := cs.DeriveSecretTo(&cs.labelResumption, p.resMaster[:p.n], nil, pskBuf[:0])
 	clear(p.resMaster[:])
-	var ageAddBuf [4]byte
-	rand.Read(ageAddBuf[:])
-	ageAdd := binary.BigEndian.Uint32(ageAddBuf[:])
-	ticket := s.tickets.seal(&sessionTicket{
+	msgStart := len(dst)
+	lifetime := min(s.tickets.lifetime, maxTLS13TicketLifetime)
+	dst = append(dst, tlsHSNewSessionTicket, 0, 0, 0)
+	dst = binary.BigEndian.AppendUint32(dst, uint32(lifetime/time.Second))
+	ageOff := len(dst)
+	dst = append(dst, 0, 0, 0, 0)
+	rand.Read(dst[ageOff : ageOff+4])
+	ageAdd := binary.BigEndian.Uint32(dst[ageOff:])
+	dst = append(dst, 0)
+	ticketLenOff := len(dst)
+	dst = append(dst, 0, 0)
+	ticketStart := len(dst)
+	dst, ok := s.tickets.appendSealed(dst, &sessionTicket{
 		tlsVersion: tlsVersion13,
 		suite:      cs.ID,
 		createdMs:  s.tickets.nowMs(),
@@ -181,16 +198,15 @@ func (s *Server) newSessionTicketMessage(p *pendingTicket) []byte {
 		clientCert: p.clientCert,
 	})
 	clear(pskBuf[:])
-	if ticket == nil || len(ticket) > maxTicketWireLen {
-		return nil
+	ticketLen := len(dst) - ticketStart
+	if !ok || ticketLen > maxTicketWireLen {
+		return dst[:msgStart], false
 	}
-	lifetime := min(s.tickets.lifetime, maxTLS13TicketLifetime)
-	body := make([]byte, 0, 4+4+1+2+len(ticket)+2)
-	body = binary.BigEndian.AppendUint32(body, uint32(lifetime/time.Second))
-	body = binary.BigEndian.AppendUint32(body, ageAdd)
-	body = append(body, 0)
-	body = binary.BigEndian.AppendUint16(body, uint16(len(ticket)))
-	body = append(body, ticket...)
-	body = append(body, 0, 0)
-	return HSWrap(tlsHSNewSessionTicket, body)
+	binary.BigEndian.PutUint16(dst[ticketLenOff:], uint16(ticketLen))
+	dst = append(dst, 0, 0)
+	bodyLen := len(dst) - msgStart - 4
+	dst[msgStart+1] = byte(bodyLen >> 16)
+	dst[msgStart+2] = byte(bodyLen >> 8)
+	dst[msgStart+3] = byte(bodyLen)
+	return dst, true
 }

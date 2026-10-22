@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // StaticConfig configures the file server returned by Static.
@@ -31,10 +32,16 @@ import (
 //	Example: Browse: true.
 //	Example: Browse: false.
 type StaticConfig struct {
-	Root   string
-	Index  string
-	Browse bool
+	Root             string
+	Index            string
+	Browse           bool
+	DisableCache     bool
+	CacheMaxBytes    int64
+	CacheMaxFileSize int64
+	CacheTTL         time.Duration
 }
+
+const wellKnownSegment = ".well-known"
 
 func sanitizeStaticPath(p string) (string, bool) {
 	if strings.ContainsAny(p, "\x00\\") {
@@ -43,8 +50,15 @@ func sanitizeStaticPath(p string) (string, bool) {
 	if strings.Contains(p, "..") {
 		return "", false
 	}
-	for _, seg := range strings.Split(p, "/") {
-		if len(seg) > 0 && seg[0] == '.' && seg != ".well-known" {
+	for i := 0; i < len(p); i++ {
+		if p[i] != '.' || (i > 0 && p[i-1] != '/') {
+			continue
+		}
+		seg := p[i:]
+		if end := strings.IndexByte(seg, '/'); end >= 0 {
+			seg = seg[:end]
+		}
+		if seg != wellKnownSegment {
 			return "", false
 		}
 	}
@@ -56,6 +70,11 @@ func sanitizeStaticPath(p string) (string, bool) {
 // Example: s.Router.GET("/static/*filepath", Static("/static", StaticConfig{Root: "./public"}))
 // Example: s.Router.GET("/files/*filepath", Static("/files", StaticConfig{Root: "/var/www", Browse: true}))
 func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
+	handler, _ := newStaticHandler(urlPrefix, cfg)
+	return handler
+}
+
+func newStaticHandler(urlPrefix string, cfg StaticConfig) (HandlerFunc, *staticFileCache) {
 	if !strings.HasPrefix(urlPrefix, "/") {
 		urlPrefix = "/" + urlPrefix
 	}
@@ -70,8 +89,13 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 		absRoot = cfg.Root
 	}
 	root := newStaticRoot(absRoot)
+	rootWithSep := absRoot
+	if !strings.HasSuffix(rootWithSep, string(os.PathSeparator)) {
+		rootWithSep += string(os.PathSeparator)
+	}
+	cache := newStaticFileCache(cfg)
 
-	return func(req *Request, resp *Response) {
+	handler := func(req *Request, resp *Response) {
 		reqPath := strings.TrimPrefix(req.Path, urlPrefix)
 		if reqPath == "" {
 			reqPath = "/"
@@ -88,6 +112,9 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 		}
 
 		cleanRel = strings.TrimPrefix(cleanRel, "/")
+		if cleanRel != "" && root.serveFast(req, resp, cleanRel, cache) {
+			return
+		}
 
 		fullPath := filepath.Join(absRoot, filepath.FromSlash(cleanRel))
 
@@ -97,10 +124,6 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
-		rootWithSep := absRoot
-		if !strings.HasSuffix(rootWithSep, string(os.PathSeparator)) {
-			rootWithSep += string(os.PathSeparator)
-		}
 		if absFullPath != absRoot && !strings.HasPrefix(absFullPath, rootWithSep) {
 			resp.Status(403).String("Forbidden")
 			return
@@ -162,11 +185,15 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			resp.Status(404).String("Not Found")
 		}
 	}
+	return handler, cache
 }
 
 type staticRoot struct {
-	abs      string
-	resolved atomic.Pointer[staticRootDir]
+	abs       string
+	absZ      []byte
+	resolved  atomic.Pointer[staticRootDir]
+	dir       atomic.Pointer[staticDirHandle]
+	noOpenat2 atomic.Bool
 }
 
 type staticRootDir struct {
@@ -175,8 +202,11 @@ type staticRootDir struct {
 }
 
 func newStaticRoot(absRoot string) *staticRoot {
-	root := &staticRoot{abs: absRoot}
+	root := &staticRoot{abs: absRoot, absZ: append([]byte(absRoot), 0)}
 	root.resolved.Store(newStaticRootDir(evalStaticRoot(absRoot)))
+	if strings.IndexByte(absRoot, 0) >= 0 {
+		root.noOpenat2.Store(true)
+	}
 	return root
 }
 
