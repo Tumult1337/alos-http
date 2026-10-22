@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/alosmap"
@@ -101,6 +102,8 @@ type cachedResponse struct {
 type ResponseCache struct {
 	cfg      CacheConfig
 	store    *alosmap.TypedMap[string, *cachedResponse]
+	filling  *alosmap.TypedMap[string, struct{}]
+	builds   atomic.Int64
 	methods  map[string]struct{}
 	ttlNs    int64
 	stop     chan struct{}
@@ -158,6 +161,7 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 	rc := &ResponseCache{
 		cfg:     cfg,
 		store:   alosmap.NewTyped[string, *cachedResponse]().Prealloc(128),
+		filling: alosmap.NewTyped[string, struct{}](),
 		methods: methods,
 		ttlNs:   int64(cfg.TTL),
 		stop:    make(chan struct{}),
@@ -246,6 +250,17 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 			return nil
 		}
 	}
+	ownedKey := strings.Clone(key)
+	compress := (rc.cfg.Gzip || rc.cfg.Brotli) && len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType)
+	if compress {
+		if _, busy := rc.filling.LoadOrStore(ownedKey, struct{}{}); busy {
+			return nil
+		}
+		defer rc.filling.Delete(ownedKey)
+		if cur, ok := rc.store.Load(ownedKey); ok && turbo.UnixNano() <= cur.expiresAtNs {
+			return cur
+		}
+	}
 	now := turbo.UnixNano()
 	ent := &cachedResponse{
 		status:      status,
@@ -255,12 +270,13 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 		expiresAtNs: now + rc.ttlNs,
 		storedAtNs:  now,
 	}
-	if len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType) {
+	if compress {
+		rc.builds.Add(1)
 		if rc.cfg.Gzip {
-			ent.gzipBody = compressedVariant(body, encodingGzip, rc.cfg.GzipLevel)
+			ent.gzipBody = compressOnce(body, encodingGzip, rc.cfg.GzipLevel)
 		}
 		if rc.cfg.Brotli {
-			ent.brotliBody = compressedVariant(body, encodingBrotli, rc.cfg.BrotliLevel)
+			ent.brotliBody = compressOnce(body, encodingBrotli, rc.cfg.BrotliLevel)
 		}
 	}
 	if ent.gzipBody != nil {
@@ -270,7 +286,7 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 		ent.encodings |= offerBrotli
 	}
 	ent.addVary = ent.encodings != 0 && !varyCoversAcceptEncoding(ent.headers)
-	rc.store.Store(strings.Clone(key), ent)
+	rc.store.Store(ownedKey, ent)
 	return ent
 }
 
@@ -442,18 +458,5 @@ func cloneHeaders(h [][2]string) [][2]string {
 func cloneBytes(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
-	return out
-}
-
-func compressedVariant(body []byte, enc encodingType, level int) []byte {
-	bp := LargeBufPool.Get().(*[]byte)
-	buf := appendCompressed((*bp)[:0], body, enc, level)
-	var out []byte
-	if len(buf) > 0 && len(buf) < len(body) {
-		out = make([]byte, len(buf))
-		copy(out, buf)
-	}
-	*bp = buf
-	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return out
 }

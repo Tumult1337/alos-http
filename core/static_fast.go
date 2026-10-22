@@ -189,7 +189,7 @@ func (root *staticRoot) serveFast(req *Request, resp *Response, rel string, cach
 		return false
 	}
 	if cache != nil {
-		if e := cache.fresh(rel); e != nil && e.serveCached(req, resp) {
+		if e := cache.fresh(rel); e != nil && cache.serveEntry(e, req, resp) {
 			return true
 		}
 	}
@@ -222,7 +222,7 @@ func (root *staticRoot) serveBeneath(sc *staticScratch, dirfd int, req *Request,
 			cache.forget(rel)
 			return false
 		}
-		if e := cache.lookup(rel, &sc.st); e != nil && e.serveCached(req, resp) {
+		if e := cache.lookup(rel, &sc.st); e != nil && cache.serveEntry(e, req, resp) {
 			return true
 		}
 	}
@@ -262,26 +262,32 @@ func serveStaticFD(sc *staticScratch, req *Request, resp *Response, fd int, rel 
 var staticCacheClock = turbo.UnixNano
 
 type staticFileCache struct {
-	entries     *alosmap.TypedMap[string, *staticCacheEntry]
-	filling     *alosmap.TypedMap[string, struct{}]
-	bytes       atomic.Int64
-	fds         atomic.Int64
-	maxBytes    int64
-	maxFileSize int64
-	ttl         int64
+	entries       *alosmap.TypedMap[string, *staticCacheEntry]
+	filling       *alosmap.TypedMap[string, struct{}]
+	bytes         atomic.Int64
+	fds           atomic.Int64
+	maxBytes      int64
+	maxFileSize   int64
+	ttl           int64
+	compressQueue chan staticCompressJob
+	variantSlots  *alosmap.TypedMap[string, *staticVariantSlot]
+	compressing   atomic.Bool
+	builds        atomic.Int64
 }
 
 type staticCacheEntry struct {
-	id          staticFileID
-	key         string
-	data        []byte
-	size        int64
-	fd          atomic.Pointer[staticFD]
-	contentType string
-	sizeText    string
-	validators  contentValidators
-	cost        int64
-	freshUntil  atomic.Int64
+	id           staticFileID
+	key          string
+	data         []byte
+	size         int64
+	fd           atomic.Pointer[staticFD]
+	contentType  string
+	sizeText     string
+	validators   contentValidators
+	cost         int64
+	freshUntil   atomic.Int64
+	compressible bool
+	slot         atomic.Pointer[staticVariantSlot]
 }
 
 func staticCacheTTLNanos(ttl time.Duration) int64 {
@@ -313,6 +319,10 @@ func newStaticFileCache(cfg StaticConfig) *staticFileCache {
 	}
 	if c.maxFileSize > c.maxBytes {
 		c.maxFileSize = c.maxBytes
+	}
+	if !cfg.DisableCompression {
+		c.compressQueue = make(chan staticCompressJob, staticCompressQueueSize)
+		c.variantSlots = alosmap.NewTyped[string, *staticVariantSlot]()
 	}
 	runtime.AddCleanup(c, releaseStaticCacheFDs, c.entries)
 	return c
@@ -356,6 +366,11 @@ func (c *staticFileCache) serveFilled(sc *staticScratch, req *Request, resp *Res
 	if e == nil {
 		return false
 	}
+	if v := c.variantFor(e, req); v != nil {
+		_ = unix.Close(fd)
+		e.serveVariant(req, resp, v)
+		return true
+	}
 	if byFD && e.sendsByFD(req) {
 		if sw := staticFileWriter(resp); sw != nil {
 			h := c.attachFD(e, fd)
@@ -366,11 +381,10 @@ func (c *staticFileCache) serveFilled(sc *staticScratch, req *Request, resp *Res
 			return true
 		}
 	}
-	if e.data == nil {
+	if !c.serveEntry(e, req, resp) {
 		return false
 	}
 	_ = unix.Close(fd)
-	e.serve(req, resp)
 	return true
 }
 
@@ -397,6 +411,7 @@ func (c *staticFileCache) attachFD(e *staticCacheEntry, fd int) *staticFD {
 
 func (c *staticFileCache) retire(e *staticCacheEntry) {
 	c.bytes.Add(-e.cost)
+	c.retireVariants(e)
 	if h := e.fd.Swap(staticFDRetired); h != nil && h != staticFDRetired {
 		c.fds.Add(-1)
 		h.release()
@@ -454,7 +469,7 @@ func (c *staticFileCache) lookupOrFill(sc *staticScratch, fd int, rel string, fi
 	if !ok || unix.Fstat(fd, &sc.st) != nil || staticFileIDOf(&sc.st) != id {
 		return nil
 	}
-	e := newStaticCacheEntry(rel, data, &sc.st)
+	e := c.newEntry(rel, data, &sc.st)
 	c.renew(e)
 	if c.reserve(e.cost) {
 		c.publish(e)
@@ -470,7 +485,7 @@ func (c *staticFileCache) publish(e *staticCacheEntry) {
 }
 
 func (c *staticFileCache) fillFDOnly(sc *staticScratch, rel string) *staticCacheEntry {
-	e := newStaticCacheEntry(rel, nil, &sc.st)
+	e := c.newEntry(rel, nil, &sc.st)
 	c.renew(e)
 	if !c.reserveFree(e.cost) {
 		return nil
@@ -493,7 +508,7 @@ func (c *staticFileCache) fillLarge(sc *staticScratch, fd int, rel string, id st
 		c.bytes.Add(-cost)
 		return nil
 	}
-	e := newStaticCacheEntry(rel, data, &sc.st)
+	e := c.newEntry(rel, data, &sc.st)
 	c.renew(e)
 	c.publish(e)
 	return e
@@ -516,6 +531,12 @@ func preadFull(fd int, size int64) ([]byte, bool) {
 		off += n
 	}
 	return data, true
+}
+
+func (c *staticFileCache) newEntry(rel string, data []byte, st *unix.Stat_t) *staticCacheEntry {
+	e := newStaticCacheEntry(rel, data, st)
+	e.compressible = c.compressible(e)
+	return e
 }
 
 func newStaticCacheEntry(rel string, data []byte, st *unix.Stat_t) *staticCacheEntry {
@@ -571,7 +592,11 @@ func (e *staticCacheEntry) sendsByFD(req *Request) bool {
 	return e.size >= staticFDSendMin && req.Method == http.MethodGet && sendsFilePlainH1(req)
 }
 
-func (e *staticCacheEntry) serveCached(req *Request, resp *Response) bool {
+func (c *staticFileCache) serveEntry(e *staticCacheEntry, req *Request, resp *Response) bool {
+	if v := c.variantFor(e, req); v != nil {
+		e.serveVariant(req, resp, v)
+		return true
+	}
 	if e.sendsByFD(req) {
 		if sw := staticFileWriter(resp); sw != nil {
 			if h := e.fd.Load(); h != nil && h != staticFDRetired && h.tryAcquire() {
@@ -580,10 +605,20 @@ func (e *staticCacheEntry) serveCached(req *Request, resp *Response) bool {
 			}
 		}
 	}
-	if e.data == nil {
+	if e.data != nil {
+		e.serve(req, resp)
+		return true
+	}
+	if req.Method != http.MethodHead {
 		return false
 	}
-	e.serve(req, resp)
+	sw := staticFileWriter(resp)
+	if sw == nil {
+		return false
+	}
+	if _, ok := e.writeFDHeaders(req, resp, sw); ok {
+		_ = sw.Close()
+	}
 	return true
 }
 
@@ -594,11 +629,11 @@ type staticServePlan struct {
 	contentRange string
 }
 
-func (e *staticCacheEntry) plan(req *Request, resp *Response) (staticServePlan, bool) {
-	v := &e.validators
+func (e *staticCacheEntry) plan(req *Request, resp *Response, v *contentValidators) (staticServePlan, bool) {
 	switch evaluatePreconditions(req, v) {
 	case preconditionNotModified:
 		resp.SetHeader("ETag", v.etag).SetHeader("Last-Modified", v.lastModified).Status(http.StatusNotModified)
+		e.addVary(resp)
 		return staticServePlan{}, false
 	case preconditionFailed:
 		resp.Status(http.StatusPreconditionFailed).String("Precondition Failed")
@@ -616,6 +651,7 @@ func (e *staticCacheEntry) plan(req *Request, resp *Response) (staticServePlan, 
 		}
 	}
 	resp.Headers = append(resp.Headers, [2]string{"accept-ranges", byteRangeUnit}, [2]string{"etag", v.etag}, [2]string{"last-modified", v.lastModified})
+	e.addVary(resp)
 	if p.contentRange != "" {
 		resp.Headers = append(resp.Headers, [2]string{"content-range", p.contentRange})
 	}
@@ -623,7 +659,7 @@ func (e *staticCacheEntry) plan(req *Request, resp *Response) (staticServePlan, 
 }
 
 func (e *staticCacheEntry) serve(req *Request, resp *Response) {
-	p, ok := e.plan(req, resp)
+	p, ok := e.plan(req, resp, &e.validators)
 	if !ok {
 		return
 	}
@@ -638,10 +674,19 @@ func staticFileWriter(resp *Response) *epollH1StreamWriter {
 }
 
 func (e *staticCacheEntry) serveFD(req *Request, resp *Response, sw *epollH1StreamWriter, h *staticFD) {
-	p, ok := e.plan(req, resp)
+	p, ok := e.writeFDHeaders(req, resp, sw)
 	if !ok {
 		h.release()
 		return
+	}
+	sw.sendFileDetached(h, p.start, p.length)
+	_ = sw.Close()
+}
+
+func (e *staticCacheEntry) writeFDHeaders(req *Request, resp *Response, sw *epollH1StreamWriter) (staticServePlan, bool) {
+	p, ok := e.plan(req, resp, &e.validators)
+	if !ok {
+		return p, false
 	}
 	lengthText := e.sizeText
 	if p.length != e.size {
@@ -649,10 +694,8 @@ func (e *staticCacheEntry) serveFD(req *Request, resp *Response, sw *epollH1Stre
 	}
 	resp.Headers = append(resp.Headers, [2]string{"content-length", lengthText})
 	if err := sw.WriteHeader(p.status, resp.Headers, e.contentType); err != nil {
-		h.release()
-		return
+		return p, false
 	}
 	resp.SetStreamer(sw)
-	sw.sendFileDetached(h, p.start, p.length)
-	_ = sw.Close()
+	return p, true
 }

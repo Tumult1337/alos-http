@@ -3,10 +3,13 @@
 package core
 
 import (
+	"bytes"
 	"io"
+	"math/bits"
 	"strings"
 	"sync"
 
+	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/gzip"
 	"github.com/molecule-man/go-brrr"
@@ -36,6 +39,9 @@ const (
 	qvalueUnset            = -1
 	defaultBrotliLevel     = 4
 	acceptEncodingWildcard = encodingNone
+	brotliWindowSlack      = 16
+	brotliMinWindowBits    = 10
+	brotliMaxWindowBits    = 22
 )
 
 var contentEncodingNames = [...]string{
@@ -95,11 +101,37 @@ func (e *pooledEncoder) appendCompressed(dst, body []byte) []byte {
 	return dst
 }
 
+type acceptEncodingWeights struct {
+	brotli, gzip, deflate, wildcard int16
+}
+
+func (w *acceptEncodingWeights) accepts(weight int16) bool {
+	if weight == qvalueUnset {
+		weight = w.wildcard
+	}
+	return weight > 0
+}
+
 func negotiateEncoding(accept string, offered encodingSet) encodingType {
 	if accept == "" || offered == 0 {
 		return encodingNone
 	}
-	brotliWeight, gzipWeight, deflateWeight, wildcardWeight := int16(qvalueUnset), int16(qvalueUnset), int16(qvalueUnset), int16(qvalueUnset)
+	w := parseAcceptEncoding(accept)
+	best, bestWeight := encodingNone, int16(0)
+	if offered&offerBrotli != 0 {
+		best, bestWeight = preferEncoding(best, bestWeight, encodingBrotli, w.brotli, w.wildcard)
+	}
+	if offered&offerGzip != 0 {
+		best, bestWeight = preferEncoding(best, bestWeight, encodingGzip, w.gzip, w.wildcard)
+	}
+	if offered&offerDeflate != 0 {
+		best, _ = preferEncoding(best, bestWeight, encodingDeflate, w.deflate, w.wildcard)
+	}
+	return best
+}
+
+func parseAcceptEncoding(accept string) acceptEncodingWeights {
+	w := acceptEncodingWeights{brotli: qvalueUnset, gzip: qvalueUnset, deflate: qvalueUnset, wildcard: qvalueUnset}
 	for i := 0; i < len(accept); i++ {
 		for i < len(accept) && isOWS(accept[i]) {
 			i++
@@ -123,37 +155,27 @@ func negotiateEncoding(accept string, offered encodingSet) encodingType {
 		switch coding := accept[start:codingEnd]; len(coding) {
 		case 1:
 			if coding[0] == '*' {
-				wildcardWeight = weight
+				w.wildcard = weight
 			}
 		case 2:
 			if coding[0]|asciiCaseBit == 'b' && coding[1]|asciiCaseBit == 'r' {
-				brotliWeight = weight
+				w.brotli = weight
 			}
 		case 4:
 			if isGzipToken(coding) {
-				gzipWeight = weight
+				w.gzip = weight
 			}
 		case 6:
 			if coding[0]|asciiCaseBit == 'x' && coding[1] == '-' && isGzipToken(coding[2:]) {
-				gzipWeight = weight
+				w.gzip = weight
 			}
 		case 7:
 			if isDeflateToken(coding) {
-				deflateWeight = weight
+				w.deflate = weight
 			}
 		}
 	}
-	best, bestWeight := encodingNone, int16(0)
-	if offered&offerBrotli != 0 {
-		best, bestWeight = preferEncoding(best, bestWeight, encodingBrotli, brotliWeight, wildcardWeight)
-	}
-	if offered&offerGzip != 0 {
-		best, bestWeight = preferEncoding(best, bestWeight, encodingGzip, gzipWeight, wildcardWeight)
-	}
-	if offered&offerDeflate != 0 {
-		best, _ = preferEncoding(best, bestWeight, encodingDeflate, deflateWeight, wildcardWeight)
-	}
-	return best
+	return w
 }
 
 func preferEncoding(best encodingType, bestWeight int16, enc encodingType, weight, wildcardWeight int16) (encodingType, int16) {
@@ -228,6 +250,38 @@ func normalizeBrotliLevel(level int) int {
 		return defaultBrotliLevel
 	}
 	return level
+}
+
+func brotliWindowFor(size int) int {
+	return min(max(bits.Len(uint(size+brotliWindowSlack)), brotliMinWindowBits), brotliMaxWindowBits)
+}
+
+func compressOnce(body []byte, enc encodingType, level int) []byte {
+	if enc != encodingBrotli {
+		return compressedCopy(body, enc, level)
+	}
+	var out bytesWriter
+	w := brotli.NewWriterOptions(&out, brotli.WriterOptions{Quality: level, LGWin: brotliWindowFor(len(body))})
+	if _, err := w.Write(body); err != nil {
+		return nil
+	}
+	if w.Close() != nil || len(out.buf) == 0 || len(out.buf) >= len(body) {
+		return nil
+	}
+	return bytes.Clone(out.buf)
+}
+
+func compressedCopy(body []byte, enc encodingType, level int) []byte {
+	bp := LargeBufPool.Get().(*[]byte)
+	buf := appendCompressed((*bp)[:0], body, enc, level)
+	var out []byte
+	if len(buf) > 0 && len(buf) < len(body) {
+		out = make([]byte, len(buf))
+		copy(out, buf)
+	}
+	*bp = buf
+	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
+	return out
 }
 
 func appendCompressed(dst, body []byte, enc encodingType, level int) []byte {

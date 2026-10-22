@@ -26,7 +26,12 @@ const (
 
 func perfCoreStaticPoll(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := turbo.Deadline(perfCoreStaticPollCeiling)
+	perfCoreStaticPollWithin(t, what, perfCoreStaticPollCeiling, cond)
+}
+
+func perfCoreStaticPollWithin(t *testing.T, what string, ceiling time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := turbo.Deadline(ceiling)
 	for !cond() {
 		if turbo.Until(deadline) <= 0 {
 			t.Fatalf("timed out waiting for %s", what)

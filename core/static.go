@@ -31,14 +31,20 @@ import (
 //
 //	Example: Browse: true.
 //	Example: Browse: false.
+//
+// DisableCompression turns off the compressed copies Static otherwise serves; defaults to false. When compression is on, a cached text-like file (text/*, JavaScript, JSON, XML, SVG, WebAssembly, TTF/OTF fonts, ICO) between 256 bytes and CacheMaxFileSize is compressed once per cached file version in the background with brotli and gzip, stored in the file cache against CacheMaxBytes, and served to clients whose Accept-Encoding allows it with Vary: Accept-Encoding and a per-encoding ETag; requests that send Range always get the uncompressed file. Compression needs the file cache, so it is also off when DisableCache is set.
+//
+//	Example: DisableCompression: true.
+//	Example: DisableCompression: false.
 type StaticConfig struct {
-	Root             string
-	Index            string
-	Browse           bool
-	DisableCache     bool
-	CacheMaxBytes    int64
-	CacheMaxFileSize int64
-	CacheTTL         time.Duration
+	Root               string
+	Index              string
+	Browse             bool
+	DisableCache       bool
+	CacheMaxBytes      int64
+	CacheMaxFileSize   int64
+	CacheTTL           time.Duration
+	DisableCompression bool
 }
 
 const wellKnownSegment = ".well-known"
@@ -63,6 +69,14 @@ func sanitizeStaticPath(p string) (string, bool) {
 		}
 	}
 	return p, true
+}
+
+func staticIndexIsPlainName(index string) bool {
+	if strings.Contains(index, "/") {
+		return false
+	}
+	_, ok := sanitizeStaticPath("/" + index)
+	return ok
 }
 
 // Static returns a handler that serves files from cfg.Root under urlPrefix, stripping urlPrefix from the request path and rejecting traversal outside the root. Register it on a catch-all route so every path below the prefix reaches the handler.
@@ -94,6 +108,7 @@ func newStaticHandler(urlPrefix string, cfg StaticConfig) (HandlerFunc, *staticF
 		rootWithSep += string(os.PathSeparator)
 	}
 	cache := newStaticFileCache(cfg)
+	indexFast := !cfg.Browse && staticIndexIsPlainName(cfg.Index)
 
 	handler := func(req *Request, resp *Response) {
 		reqPath := strings.TrimPrefix(req.Path, urlPrefix)
@@ -112,7 +127,11 @@ func newStaticHandler(urlPrefix string, cfg StaticConfig) (HandlerFunc, *staticF
 		}
 
 		cleanRel = strings.TrimPrefix(cleanRel, "/")
-		if cleanRel != "" && root.serveFast(req, resp, cleanRel, cache) {
+		fastRel := cleanRel
+		if indexFast && (cleanRel == "" || strings.HasSuffix(cleanRel, "/")) {
+			fastRel = cleanRel + cfg.Index
+		}
+		if fastRel != "" && root.serveFast(req, resp, fastRel, cache) {
 			return
 		}
 
