@@ -108,6 +108,7 @@ type ResponseCache struct {
 	ttlNs    int64
 	stop     chan struct{}
 	stopOnce sync.Once
+	raceSeam func()
 }
 
 // Cache returns middleware that caches handler responses in memory according to
@@ -210,7 +211,8 @@ func (rc *ResponseCache) handle(next HandlerFunc, req *Request, resp *Response) 
 			serveCached(resp, ent, ent.negotiate(req))
 			return
 		}
-		rc.store.Delete(key)
+		rc.crossRaceSeam()
+		rc.evictEntry(key, ent)
 	}
 	next(req, resp)
 	ent := rc.captureAndStore(key, req.Method, resp)
@@ -254,22 +256,19 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 	compress := (rc.cfg.Gzip || rc.cfg.Brotli) && len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType)
 	if compress {
 		if _, busy := rc.filling.LoadOrStore(ownedKey, struct{}{}); busy {
-			return nil
+			if cur, ok := rc.store.Load(ownedKey); ok {
+				return liveEntry(cur)
+			}
+			rc.crossRaceSeam()
+			stored, _ := rc.store.LoadOrStore(ownedKey, rc.newEntry(status, resp, body))
+			return liveEntry(stored)
 		}
 		defer rc.filling.Delete(ownedKey)
-		if cur, ok := rc.store.Load(ownedKey); ok && turbo.UnixNano() <= cur.expiresAtNs {
+		if cur, ok := rc.store.Load(ownedKey); ok && cur.encodings != 0 && turbo.UnixNano() <= cur.expiresAtNs {
 			return cur
 		}
 	}
-	now := turbo.UnixNano()
-	ent := &cachedResponse{
-		status:      status,
-		headers:     cloneHeaders(resp.Headers),
-		contentType: strings.Clone(resp.ContentType),
-		body:        cloneBytes(body),
-		expiresAtNs: now + rc.ttlNs,
-		storedAtNs:  now,
-	}
+	ent := rc.newEntry(status, resp, body)
 	if compress {
 		rc.builds.Add(1)
 		if rc.cfg.Gzip {
@@ -287,6 +286,25 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 	}
 	ent.addVary = ent.encodings != 0 && !varyCoversAcceptEncoding(ent.headers)
 	rc.store.Store(ownedKey, ent)
+	return ent
+}
+
+func (rc *ResponseCache) newEntry(status int, resp *Response, body []byte) *cachedResponse {
+	now := turbo.UnixNano()
+	return &cachedResponse{
+		status:      status,
+		headers:     cloneHeaders(resp.Headers),
+		contentType: strings.Clone(resp.ContentType),
+		body:        cloneBytes(body),
+		expiresAtNs: now + rc.ttlNs,
+		storedAtNs:  now,
+	}
+}
+
+func liveEntry(ent *cachedResponse) *cachedResponse {
+	if turbo.UnixNano() > ent.expiresAtNs {
+		return nil
+	}
 	return ent
 }
 
@@ -369,11 +387,22 @@ func (rc *ResponseCache) sweepLoop() {
 	}
 }
 
+func (rc *ResponseCache) crossRaceSeam() {
+	if rc.raceSeam != nil {
+		rc.raceSeam()
+	}
+}
+
+func (rc *ResponseCache) evictEntry(key string, ent *cachedResponse) {
+	rc.store.CompareAndDelete(key, ent)
+}
+
 func (rc *ResponseCache) evictExpired() {
 	now := turbo.UnixNano()
 	rc.store.Range(func(key string, ent *cachedResponse) bool {
 		if now > ent.expiresAtNs {
-			rc.store.Delete(key)
+			rc.crossRaceSeam()
+			rc.evictEntry(key, ent)
 		}
 		return true
 	})
@@ -386,16 +415,18 @@ func (rc *ResponseCache) evictOverflow() {
 	}
 	type aged struct {
 		key string
+		ent *cachedResponse
 		ts  int64
 	}
 	victims := make([]aged, 0, over*2)
 	rc.store.Range(func(key string, ent *cachedResponse) bool {
-		victims = append(victims, aged{key, ent.storedAtNs})
+		victims = append(victims, aged{key, ent, ent.storedAtNs})
 		return true
 	})
 	slices.SortFunc(victims, func(a, b aged) int { return cmp.Compare(a.ts, b.ts) })
+	rc.crossRaceSeam()
 	for i := 0; i < over && i < len(victims); i++ {
-		rc.store.Delete(victims[i].key)
+		rc.evictEntry(victims[i].key, victims[i].ent)
 	}
 }
 
