@@ -78,9 +78,12 @@ func colonAfterWhitespace(rest []byte) int {
 	return -1
 }
 
+const upstreamMaxInterimResponses = 5
+
 type h1Parser struct {
 	phase        int8
 	status       int
+	interim      int
 	keepAlive    bool
 	noBody       bool
 	stream       bool
@@ -109,6 +112,7 @@ func (p *h1Parser) reset() {
 	p.stream = false
 	p.remaining = 0
 	p.trailerBytes = 0
+	p.interim = 0
 	p.hdr = p.hdr[:0]
 	p.strs = p.strs[:0]
 	p.receiptDateBuf = p.receiptDateBuf[:0]
@@ -264,6 +268,9 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				return false, nil
 			}
 			if p.status >= 100 && p.status < 200 {
+				if p.interim++; p.interim > upstreamMaxInterimResponses {
+					return false, errFPBadResponse
+				}
 				p.hdr = p.hdr[:0]
 				continue
 			}

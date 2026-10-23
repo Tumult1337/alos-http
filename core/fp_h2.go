@@ -52,6 +52,7 @@ type h2Stream struct {
 	ex         *Exchange
 	sendWindow int32
 	gotHeaders bool
+	interim    int
 	status     int
 	headers    [][2]string
 	body       []byte
@@ -495,6 +496,9 @@ func (h *h2Proto) completeHeaders(c *backendConn, streamID uint32, endStream boo
 		return nil
 	}
 	if status < 200 {
+		if st.interim++; st.interim > upstreamMaxInterimResponses {
+			h.resetStream(c, st, H2ErrProtocol, errFPBadResponse)
+		}
 		return nil
 	}
 	st.status = status

@@ -308,7 +308,10 @@ func readUpgradeAnswer(conn net.Conn, p *h1Parser, method string, readTimeout ti
 		return false, -1, err
 	}
 	head := make([]byte, 0, upgradeAnswerHeadHint)
-	for {
+	for interim := 0; ; interim++ {
+		if interim > upstreamMaxInterimResponses {
+			return false, -1, answeredUpgradeError(ErrProxyBadResponse)
+		}
 		head, err = readResponseHead(conn, head[:0])
 		if err != nil {
 			return false, -1, err
