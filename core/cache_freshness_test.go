@@ -42,6 +42,7 @@ func TestCache_HonorsResponseFreshness(t *testing.T) {
 		headers [][2]string
 		ttl     time.Duration
 		stored  bool
+		dated   bool
 	}{
 		{name: "no-explicit-expiry", ttl: time.Minute, stored: true},
 		{name: "max-age-below-ttl", headers: [][2]string{cc("max-age=5")}, ttl: 5 * time.Second, stored: true},
@@ -52,9 +53,11 @@ func TestCache_HonorsResponseFreshness(t *testing.T) {
 		{name: "age-exhausts-lifetime", headers: [][2]string{cc("max-age=60"), {"Age", "70"}}},
 		{name: "max-age-zero", headers: [][2]string{cc("max-age=0")}},
 		{name: "max-age-invalid", headers: [][2]string{cc("max-age=soon")}},
-		{name: "expires-from-date", headers: [][2]string{{"Date", date}, {"Expires", now.Add(30 * time.Second).UTC().Format(http.TimeFormat)}}, ttl: 30 * time.Second, stored: true},
+		{name: "expires-from-date", headers: [][2]string{{"Date", date}, {"Expires", now.Add(30 * time.Second).UTC().Format(http.TimeFormat)}}, ttl: 30 * time.Second, stored: true, dated: true},
 		{name: "expires-past", headers: [][2]string{{"Date", date}, {"Expires", now.Add(-time.Second).UTC().Format(http.TimeFormat)}}},
 		{name: "expires-invalid", headers: [][2]string{{"Expires", "0"}}},
+		{name: "expires-from-past-date", headers: [][2]string{{"Date", now.Add(-100 * time.Second).UTC().Format(http.TimeFormat)}, {"Expires", now.Add(30 * time.Second).UTC().Format(http.TimeFormat)}}, ttl: 30 * time.Second, stored: true, dated: true},
+		{name: "date-past-no-age", headers: [][2]string{cc("max-age=3600"), {"Date", now.Add(-2 * time.Hour).UTC().Format(http.TimeFormat)}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -68,7 +71,11 @@ func TestCache_HonorsResponseFreshness(t *testing.T) {
 			if !ok {
 				return
 			}
-			if got := time.Duration(ent.expiresAtNs - ent.storedAtNs); got != tc.ttl {
+			got := time.Duration(ent.expiresAtNs - ent.storedAtNs)
+			if tc.dated && got <= tc.ttl && got > tc.ttl-2*time.Second {
+				return
+			}
+			if got != tc.ttl {
 				t.Fatalf("freshness %v, want %v", got, tc.ttl)
 			}
 		})
@@ -210,5 +217,30 @@ func TestCache_ReplacedEntryCountsOnce(t *testing.T) {
 	}
 	if _, ok := rc.store.Load("b"); !ok || rc.entries.Load() != 2 {
 		t.Fatalf("replacing a: b present %v, counted %d, want true and 2", ok, rc.entries.Load())
+	}
+}
+
+func TestCache_ApparentAgeOverridesSmallerAgeHeader(t *testing.T) {
+	now := time.Unix(0, turbo.UnixNano())
+	date := now.Add(-100 * time.Second).UTC().Format(http.TimeFormat)
+	rc := NewResponseCache(CacheConfig{TTL: time.Hour})
+	defer rc.Stop()
+	h := cacheFreshHandler([2]string{"Cache-Control", "max-age=130"}, [2]string{"Date", date}, [2]string{"Age", "10"})
+	rc.handle(h, cReq("GET", "x", "/a", ""), cResp())
+	ent, ok := cacheFreshStored(t, rc, "/a")
+	if !ok {
+		t.Fatal("response with remaining freshness not stored")
+	}
+	if ttl := time.Duration(ent.expiresAtNs - ent.storedAtNs); ttl > 30*time.Second || ttl <= 28*time.Second {
+		t.Fatalf("freshness %v, want max-age 130s minus an apparent age of about 100s", ttl)
+	}
+	hit := cResp()
+	rc.handle(h, cReq("GET", "x", "/a", ""), hit)
+	ages := respHeaderValues(hit, "Age")
+	if len(ages) != 1 {
+		t.Fatalf("hit Age %v", ages)
+	}
+	if age, err := strconv.Atoi(ages[0]); err != nil || age < 100 || age > 102 {
+		t.Fatalf("hit Age %v, want the apparent age of about 100", ages)
 	}
 }
