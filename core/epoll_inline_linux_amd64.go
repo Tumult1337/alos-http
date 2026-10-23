@@ -25,6 +25,7 @@ var inlineHandoffs atomic.Uint64
 type inlineTask struct {
 	conn   *epollConn
 	stream *H2Stream
+	ws     *wsLoopConn
 	route  uintptr
 }
 
@@ -248,10 +249,14 @@ func (w *epollWorker) runInlineQueue() bool {
 		if w.server.inlineWatch.parked.Load() {
 			w.server.inlineWatch.signal()
 		}
-		if t.stream != nil {
+		switch {
+		case t.ws != nil:
+			t.ws.inlineSeq = seq
+			t.ws.runCallback(true)
+		case t.stream != nil:
 			t.stream.inlineSeq = seq
 			t.stream.run(true)
-		} else {
+		default:
 			t.conn.h1InlineSeq = seq
 			t.conn.runH1(true)
 		}
@@ -266,6 +271,10 @@ func (w *epollWorker) runInlineQueue() bool {
 
 func (w *epollWorker) spillInline(t inlineTask) {
 	w.spawned++
+	if t.ws != nil {
+		w.handlers.run(t.ws.callbackRunner())
+		return
+	}
 	if t.stream != nil {
 		w.handlers.run(t.stream.asyncRunner())
 		return
