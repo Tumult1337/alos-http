@@ -273,12 +273,7 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		if srv.misdirectsClientAuth(c.tlsCertEntry, c.req.Host) {
 			return c.h1Reject(out, 421, "Misdirected Request"), h1StepClose
 		}
-		if !c.acquireIPConn(srv, &c.req) {
-			statsBlocked()
-			c.resp.resetFastH1()
-			c.resp.Status(429).String("Your IP has too many connections open")
-			return appendPlainResponseClose(&c.resp, out), h1StepClose
-		}
+		applyTrustedIP(srv, &c.req)
 		c.resp.resetFastH1()
 		c.resp.SetSW(nil)
 		c.resp.lazyReq = &c.req

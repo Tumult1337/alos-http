@@ -1990,11 +1990,10 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	w.pool.put(c)
 }
 
-func (c *epollConn) acquireIPConn(srv *Server, req *Request) bool {
+func applyTrustedIP(srv *Server, req *Request) {
 	if srv.trustedProxies.active {
 		applyTrustedRealIP(req, srv.trustedProxies)
 	}
-	return true
 }
 
 func (c *epollConn) compactH2ReadBuffer(force bool) {

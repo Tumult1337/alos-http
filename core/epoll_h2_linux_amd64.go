@@ -835,14 +835,7 @@ func (c *epollConn) startH2Stream(srv *Server, streamID uint32, stream *H2Stream
 	stream.req.tlsWriter = nil
 	stream.req.hdrBuf = nil
 
-	if !c.acquireIPConn(srv, &stream.req) {
-		statsBlocked()
-		c.h2AbortBodyIn(streamID)
-		stream.Reset()
-		StreamPool.Put(stream)
-		c.emitH2GoAway(c.worker, H2ErrEnhanceYourCalm)
-		return true
-	}
+	applyTrustedIP(srv, &stream.req)
 
 	stream.resp.Reset()
 	stream.resp.SetSW(nil)
@@ -1117,12 +1110,6 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		c.h2SettleParked(w, streamID, stream)
 	}
 	w.markFlush(c)
-}
-
-func (c *epollConn) emitH2GoAway(w *epollWorker, errCode uint32) {
-	frame := appendH2GoAwayFrame(w.h2FinishScratch[:0], c.h2.lastStreamID, errCode)
-	c.emitH2(frame)
-	w.h2FinishScratch = frame[:0]
 }
 
 func (c *epollConn) emitH2Reset(w *epollWorker, streamID, errCode uint32) {
