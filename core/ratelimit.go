@@ -186,7 +186,8 @@ func (tb *TokenBucket) WaitWithDeadline(tokens int64, deadline time.Time) bool {
 
 // BandwidthConfig sets a bandwidth limit in megabits per second. Pass it in
 // Config.ConnBandwidth for a per-connection limit or Config.GlobalBandwidth
-// for a server-wide limit.
+// for a server-wide limit. The limits apply only to streamed request bodies and
+// to HTTP/1.1 stream writer and sendfile responses; see Config.ConnBandwidth.
 //
 // MaxUploadRate caps inbound data in Mbps; <= 0 leaves uploads unthrottled.
 //

@@ -168,11 +168,15 @@ var timeNow = time.Now
 //	Example: WorkerCount: 8.
 //	Example: WorkerCount: 0 auto-sizes.
 //
-// ConnBandwidth rate-limits each connection.
+// ConnBandwidth rate-limits each connection. It throttles only streamed request bodies read
+// through BodyStream (upload), and HTTP/1.1 responses written through a stream writer or sendfile
+// (download). Buffered request bodies, buffered responses, HTTP/2 and HTTP/3 responses, WebSocket
+// frames and proxied traffic are not throttled.
 //
 //	Example: ConnBandwidth: BandwidthConfig{MaxUploadRate: 100, MaxDownloadRate: 200} (Mbps).
 //
-// GlobalBandwidth rate-limits all connections in aggregate.
+// GlobalBandwidth rate-limits all connections in aggregate. It throttles the same traffic as
+// ConnBandwidth and nothing else.
 //
 //	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 1000} (Mbps).
 //
