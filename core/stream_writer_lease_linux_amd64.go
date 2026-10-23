@@ -23,15 +23,13 @@ func (l *streamWriterLease) enterLocked(gen uint64) bool {
 	return true
 }
 
-func (l *streamWriterLease) leaveLocked() (idle bool) {
+func (l *streamWriterLease) leaveLocked() {
 	l.calls--
-	return l.released && l.calls == 0
 }
 
-func (l *streamWriterLease) releaseLocked() (idle bool) {
+func (l *streamWriterLease) releaseLocked() {
 	l.released = true
 	l.gen++
-	return l.calls == 0
 }
 
 type h1StreamHandle struct {
@@ -49,7 +47,8 @@ func (h *h1StreamHandle) enter() bool {
 func (h *h1StreamHandle) leave() {
 	sw := h.sw
 	sw.mu.Lock()
-	recycle := sw.lease.leaveLocked() && !sw.pumpQueued
+	sw.lease.leaveLocked()
+	recycle := sw.recyclableLocked()
 	sw.mu.Unlock()
 	if recycle {
 		sw.recycle()
@@ -118,7 +117,8 @@ func (h *h2StreamHandle) enter() bool {
 func (h *h2StreamHandle) leave() {
 	sw := h.sw
 	sw.mu.Lock()
-	recycle := sw.lease.leaveLocked() && !sw.pumpQueued
+	sw.lease.leaveLocked()
+	recycle := sw.recyclableLocked()
 	sw.mu.Unlock()
 	if recycle {
 		sw.recycle()

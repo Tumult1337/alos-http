@@ -27,7 +27,7 @@ func init() { epollH1StreamWriterPool.New = newEpollH1StreamWriter }
 func newEpollH1StreamWriter() any {
 	sw := &epollH1StreamWriter{contentLength: h1NoContentLength}
 	sw.space = sync.NewCond(&sw.mu)
-	sw.pumpFn = func(w *epollWorker) { sw.c.h1StreamPumpTask(w, sw) }
+	sw.pumpFn = sw.runPumpTask
 	return sw
 }
 
@@ -63,6 +63,7 @@ type epollH1StreamWriter struct {
 	finished    bool
 	handlerDone bool
 	pumpQueued  bool
+	tasksQueued int
 	err         error
 
 	fileFD       int
@@ -230,6 +231,7 @@ func (sw *epollH1StreamWriter) claimPumpLocked() bool {
 		return false
 	}
 	sw.pumpQueued = true
+	sw.tasksQueued++
 	return true
 }
 
@@ -260,7 +262,8 @@ func (sw *epollH1StreamWriter) release() {
 		sw.err = ErrStreamClosed
 	}
 	sw.space.Broadcast()
-	recycle := sw.lease.releaseLocked() && !sw.pumpQueued
+	sw.lease.releaseLocked()
+	recycle := sw.recyclableLocked()
 	sw.mu.Unlock()
 	if recycle {
 		sw.recycle()
@@ -292,18 +295,28 @@ func (sw *epollH1StreamWriter) recycle() {
 	epollH1StreamWriterPool.Put(sw)
 }
 
-func (c *epollConn) h1StreamPumpTask(w *epollWorker, sw *epollH1StreamWriter) {
+func (sw *epollH1StreamWriter) runPumpTask(w *epollWorker) {
 	sw.mu.Lock()
+	sw.tasksQueued--
 	sw.pumpQueued = false
 	if sw.lease.released {
-		recycle := sw.lease.calls == 0
+		recycle := sw.recyclableLocked()
 		sw.mu.Unlock()
 		if recycle {
 			sw.recycle()
 		}
 		return
 	}
+	c := sw.c
 	sw.mu.Unlock()
+	c.h1StreamPumpTask(w, sw)
+}
+
+func (sw *epollH1StreamWriter) recyclableLocked() bool {
+	return sw.lease.released && sw.lease.calls == 0 && sw.tasksQueued == 0
+}
+
+func (c *epollConn) h1StreamPumpTask(w *epollWorker, sw *epollH1StreamWriter) {
 	if c.generation != sw.gen || c.fd < 0 {
 		sw.fail(ErrStreamClosed)
 		return

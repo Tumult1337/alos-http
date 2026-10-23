@@ -188,3 +188,49 @@ func TestH1StreamWriterWritesAfterHandlerReturnStayIsolated(t *testing.T) {
 		}
 	}
 }
+
+func TestH2StreamWriterWithQueuedPumpIsNotRecycled(t *testing.T) {
+	w, c, _ := h2DeadlineFixture(t)
+	sw := newEpollH2StreamWriter().(*epollH2StreamWriter)
+	sw.c, sw.w, sw.gen = c, w, c.generation
+	sw.mu.Lock()
+	queued := sw.claimPumpLocked()
+	sw.finished = true
+	sw.mu.Unlock()
+	if !queued {
+		t.Fatal("fixture could not claim a pump task")
+	}
+	w.postTask(sw.pumpFn)
+	c.h2PumpFrames(nil, sw, 0)
+	sw.release()
+	if sw.c != c {
+		t.Fatal("writer was recycled while a posted pump task still referenced it")
+	}
+	w.drainTasks()
+	if sw.c != nil {
+		t.Fatal("writer was not recycled after its last pump task ran")
+	}
+}
+
+func TestH1StreamWriterWithQueuedPumpIsNotRecycled(t *testing.T) {
+	w, c, _ := h1ReceivedFixture(t, Config{})
+	sw := newEpollH1StreamWriter().(*epollH1StreamWriter)
+	sw.c, sw.w, sw.gen = c, w, c.generation
+	sw.mu.Lock()
+	queued := sw.claimPumpLocked()
+	sw.finished = true
+	sw.mu.Unlock()
+	if !queued {
+		t.Fatal("fixture could not claim a pump task")
+	}
+	w.postTask(sw.pumpFn)
+	c.h1PumpStream(sw)
+	sw.release()
+	if sw.c != c {
+		t.Fatal("writer was recycled while a posted pump task still referenced it")
+	}
+	w.drainTasks()
+	if sw.c != nil {
+		t.Fatal("writer was not recycled after its last pump task ran")
+	}
+}

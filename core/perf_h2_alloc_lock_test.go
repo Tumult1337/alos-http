@@ -108,12 +108,14 @@ func perfH2RoundTripAllocs(t *testing.T, useTLS bool, wl perfH2Workload) float64
 }
 
 func TestPerfH2AllocLockH2cRootRoundTrip(t *testing.T) {
+	perfTLSSkipUnderRace(t)
 	if got := perfH2RoundTripAllocs(t, false, perfH2W1r); got != 0 {
 		t.Fatalf("h2c GET / with %d streams: %v allocs per batch, want 0", perfH2Streams, got)
 	}
 }
 
 func TestPerfH2AllocLockTLSRootRoundTrip(t *testing.T) {
+	perfTLSSkipUnderRace(t)
 	if got := perfH2RoundTripAllocs(t, true, perfH2W1r); got >= perfH2LockTLSClientBudget {
 		t.Fatalf("TLS h2 GET / with %d streams: %v allocs per batch, want < %d (client crypto/tls only)", perfH2Streams, got, perfH2LockTLSClientBudget)
 	}
