@@ -37,10 +37,7 @@ func perfCoreStaticSlowReader(t *testing.T, useTLS, disableCache bool) {
 		cache = c
 		r.GET("/s/*filepath", h)
 	}})
-	c := ts.dial(t)
-	if tcp, ok := c.(*net.TCPConn); ok {
-		_ = tcp.SetReadBuffer(16 << 10)
-	}
+	c := ts.dialRecvBuf(t, 16<<10)
 	br := bufio.NewReaderSize(c, 4<<10)
 	host := "Host: " + ts.domain + "\r\n"
 	writeAll(t, c, "GET /s/big.bin HTTP/1.1\r\n"+host+"\r\n")

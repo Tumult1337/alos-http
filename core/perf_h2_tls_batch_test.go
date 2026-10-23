@@ -96,9 +96,6 @@ func TestH2TLSMixedLargeAndSmallResponsesStayIntact(t *testing.T) {
 
 func TestH2cMixedLargeAndSmallResponsesSurvivePartialWrites(t *testing.T) {
 	addr := startH2FixServer(t, nil, perfH2MixedRoutes)
-	rc := h2RawDial(t, addr, nil)
-	if tcp, ok := rc.conn.(*net.TCPConn); ok {
-		_ = tcp.SetReadBuffer(perfH2MixedReadBuffer)
-	}
+	rc := h2RawDialRecvBuf(t, addr, nil, perfH2MixedReadBuffer)
 	perfH2CheckMixedResponses(t, rc)
 }

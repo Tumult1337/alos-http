@@ -4,7 +4,6 @@ package core
 
 import (
 	"encoding/binary"
-	"net"
 	"testing"
 	"time"
 )
@@ -20,11 +19,8 @@ func TestH2BudgetParkedResponseBytesAreCapped(t *testing.T) {
 		c.H2MaxConcurrentStreams = perfH2ParkStreams + 1
 		c.MaxPendingWriteBytes = perfH2ParkPendingWrite
 	})
-	rc := h2RawDial(t, addr, h2FixSettings([2]uint32{uint32(H2SettingInitialWindowSize), h2FixMaxWindow}))
+	rc := h2RawDialRecvBuf(t, addr, h2FixSettings([2]uint32{uint32(H2SettingInitialWindowSize), h2FixMaxWindow}), perfH2ParkReadBuffer)
 	rc.write(H2FrameWindowUpdate, 0, 0, h2FixWindowIncrement(h2FixMaxWindow-H2DefaultWindowSize))
-	if tcp, ok := rc.conn.(*net.TCPConn); ok {
-		_ = tcp.SetReadBuffer(perfH2ParkReadBuffer)
-	}
 	for i := range perfH2ParkStreams {
 		h2FixGet(rc, uint32(2*i+1), "/big")
 	}

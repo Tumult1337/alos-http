@@ -224,17 +224,19 @@ func perfCoreDropPageCache(t *testing.T, path string) {
 
 func TestPerfCoreStaticColdFilePumps(t *testing.T) {
 	for _, useTLS := range []bool{false, true} {
-		ts, content, path := perfCoreH2FileServer(t, useTLS, perfCoreH2FileSize)
-		clients := map[string]*http.Client{"h2": perfCoreH2FileClient(t, ts)}
-		if useTLS {
-			clients["http/1.1"] = ts.client(t, "http/1.1")
-		}
-		for name, cl := range clients {
-			perfCoreDropPageCache(t, path)
-			resp, body, err := perfCoreH2FileGet(cl, ts.url("/s/big.bin"), "")
-			if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, content) {
-				t.Fatalf("tls=%v %s cold file: err %v len %d equal=%v", useTLS, name, err, len(body), bytes.Equal(body, content))
+		t.Run("tls="+strconv.FormatBool(useTLS), func(t *testing.T) {
+			ts, content, path := perfCoreH2FileServer(t, useTLS, perfCoreH2FileSize)
+			clients := map[string]*http.Client{"h2": perfCoreH2FileClient(t, ts)}
+			if useTLS {
+				clients["http/1.1"] = ts.client(t, "http/1.1")
 			}
-		}
+			for name, cl := range clients {
+				perfCoreDropPageCache(t, path)
+				resp, body, err := perfCoreH2FileGet(cl, ts.url("/s/big.bin"), "")
+				if err != nil || resp.StatusCode != 200 || !bytes.Equal(body, content) {
+					t.Fatalf("tls=%v %s cold file: err %v len %d equal=%v", useTLS, name, err, len(body), bytes.Equal(body, content))
+				}
+			}
+		})
 	}
 }

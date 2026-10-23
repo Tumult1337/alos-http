@@ -55,6 +55,16 @@ func h2RawDial(t *testing.T, addr string, settings []byte) *h2RawConn {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
+	return h2RawStart(t, conn, settings)
+}
+
+func h2RawDialRecvBuf(t *testing.T, addr string, settings []byte, recvBuf int) *h2RawConn {
+	t.Helper()
+	return h2RawStart(t, dialTCPRecvBuf(t, addr, 2*time.Second, recvBuf), settings)
+}
+
+func h2RawStart(t *testing.T, conn net.Conn, settings []byte) *h2RawConn {
+	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	rc := &h2RawConn{t: t, conn: conn}
 	if _, err := conn.Write(H2ClientPreface[:]); err != nil {
