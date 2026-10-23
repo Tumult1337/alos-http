@@ -39,12 +39,16 @@ func newQUICTestPeerFor(t *testing.T, srv *Server) *quicTestPeer {
 	pc := &capturePacketConn{}
 	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	qc := newQUICConn(srv, pc, &quicFixLoopback, dcid, []byte{9, 10, 11, 12, 13, 14, 15, 16})
+	_, serverKeys, err := quicDeriveInitialKeys(dcid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, keys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	qc.keys[quicSpaceAppData] = keys
-	qc.sendKeys[quicSpaceAppData] = keys
+	qc.keys[quicSpaceAppData] = serverKeys
+	qc.sendKeys[quicSpaceAppData] = serverKeys
 	qc.addressValidated.Store(true)
 	qc.peerStreamWindow = 1 << 20
 	qc.peerUniStreamWindow = 1 << 20

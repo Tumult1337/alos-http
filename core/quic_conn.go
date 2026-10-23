@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -340,6 +341,11 @@ type QUICConn struct {
 	uniStreamsRetired  atomic.Uint64
 	timerWork          atomic.Bool
 	congestionBlocked  atomic.Bool
+
+	admitMu        sync.Mutex
+	runningReqs    int
+	maxRunningReqs int
+	waitingReqs    []*QUICStream
 }
 
 func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dcid, scid []byte) *QUICConn {
@@ -371,6 +377,7 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	qc.recvFlowLimit.Store(maxData)
 	qc.stallSoftCap = quicStalledSendSoftCap(server)
 	qc.stallHardCap = qc.stallSoftCap * quicStalledSendHardFactor
+	qc.maxRunningReqs = min(server.h2MaxRunningHandlers(), quicMaxConcurrentReqStreams)
 
 	qc.workShard = uint8(connShardCounter.Add(1) % reqStreamShards)
 	qc.pktBudget = quicCoalesceBudget
@@ -810,6 +817,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	}
 	if acked {
 		qc.resumeCongestionBlocked()
+		qc.admitWaiting()
 	}
 
 	if needsAck {
@@ -1045,15 +1053,7 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 			qc.activeReqStreams.Add(-1)
 		} else {
 			s.refCount.Add(1)
-			if quicAsyncDispatch {
-				go qc.serveRequestStream(s)
-			} else {
-				select {
-				case reqStreamWorkChs[qc.workShard] <- s:
-				default:
-					go qc.serveRequestStream(s)
-				}
-			}
+			qc.admitRequestStream(s)
 		}
 	}
 	qc.releaseStream(s)
@@ -1198,12 +1198,14 @@ func (qc *QUICConn) handleResetStream(f quicResetStreamFrame) {
 			return
 		}
 	}
+	qc.cancelWaiting(s)
 	if s.dispatched.CompareAndSwap(false, true) {
 		if quicStreamIsBidi(f.streamID) {
 			qc.resetStreamSend(s, h3ErrRequestIncomplete)
 		}
 		qc.retireStream(s, 1)
 	}
+	qc.admitWaiting()
 }
 
 func (qc *QUICConn) acquirePeerUniStreams() []*QUICStream {
@@ -1249,9 +1251,11 @@ func (qc *QUICConn) handleStopSending(f quicStopSendingFrame) {
 		return
 	}
 	defer qc.releaseStream(s)
+	qc.cancelWaiting(s)
 	qc.resetStreamSend(s, f.errorCode)
 	s.abortHandler(ErrClientGone)
 	qc.maybeFinishStream(s)
+	qc.admitWaiting()
 }
 
 func (qc *QUICConn) resetStreamSend(s *QUICStream, errorCode uint64) {
@@ -1280,11 +1284,100 @@ func (qc *QUICConn) closeWithError(errorCode uint64, reason string) {
 	qc.close()
 }
 
+func (qc *QUICConn) admitRequestStream(s *QUICStream) {
+	pending := qc.pendingWriteBytes()
+	qc.admitMu.Lock()
+	if qc.closed.Load() {
+		qc.admitMu.Unlock()
+		qc.dropWaiting(s)
+		return
+	}
+	if len(qc.waitingReqs) > 0 || !qc.admitsHandlerLocked(pending) {
+		qc.waitingReqs = append(qc.waitingReqs, s)
+		qc.admitMu.Unlock()
+		return
+	}
+	qc.runningReqs++
+	qc.admitMu.Unlock()
+	qc.startRequestStream(s)
+}
+
+func (qc *QUICConn) admitsHandlerLocked(pendingWrite int64) bool {
+	return qc.runningReqs < qc.maxRunningReqs && pendingWrite < qc.stallSoftCap
+}
+
+func (qc *QUICConn) pendingWriteBytes() int64 {
+	qc.writeMu.Lock()
+	queued := len(qc.coalesceBuf) - qc.coalesceStart
+	qc.writeMu.Unlock()
+	return int64(queued) + qc.stalledSendBytes.Load()
+}
+
+func (qc *QUICConn) admitWaiting() {
+	for {
+		qc.admitMu.Lock()
+		empty := len(qc.waitingReqs) == 0
+		qc.admitMu.Unlock()
+		if empty {
+			return
+		}
+		pending := qc.pendingWriteBytes()
+		qc.admitMu.Lock()
+		if qc.closed.Load() || len(qc.waitingReqs) == 0 || !qc.admitsHandlerLocked(pending) {
+			qc.admitMu.Unlock()
+			return
+		}
+		s := qc.waitingReqs[0]
+		n := copy(qc.waitingReqs, qc.waitingReqs[1:])
+		qc.waitingReqs[n] = nil
+		qc.waitingReqs = qc.waitingReqs[:n]
+		qc.runningReqs++
+		qc.admitMu.Unlock()
+		qc.startRequestStream(s)
+	}
+}
+
+func (qc *QUICConn) cancelWaiting(s *QUICStream) {
+	qc.admitMu.Lock()
+	idx := slices.Index(qc.waitingReqs, s)
+	if idx >= 0 {
+		qc.waitingReqs = slices.Delete(qc.waitingReqs, idx, idx+1)
+	}
+	qc.admitMu.Unlock()
+	if idx < 0 {
+		return
+	}
+	qc.resetStreamSend(s, h3ErrRequestRejected)
+	qc.activeReqStreams.Add(-1)
+	qc.retireStream(s, 2)
+}
+
+func (qc *QUICConn) dropWaiting(s *QUICStream) {
+	qc.activeReqStreams.Add(-1)
+	qc.releaseStream(s)
+}
+
+func (qc *QUICConn) startRequestStream(s *QUICStream) {
+	if quicAsyncDispatch {
+		go qc.serveRequestStream(s)
+		return
+	}
+	select {
+	case reqStreamWorkChs[qc.workShard] <- s:
+	default:
+		go qc.serveRequestStream(s)
+	}
+}
+
 func (qc *QUICConn) serveRequestStream(s *QUICStream) {
 	s.refCount.Add(1)
 	defer qc.activeReqStreams.Add(-1)
 	defer qc.releaseStream(s)
 	qc.h3.handleRequestStream(s)
+	qc.admitMu.Lock()
+	qc.runningReqs--
+	qc.admitMu.Unlock()
+	qc.admitWaiting()
 	s.mu.Lock()
 	s.handlerFinishedLocked()
 	s.awaitingCleanup = true
@@ -1904,6 +1997,13 @@ func (qc *QUICConn) close() {
 			qc.finishRequestStream(s)
 		}
 		qc.releaseStream(s)
+	}
+	qc.admitMu.Lock()
+	waiting := qc.waitingReqs
+	qc.waitingReqs = nil
+	qc.admitMu.Unlock()
+	for _, s := range waiting {
+		qc.dropWaiting(s)
 	}
 }
 

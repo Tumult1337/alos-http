@@ -156,6 +156,7 @@ func (qc *QUICConn) tick(now int64, checkIdle bool) {
 	}
 	qc.writeMu.Unlock()
 	qc.resumeCongestionBlocked()
+	qc.admitWaiting()
 	qc.writeMu.Lock()
 	pending := len(qc.pendingAck[quicSpaceAppData]) > 0 || len(qc.coalesceEnds) > 0
 	qc.writeMu.Unlock()

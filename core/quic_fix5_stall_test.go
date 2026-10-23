@@ -3,6 +3,7 @@
 package core
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -73,8 +74,11 @@ func newQUICFix5FreshStallPeer(t *testing.T) (*quicTestPeer, int64) {
 		p.backdateStall(uint64(i*4), quicFixStallTimeoutPlus)
 	}
 	p.qc.lastSendProgress.Store(now - int64(quicFixStallTimeoutPlus))
+	softCap := p.qc.stallSoftCap
+	p.qc.stallSoftCap = math.MaxInt64
 	quicFixSendRequest(p, quicFix5FreshStream, h3AppendHeadersFrame(nil, quicFixGET("/big")))
 	p.awaitHandlersIdle()
+	p.qc.stallSoftCap = softCap
 	p.tickAt(now)
 	reset := p.excessiveLoadResets()
 	for i := 0; i < quicFix5OldStalledStreams; i++ {
