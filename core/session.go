@@ -256,7 +256,9 @@ func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
 	if !ok {
 		return nil, false
 	}
-	v.returned.Store(true)
+	if !v.returned.Load() {
+		v.returned.Store(true)
+	}
 	cp := make(map[string]any, len(v.data))
 	for k, val := range v.data {
 		cp[k] = val
