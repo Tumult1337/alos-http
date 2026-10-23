@@ -277,25 +277,61 @@ func TestWSEventsCloseDuringUpgradeHoldsPerIPConnSlot(t *testing.T) {
 }
 
 func TestWSEventsHijackedPathOnCloseHoldsSlots(t *testing.T) {
-	blocker := newWSBlockingClose()
-	ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) { cfg.MaxConnsPerIP = 1 })
-	c, _, _ := wsEvDial(t, ts, "/ws-copied")
-	_ = c.Close()
-	blocker.awaitEntered(t)
-	time.Sleep(wsCloseAdmissionSettle)
-	if got := ts.srv.activeConns.Load(); got != 1 {
-		t.Fatalf("activeConns with a blocked OnClose on a closed hijacked conn = %d, want 1", got)
-	}
-	for attempt := range 3 {
-		if status := wsCloseAdmissionUpgrade(t, ts); status != 0 && status != http.StatusTooManyRequests {
-			t.Fatalf("attempt %d with a blocked OnClose on a hijacked conn: status %d, want refusal", attempt, status)
+	t.Run("direct", func(t *testing.T) {
+		blocker := newWSBlockingClose()
+		ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) { cfg.MaxConnsPerIP = 1 })
+		c, _, _ := wsEvDial(t, ts, "/ws-copied")
+		_ = c.Close()
+		blocker.awaitEntered(t)
+		time.Sleep(wsCloseAdmissionSettle)
+		if got := ts.srv.activeConns.Load(); got != 1 {
+			t.Fatalf("activeConns with a blocked OnClose on a closed hijacked conn = %d, want 1", got)
 		}
-	}
-	blocker.unblock()
-	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
-	if status := wsCloseAdmissionUpgrade(t, ts); status != http.StatusSwitchingProtocols {
-		t.Fatalf("upgrade after OnClose returned: status %d", status)
-	}
+		for attempt := range 3 {
+			if status := wsCloseAdmissionUpgrade(t, ts); status != 0 && status != http.StatusTooManyRequests {
+				t.Fatalf("attempt %d with a blocked OnClose on a hijacked conn: status %d, want refusal", attempt, status)
+			}
+		}
+		blocker.unblock()
+		waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+		if status := wsCloseAdmissionUpgrade(t, ts); status != http.StatusSwitchingProtocols {
+			t.Fatalf("upgrade after OnClose returned: status %d", status)
+		}
+	})
+	t.Run("trusted-proxy", func(t *testing.T) {
+		const ip = "203.0.113.21"
+		xff := "X-Forwarded-For: " + ip
+		blocker := newWSBlockingClose()
+		ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) {
+			cfg.MaxConnsPerIP = 2
+			cfg.TrustedProxies = []string{"127.0.0.1"}
+		})
+		other, ok := ts.srv.perIPLimiter.hold(ip, 2)
+		if !ok || other == nil {
+			t.Fatal("the other holder could not take its slot")
+		}
+		defer other.release()
+		c, _, _ := wsEvDial(t, ts, "/ws-copied", xff)
+		time.Sleep(wsCloseAdmissionSettle)
+		if got := ts.srv.perIPLimiter.count(ip); got != 2 {
+			t.Fatalf("per-IP count with an open hijacked WebSocket and one other holder = %d, want 2", got)
+		}
+		if status := wsCloseAdmissionUpgrade(t, ts, xff); status != http.StatusTooManyRequests {
+			t.Fatalf("second upgrade from the same client: status %d, want 429", status)
+		}
+		_ = c.Close()
+		blocker.awaitEntered(t)
+		time.Sleep(wsCloseAdmissionSettle)
+		if got := ts.srv.perIPLimiter.count(ip); got != 2 {
+			t.Fatalf("per-IP count while OnClose blocks = %d, want 2", got)
+		}
+		blocker.unblock()
+		waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+		time.Sleep(wsCloseAdmissionSettle)
+		if got := ts.srv.perIPLimiter.count(ip); got != 1 {
+			t.Fatalf("per-IP count after the WebSocket ended = %d, want the other holder's 1", got)
+		}
+	})
 }
 
 func TestWSEventsHijackedTLSPathOnCloseHoldsPerIPSlot(t *testing.T) {

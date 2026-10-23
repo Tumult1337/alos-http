@@ -104,3 +104,26 @@ func TestServeWebSocketH2PanicReleasesConnSlot(t *testing.T) {
 		t.Fatalf("activeConns %d after a panic in the H2 upgrade, want 0", got)
 	}
 }
+
+func TestWebSocketH2CopiedRequestTunnelHoldsPerIPSlot(t *testing.T) {
+	blocker := newWSBlockingClose()
+	ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) {
+		cfg.TrustedProxies = []string{"127.0.0.1"}
+		cfg.MaxConnsPerIP = 1
+	})
+	ip := "203.0.113.22"
+	xff := [2]string{"x-forwarded-for", ip}
+	rc, _ := h2DialCaptureSettings(t, ts.addr)
+	ws, hdrs := openH2WebSocket(t, rc, 1, "/ws-copied", xff)
+	if hdrs[":status"] != "200" {
+		t.Fatalf("first tunnel status %q", hdrs[":status"])
+	}
+	time.Sleep(wsCloseAdmissionSettle)
+	if _, hdrs = openH2WebSocket(t, rc, 3, "/ws-copied", xff); hdrs[":status"] != "429" {
+		t.Fatalf("second tunnel from the same client while the first is open: status %q, want 429", hdrs[":status"])
+	}
+	ws.send(wsEvCloseFrame(1000, ""))
+	blocker.awaitEntered(t)
+	blocker.unblock()
+	h2TunnelAwaitSlotFree(t, ts.srv, ip)
+}

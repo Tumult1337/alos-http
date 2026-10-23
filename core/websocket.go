@@ -327,6 +327,9 @@ func upgradeH2WebSocket(req *Request, resp *Response, opts WSUpgradeOptions) *WS
 	resp.SetStreamer(sw)
 	conn := newH2StreamConn(body, sw, req.RemoteAddr)
 	req.h2Tunnel = conn
+	if stream := req.h2Stream; stream != nil {
+		stream.req.h2Tunnel = conn
+	}
 	ws.attachConn(conn)
 	return ws
 }
