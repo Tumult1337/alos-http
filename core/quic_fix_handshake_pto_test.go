@@ -71,7 +71,6 @@ type quicFixBigFlight struct {
 	*quicFixFlightConn
 	total    uint64
 	covered  map[uint64]bool
-	received map[uint64]bool
 	seen     int
 	clientPN uint64
 	in       int
@@ -105,17 +104,12 @@ func newQUICFixBigFlight(t *testing.T, validated bool) *quicFixBigFlight {
 	f := &quicFixBigFlight{
 		quicFixFlightConn: &quicFixFlightConn{qc: qc, pc: pc, hello: hello, initialSendKeys: qc.sendKeys[quicSpaceInitial], handshakeSendKeys: qc.sendKeys[quicSpaceHandshake]},
 		covered:           map[uint64]bool{},
-		received:          map[uint64]bool{},
 		in:                quicMinInitialDatagram,
 	}
 	return f
 }
 
 func (f *quicFixBigFlight) handshakeCrypto(t *testing.T, raw []byte, each func(quicCryptoFrame)) {
-	f.handshakePackets(t, raw, func(uint64) {}, each)
-}
-
-func (f *quicFixBigFlight) handshakePackets(t *testing.T, raw []byte, onPacket func(uint64), each func(quicCryptoFrame)) {
 	t.Helper()
 	pkt := append([]byte(nil), raw...)
 	for len(pkt) > 0 && quicIsLongHeader(pkt) {
@@ -128,7 +122,6 @@ func (f *quicFixBigFlight) handshakePackets(t *testing.T, raw []byte, onPacket f
 			if err != nil {
 				t.Fatalf("server sent an undecryptable Handshake packet: %v", err)
 			}
-			onPacket(hdr.pn)
 			if err := quicParseFrames(plain, &quicFrameVisitor{onCrypto: each}); err != nil {
 				t.Fatalf("server sent malformed Handshake frames: %v", err)
 			}
@@ -141,11 +134,7 @@ func (f *quicFixBigFlight) deliverFirstDatagramOnly(t *testing.T) int {
 	t.Helper()
 	raws := f.pc.snapshot()
 	for i, raw := range raws {
-		f.handshakePackets(t, raw, func(pn uint64) {
-			if i == 0 {
-				f.received[pn] = true
-			}
-		}, func(c quicCryptoFrame) {
+		f.handshakeCrypto(t, raw, func(c quicCryptoFrame) {
 			f.total = max(f.total, c.offset+uint64(len(c.data)))
 			if i == 0 {
 				f.cover(c)
@@ -171,7 +160,7 @@ func (f *quicFixBigFlight) deliverNew(t *testing.T) (datagrams, cryptoDatagrams 
 	raws := f.pc.snapshot()
 	for _, raw := range raws[f.seen:] {
 		hadCrypto := false
-		f.handshakePackets(t, raw, func(pn uint64) { f.received[pn] = true }, func(c quicCryptoFrame) {
+		f.handshakeCrypto(t, raw, func(c quicCryptoFrame) {
 			hadCrypto = true
 			f.cover(c)
 		})
@@ -187,22 +176,6 @@ func (f *quicFixBigFlight) deliverNew(t *testing.T) (datagrams, cryptoDatagrams 
 func (f *quicFixBigFlight) clientAcksFirstPacket(t *testing.T) {
 	t.Helper()
 	f.clientSends(t, quicAppendACKFrame(nil, 0, 0, 0))
-}
-
-func (f *quicFixBigFlight) clientAcksEverythingReceived(t *testing.T) {
-	t.Helper()
-	var ranges []pnRange
-	for pn := uint64(1 << 16); pn > 0; pn-- {
-		if !f.received[pn-1] {
-			continue
-		}
-		if n := len(ranges); n > 0 && ranges[n-1].lo == pn {
-			ranges[n-1].lo = pn - 1
-			continue
-		}
-		ranges = append(ranges, pnRange{lo: pn - 1, hi: pn - 1})
-	}
-	f.clientSends(t, quicAppendACKFrameRanges(nil, 0, ranges))
 }
 
 func (f *quicFixBigFlight) clientSends(t *testing.T, ack []byte) {
