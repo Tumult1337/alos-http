@@ -387,6 +387,7 @@ type epollWorker struct {
 	inlineQ         []inlineTask
 	inlineHead      int
 	inlineDeadline  int64
+	inlineBatch     time.Duration
 	inlineSeen      uint64
 	inlineAll       bool
 	inlineRan       bool
@@ -623,16 +624,17 @@ func newEpollWorkerFromFD(s *Server, lfd int, minPrealloc int) (*epollWorker, er
 		return nil, fmt.Errorf("epoll add wake: %w", err)
 	}
 	w := &epollWorker{
-		server:     s,
-		epfd:       epfd,
-		listenerFD: lfd,
-		wakeFd:     wfd,
-		conns:      make([]*epollConn, 1024),
-		events:     make([]unix.EpollEvent, epollEventBatch),
-		taskCh:     make(chan func(*epollWorker), epollTaskQueueSize),
-		handlers:   newHandlerPool(handlerPoolWorkersPerLoop),
-		flushList:  make([]*epollConn, 0, 64),
-		inlineAll:  s.inlineDispatchEnabled(),
+		server:      s,
+		epfd:        epfd,
+		listenerFD:  lfd,
+		wakeFd:      wfd,
+		conns:       make([]*epollConn, 1024),
+		events:      make([]unix.EpollEvent, epollEventBatch),
+		taskCh:      make(chan func(*epollWorker), epollTaskQueueSize),
+		handlers:    newHandlerPool(handlerPoolWorkersPerLoop),
+		flushList:   make([]*epollConn, 0, 64),
+		inlineAll:   s.inlineDispatchEnabled(),
+		inlineBatch: s.inlineBatchOrDefault(),
 	}
 	w.pool.server = s
 	w.pool.batchSize = s.preallocBatch()
@@ -865,7 +867,7 @@ func (w *epollWorker) loop() error {
 		}
 		resumed = false
 		w.refreshLimits()
-		w.inlineDeadline = turbo.Now() + int64(inlineBatchBudget)
+		w.inlineDeadline = turbo.Now() + int64(w.inlineBatch)
 		tasksPending := false
 		for i := 0; i < n; i++ {
 			fd := int(w.events[i].Fd)

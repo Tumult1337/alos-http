@@ -55,6 +55,7 @@ func startRouteInlineServer(t *testing.T, useTLS bool) string {
 		cfg.PlainHTTP = true
 	}
 	s := New(cfg)
+	s.inlineBatch = time.Minute
 	s.Router.GET("/in", func(req *Request, resp *Response) { reportDispatchMode(resp, "in") }).Inline()
 	s.Router.GET("/out", func(req *Request, resp *Response) { reportDispatchMode(resp, "out") })
 	s.Router.GET("/p/:id", func(req *Request, resp *Response) { reportDispatchMode(resp, req.ParamValue("id")) }).Inline()
@@ -137,5 +138,32 @@ func TestPerfH1RouteInlineDispatch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestInlineBatchBudgetDefaultAndOverride(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		override time.Duration
+		want     time.Duration
+	}{
+		{"default", 0, inlineBatchBudget},
+		{"override", time.Minute, time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := New(Config{Addr: "127.0.0.1:0", HTTPAddr: "-", PlainHTTP: true})
+			s.inlineBatch = tc.override
+			w, err := newEpollWorker(s, "127.0.0.1:0", 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(w.closeLoop)
+			if w.inlineBatch != tc.want {
+				t.Fatalf("inlineBatch=%v want %v", w.inlineBatch, tc.want)
+			}
+		})
+	}
+	if inlineBatchBudget != 2*time.Millisecond {
+		t.Fatalf("production budget %v", inlineBatchBudget)
 	}
 }

@@ -18,6 +18,13 @@ const (
 	inlineHandedOff      = ^uint64(0)
 )
 
+func (s *Server) inlineBatchOrDefault() time.Duration {
+	if s.inlineBatch > 0 {
+		return s.inlineBatch
+	}
+	return inlineBatchBudget
+}
+
 var errEpollLoopHandedOff = errors.New("epoll: event loop handed to a successor")
 
 var inlineHandoffs atomic.Uint64

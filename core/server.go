@@ -653,6 +653,7 @@ type Server struct {
 	wakersMu          sync.Mutex
 	wakers            map[shutdownWaker]struct{}
 	inlineWatch       inlineWatchdog
+	inlineBatch       time.Duration
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
 	_                 [CacheLineSize]byte
