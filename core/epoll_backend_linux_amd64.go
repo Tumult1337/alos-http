@@ -1848,15 +1848,8 @@ func (w *epollWorker) sendWithBody(c *epollConn) (int, error) {
 	if len(head) == 0 {
 		return socketSend(c.fd, c.bodyOut)
 	}
-	w.sendIov[0].Base = &head[0]
-	w.sendIov[0].SetLen(len(head))
-	w.sendIov[1].Base = &c.bodyOut[0]
-	w.sendIov[1].SetLen(len(c.bodyOut))
-	w.sendMsg.Iov = &w.sendIov[0]
-	w.sendMsg.SetIovlen(len(w.sendIov))
-	n, err := socketSendmsg(c.fd, &w.sendMsg)
-	w.sendIov[0].Base, w.sendIov[1].Base = nil, nil
-	return n, err
+	iov := appendIovec(appendIovec(w.sendIov[:0], head), c.bodyOut)
+	return socketSendIovecs(c.fd, &w.sendMsg, iov)
 }
 
 func (c *epollConn) advanceSent(n int) {

@@ -105,22 +105,10 @@ func (c *epollConn) h2UnconsumeFrames(stream *H2Stream, frames [][]byte) {
 func (d *h2DirectScratch) send(fd int, segs [][]byte) int {
 	iov := d.iov[:0]
 	for _, seg := range segs {
-		if len(seg) == 0 {
-			continue
-		}
-		v := unix.Iovec{Base: &seg[0]}
-		v.SetLen(len(seg))
-		iov = append(iov, v)
+		iov = appendIovec(iov, seg)
 	}
-	d.msg.Iov = &iov[0]
-	d.msg.SetIovlen(len(iov))
-	n, err := socketSendmsg(fd, &d.msg)
-	for err == unix.EINTR {
-		n, err = socketSendmsg(fd, &d.msg)
-	}
-	clear(iov)
+	n, err := socketSendIovecs(fd, &d.msg, iov)
 	d.iov = iov[:0]
-	d.msg.Iov = nil
 	if err != nil {
 		return 0
 	}

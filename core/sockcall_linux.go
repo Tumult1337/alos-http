@@ -46,3 +46,27 @@ func socketSendmsg(fd int, msg *unix.Msghdr) (int, error) {
 	}
 	return int(r), nil
 }
+
+func appendIovec(iov []unix.Iovec, seg []byte) []unix.Iovec {
+	if len(seg) == 0 {
+		return iov
+	}
+	v := unix.Iovec{Base: &seg[0]}
+	v.SetLen(len(seg))
+	return append(iov, v)
+}
+
+func socketSendIovecs(fd int, msg *unix.Msghdr, iov []unix.Iovec) (int, error) {
+	if len(iov) == 0 {
+		return 0, nil
+	}
+	msg.Iov = &iov[0]
+	msg.SetIovlen(len(iov))
+	n, err := socketSendmsg(fd, msg)
+	for err == unix.EINTR {
+		n, err = socketSendmsg(fd, msg)
+	}
+	clear(iov)
+	msg.Iov = nil
+	return n, err
+}
