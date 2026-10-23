@@ -14,7 +14,7 @@ import (
 
 func startPlainRouteTLSServer(t *testing.T) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr:          addr,
 		HTTPAddr:      "-",

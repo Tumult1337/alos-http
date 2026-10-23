@@ -25,7 +25,7 @@ const (
 
 func startH2FixServer(t *testing.T, tune func(*Config), routes func(*Server)) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	cfg := Config{
 		Addr:          addr,
 		PlainHTTP:     true,
@@ -125,12 +125,7 @@ const h2FixBenchBatch = 8
 
 func startH2FixBenchServer(b *testing.B) string {
 	b.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		b.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(b)
 	srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", MaxConnsPerIP: -1, Listeners: 1})
 	mid := bytes.Repeat([]byte{'m'}, 32<<10)
 	srv.Router.GET("/ok", func(req *Request, resp *Response) { resp.Status(200).String("ok") })

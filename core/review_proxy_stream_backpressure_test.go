@@ -68,12 +68,7 @@ func slowProxyGet(t *testing.T, addr string, body []byte, stopAt int) {
 
 func startSingleLoopProxy(t *testing.T, cfg DomainConfig) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr:          addr,

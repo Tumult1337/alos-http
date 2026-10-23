@@ -49,7 +49,7 @@ func resetConn(conn net.Conn) {
 }
 
 func TestH1InFlightRequestSurvivesReadBufPoolReuse(t *testing.T) {
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	s := New(Config{
 		Addr:          addr,
 		PlainHTTP:     true,

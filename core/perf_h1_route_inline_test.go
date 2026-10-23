@@ -38,7 +38,7 @@ func reportDispatchMode(resp *Response, body string) {
 
 func startRouteInlineServer(t *testing.T, useTLS bool) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	cfg := Config{
 		Addr:            addr,
 		HTTPAddr:        "-",

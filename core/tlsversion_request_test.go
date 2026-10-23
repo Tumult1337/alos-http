@@ -6,23 +6,11 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
-	"net"
 	"net/http"
 	"strconv"
 	"testing"
 	"time"
 )
-
-func freeLoopbackAddr(t testing.TB) string {
-	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
-}
 
 func reportTLSVersion(req *Request, resp *Response) {
 	resp.Status(200).String(strconv.Itoa(int(req.TLSVersion)))

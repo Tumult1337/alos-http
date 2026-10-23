@@ -16,12 +16,7 @@ import (
 
 func engineProxy(t *testing.T, backendAddr string) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", LogRequests: false})
 	srv.AddProxyDomain(DomainConfig{

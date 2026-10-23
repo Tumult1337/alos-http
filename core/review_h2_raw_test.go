@@ -29,7 +29,7 @@ type h2RawConn struct {
 
 func startPlainH2Server(t *testing.T) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr:          addr,
 		PlainHTTP:     true,

@@ -678,3 +678,55 @@ func TestWSEventsHandedOffCallbackWritesStayFramed(t *testing.T) {
 		t.Fatalf("frame counts %v", counts)
 	}
 }
+
+func wsDirectState(ev *wsLoopConn) bool {
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	return ev.direct
+}
+
+func TestWSDirectSendOffForDemotedCallback(t *testing.T) {
+	srv := New(Config{})
+	w := &epollWorker{server: srv, handlers: newHandlerPool(1)}
+	t.Cleanup(w.handlers.close)
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	ev := &wsLoopConn{w: w, h: WSEventHandler{OnMessage: func(ws *WSConn, op byte, msg []byte) {
+		entered <- struct{}{}
+		<-release
+	}}}
+	ev.ws = &WSConn{ev: ev}
+	srv.Router.demoteInline(ev.callbackIdentity(wsCallbackMessage), false)
+	ev.direct = true
+	w.queueWSCallback(ev, wsCallbackMessage)
+	<-entered
+	directWhileRunning := wsDirectState(ev)
+	close(release)
+	if directWhileRunning {
+		t.Fatal("a demoted pool callback runs with direct send on")
+	}
+}
+
+func TestWSDirectSendOffWhileCallbackPending(t *testing.T) {
+	c := &epollConn{fd: -1}
+	ev := &wsLoopConn{c: c}
+	ev.takeOutbox(c, nil, false)
+	if !wsDirectState(ev) {
+		t.Fatal("control: direct send must be on for an idle conn with nothing pending")
+	}
+	ev.cbPending = true
+	ev.takeOutbox(c, nil, false)
+	if wsDirectState(ev) {
+		t.Fatal("takeOutbox turned direct send on while a callback is pending")
+	}
+}
+
+func TestWSRevokeLoopTurnsDirectSendOff(t *testing.T) {
+	ev := &wsLoopConn{holding: true, direct: true}
+	ev.revokeLoop()
+	ev.mu.Lock()
+	defer ev.mu.Unlock()
+	if ev.direct || ev.holding {
+		t.Fatalf("after revoke: direct=%v holding=%v", ev.direct, ev.holding)
+	}
+}
