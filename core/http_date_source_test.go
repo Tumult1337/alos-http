@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 	"unsafe"
@@ -175,72 +174,6 @@ func TestHTTPDateH2MemoFollowsEntry(t *testing.T) {
 	}
 }
 
-const handlerOwnDate = "Tue, 15 Nov 1994 08:12:31 GMT"
-
-func rootFastServerNoContent(t *testing.T, date string) *Server {
-	t.Helper()
-	s := New(Config{})
-	s.Router.GET("/", func(req *Request, resp *Response) {
-		resp.Headers = append(resp.Headers, [2]string{"Date", date})
-		resp.Status(204)
-	})
-	s.Router.Build()
-	s.computeFastDispatch()
-	if s.plainRootFast.Load() == nil || s.h2RootFast.Load() == nil {
-		t.Fatal("root fast path not eligible in the test server")
-	}
-	return s
-}
-
-func TestHTTPDateRootFastKeepsHandlerDateH1(t *testing.T) {
-	installSharedDate(t)
-	server := rootFastServerNoContent(t, handlerOwnDate)
-	raw := []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-	memo, _, _, ok, refreshDate := server.matchPlainRootFastRequest(raw, false)
-	if !ok {
-		t.Fatal("root fast path did not match")
-	}
-	if !bytes.Contains(memo, []byte("Date: "+handlerOwnDate+"\r\n")) {
-		t.Fatalf("fixture lost the handler Date: %q", memo)
-	}
-	out := appendRootFastResponse(nil, memo, refreshDate)
-	if !bytes.Equal(out, memo) {
-		t.Fatalf("handler Date rewritten:\n got %q\nwant %q", out, memo)
-	}
-}
-
-func TestHTTPDateRootFastRefreshesGeneratedDateH1(t *testing.T) {
-	server := rootFastServer(t, Config{})
-	installSharedDate(t)
-	raw := []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-	memo, _, _, ok, refreshDate := server.matchPlainRootFastRequest(raw, false)
-	if !ok {
-		t.Fatal("root fast path did not match")
-	}
-	out := appendRootFastResponse(nil, memo, refreshDate)
-	if !bytes.Contains(out, []byte("Date: "+sharedDateText+"\r\n")) {
-		t.Fatalf("generated Date not refreshed: %q", out)
-	}
-}
-
-func TestHTTPDateRootFastKeepsHandlerDateH2(t *testing.T) {
-	installSharedDate(t)
-	server := rootFastServerNoContent(t, strings.Repeat("~", h2DateValueLen))
-	fast := server.h2RootFast.Load()
-	wire := appendFastH2RootResponse(nil, fast, 1, H2DefaultMaxFrameSize)
-	block, _, _ := responseHeaderFlight(t, wire, 1, H2DefaultMaxFrameSize, true)
-	if !bytes.Equal(block, fast.headerPayload) {
-		t.Fatalf("handler Date block rewritten:\n got %x\nwant %x", block, fast.headerPayload)
-	}
-	fields, err := newHpackDecoder(4096).Decode(block)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := dateValues(fields); len(got) != 1 || got[0] != strings.Repeat("~", h2DateValueLen) {
-		t.Fatalf("Date=%q", got)
-	}
-}
-
 func TestHTTPDateBuildH1ResponseStatusRule(t *testing.T) {
 	for _, status := range []int{100, 199, 600} {
 		wire, bp := BuildH1Response(&Response{StatusCode: status})
@@ -282,23 +215,6 @@ func TestHTTPDateWriteH1ResponseStatusRule(t *testing.T) {
 			t.Fatalf("WriteH1Response status=%d Date=%q", status, got)
 		}
 	}
-}
-
-func TestHTTPDateRootFastRefreshesGeneratedDateH2(t *testing.T) {
-	server := rootFastServer(t, Config{})
-	installSharedDate(t)
-	requireSharedDate(t, "h2-root", dateMemoH2Fields(t, server.h2RootFast.Load()))
-}
-
-func TestHTTPDateRootFastAltSvcVariantRefreshesDate(t *testing.T) {
-	server := rootFastServer(t, Config{})
-	server.enableAltSvc(443)
-	installSharedDate(t)
-	fast := server.h2RootFast.Load().forConn(true)
-	if fast == server.h2RootFast.Load() || !bytes.Contains(fast.headerPayload, server.altSvc.Load().hpack) {
-		t.Fatal("served response is not the Alt-Svc variant")
-	}
-	requireSharedDate(t, "h2-root-alt", dateMemoH2Fields(t, fast))
 }
 
 func TestHTTPDateReceiptStatusRule(t *testing.T) {

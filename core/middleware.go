@@ -695,7 +695,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 	}
 }
 
-// BodyLimit returns middleware that rejects requests whose body exceeds maxBytes with 413 Payload Too Large, checking Content-Length first and then the actual body length.
+// BodyLimit returns middleware that rejects requests whose body exceeds maxBytes with 413 Payload Too Large, checking Content-Length first and then the actual body length. A streamed body (Request.BodyStream) returns ErrBodyTooLarge from Read once more than maxBytes arrive, and the response becomes 413 unless the handler already streamed one.
 //
 // Example: app.Use(BodyLimit(1 << 20))
 // Example: app.Use(BodyLimit(10 << 20))
@@ -717,7 +717,15 @@ func BodyLimit(maxBytes int64) MiddlewareFunc {
 				_ = maxStr
 				return
 			}
+			stream := req.BodyStream()
+			if stream != nil {
+				stream.limitReads(maxBytes)
+			}
 			next(req, resp)
+			if stream != nil && stream.readLimitExceeded() && !resp.IsStreamed() {
+				resp.resetFastH1()
+				resp.Status(413).String("Payload Too Large")
+			}
 		}
 	}
 }

@@ -29,7 +29,7 @@ func perfH2WarmDecoder(tb testing.TB, wl perfH2Workload, scheme string) (*HpackD
 	tb.Helper()
 	blocks := perfH2EncodeRequest(wl, scheme)
 	d := newPerfH2Decoder()
-	if _, _, _, err := d.DecodeRequest(nil, blocks.warm); err != nil {
+	if _, _, err := d.DecodeRequest(nil, blocks.warm); err != nil {
 		tb.Fatalf("%s warm block: %v", wl.name, err)
 	}
 	return d, blocks.steady
@@ -74,7 +74,7 @@ func BenchmarkPerfH2HpackDecodeSteadyMemo(b *testing.B) {
 			b.SetBytes(int64(len(block)))
 			for b.Loop() {
 				var err error
-				headers, _, _, err = d.DecodeRequest(headers[:0], block)
+				headers, _, err = d.DecodeRequest(headers[:0], block)
 				if err != nil {
 					b.Fatal(err)
 				}
@@ -111,7 +111,7 @@ func BenchmarkPerfH2HpackDecodeWarmBlock(b *testing.B) {
 			b.SetBytes(int64(len(block)))
 			for b.Loop() {
 				var err error
-				headers, _, _, err = d.DecodeRequest(headers[:0], block)
+				headers, _, err = d.DecodeRequest(headers[:0], block)
 				if err != nil {
 					b.Fatal(err)
 				}

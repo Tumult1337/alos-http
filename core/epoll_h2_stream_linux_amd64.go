@@ -26,7 +26,7 @@ func init() { epollH2StreamWriterPool.New = newEpollH2StreamWriter }
 func newEpollH2StreamWriter() any {
 	sw := &epollH2StreamWriter{}
 	sw.space = sync.NewCond(&sw.mu)
-	sw.pumpFn = func(w *epollWorker) { sw.c.h2PumpTask(w, sw) }
+	sw.pumpFn = sw.runPumpTask
 	return sw
 }
 
@@ -50,20 +50,24 @@ type epollH2StreamWriter struct {
 	headerCalled bool
 	suppressBody bool
 
-	header      []byte
-	pending     []byte
-	pendingOff  int
-	headerReady bool
-	headersOut  bool
-	ended       bool
-	finished    bool
-	handlerDone bool
-	registered  bool
-	endedEarly  bool
-	pumpQueued  bool
-	sendRST     bool
-	err         error
-	file        h2FileSend
+	header       []byte
+	pending      []byte
+	pendingOff   int
+	headerReady  bool
+	headersOut   bool
+	ended        bool
+	finished     bool
+	handlerDone  bool
+	registered   bool
+	endedEarly   bool
+	pumpQueued   bool
+	tasksQueued  int
+	sendDeadline int64
+	sendRST      bool
+	err          error
+	file         h2FileSend
+
+	lease streamWriterLease
 }
 
 func (c *epollConn) newH2StreamWriter(req *Request) StreamWriter {
@@ -79,7 +83,10 @@ func (c *epollConn) newH2StreamWriter(req *Request) StreamWriter {
 		sw.maxWrite = 0
 	}
 	sw.cors.bind(req)
-	return sw
+	sw.mu.Lock()
+	gen := sw.lease.acquire()
+	sw.mu.Unlock()
+	return &h2StreamHandle{sw: sw, gen: gen}
 }
 
 func (sw *epollH2StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
@@ -176,6 +183,7 @@ func (sw *epollH2StreamWriter) claimPumpLocked() bool {
 		return false
 	}
 	sw.pumpQueued = true
+	sw.tasksQueued++
 	return true
 }
 
@@ -216,6 +224,20 @@ func (sw *epollH2StreamWriter) fail(err error) {
 }
 
 func (sw *epollH2StreamWriter) release() {
+	sw.mu.Lock()
+	if sw.err == nil {
+		sw.err = ErrStreamClosed
+	}
+	sw.space.Broadcast()
+	sw.lease.releaseLocked()
+	recycle := sw.recyclableLocked()
+	sw.mu.Unlock()
+	if recycle {
+		sw.recycle()
+	}
+}
+
+func (sw *epollH2StreamWriter) recycle() {
 	sw.c, sw.w, sw.stream = nil, nil, nil
 	sw.gen, sw.streamID = 0, 0
 	sw.method, sw.serverName, sw.altSvc = "", "", nil
@@ -231,10 +253,32 @@ func (sw *epollH2StreamWriter) release() {
 	sw.pendingOff = 0
 	sw.headerReady, sw.headersOut, sw.ended, sw.finished = false, false, false, false
 	sw.handlerDone, sw.registered, sw.pumpQueued, sw.sendRST = false, false, false, false
+	sw.sendDeadline = 0
 	sw.endedEarly = false
 	sw.err = nil
 	sw.file.clear()
 	epollH2StreamWriterPool.Put(sw)
+}
+
+func (sw *epollH2StreamWriter) runPumpTask(w *epollWorker) {
+	sw.mu.Lock()
+	sw.tasksQueued--
+	if sw.lease.released {
+		sw.pumpQueued = false
+		recycle := sw.recyclableLocked()
+		sw.mu.Unlock()
+		if recycle {
+			sw.recycle()
+		}
+		return
+	}
+	c := sw.c
+	sw.mu.Unlock()
+	c.h2PumpTask(w, sw)
+}
+
+func (sw *epollH2StreamWriter) recyclableLocked() bool {
+	return sw.lease.released && sw.lease.calls == 0 && sw.tasksQueued == 0
 }
 
 func (c *epollConn) h2PumpTask(w *epollWorker, sw *epollH2StreamWriter) {
@@ -271,9 +315,26 @@ func (c *epollConn) h2PumpSealed(w *epollWorker, sw *epollH2StreamWriter) {
 }
 
 func (c *epollConn) h2PumpFrames(dst []byte, sw *epollH2StreamWriter, backlog int) []byte {
-	st := &c.h2
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	before := len(dst)
+	dst = c.h2PumpFramesLocked(dst, sw, backlog)
+	c.h2NoteWriterStall(sw, len(dst) > before)
+	return dst
+}
+
+func (c *epollConn) h2NoteWriterStall(sw *epollH2StreamWriter, progressed bool) {
+	stalled := !sw.finished && sw.err == nil && (sw.bufferedLocked() > 0 || sw.file.left > 0) && (sw.stream.Window.Load() <= 0 || c.h2.connWindow <= 0)
+	if !stalled || progressed {
+		sw.sendDeadline = 0
+	}
+	if stalled && sw.sendDeadline == 0 {
+		sw.sendDeadline = deadlineFrom(c.worker.writeTO)
+	}
+}
+
+func (c *epollConn) h2PumpFramesLocked(dst []byte, sw *epollH2StreamWriter, backlog int) []byte {
+	st := &c.h2
 	sw.pumpQueued = false
 	if sw.finished {
 		return dst
@@ -417,7 +478,7 @@ func (c *epollConn) h2DropUnusedWriter(sw *epollH2StreamWriter) {
 
 func (c *epollConn) h2PumpAll(w *epollWorker) bool {
 	if len(c.h2Streaming) == 0 {
-		return (len(c.h2.sending) != 0 || c.h2.peerGoingAway) && c.h2PumpBuffered()
+		return (len(c.h2.sending) != 0 || c.h2.peerGoingAway || c.peerHup) && c.h2PumpBuffered()
 	}
 	before, directBefore := len(c.writeBuf), c.h2.directSent
 	for _, sw := range c.h2Streaming {

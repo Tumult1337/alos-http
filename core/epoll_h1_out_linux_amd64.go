@@ -27,7 +27,7 @@ func init() { epollH1StreamWriterPool.New = newEpollH1StreamWriter }
 func newEpollH1StreamWriter() any {
 	sw := &epollH1StreamWriter{contentLength: h1NoContentLength}
 	sw.space = sync.NewCond(&sw.mu)
-	sw.pumpFn = func(w *epollWorker) { sw.c.h1StreamPumpTask(w, sw) }
+	sw.pumpFn = sw.runPumpTask
 	return sw
 }
 
@@ -63,6 +63,7 @@ type epollH1StreamWriter struct {
 	finished    bool
 	handlerDone bool
 	pumpQueued  bool
+	tasksQueued int
 	err         error
 
 	fileFD       int
@@ -72,6 +73,8 @@ type epollH1StreamWriter struct {
 	fileProgress bool
 	fileNeedIO   bool
 	fileRef      *staticFD
+
+	lease streamWriterLease
 }
 
 func (c *epollConn) newStreamWriter(req *Request) StreamWriter {
@@ -94,7 +97,10 @@ func (c *epollConn) newH1StreamWriter(req *Request) StreamWriter {
 	sw.limiter, sw.global = c.connLimiter, srv.globalLimiter
 	sw.maxWrite = srv.config.MaxWriteSize
 	sw.cors.bind(req)
-	return sw
+	sw.mu.Lock()
+	gen := sw.lease.acquire()
+	sw.mu.Unlock()
+	return &h1StreamHandle{sw: sw, gen: gen}
 }
 
 func (sw *epollH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
@@ -225,7 +231,15 @@ func (sw *epollH1StreamWriter) claimPumpLocked() bool {
 		return false
 	}
 	sw.pumpQueued = true
+	sw.tasksQueued++
 	return true
+}
+
+func (sw *epollH1StreamWriter) completed() bool {
+	sw.mu.Lock()
+	ok := !sw.mustClose && sw.framingComplete()
+	sw.mu.Unlock()
+	return ok
 }
 
 func (sw *epollH1StreamWriter) framingComplete() bool {
@@ -243,6 +257,20 @@ func (sw *epollH1StreamWriter) fail(err error) {
 }
 
 func (sw *epollH1StreamWriter) release() {
+	sw.mu.Lock()
+	if sw.err == nil {
+		sw.err = ErrStreamClosed
+	}
+	sw.space.Broadcast()
+	sw.lease.releaseLocked()
+	recycle := sw.recyclableLocked()
+	sw.mu.Unlock()
+	if recycle {
+		sw.recycle()
+	}
+}
+
+func (sw *epollH1StreamWriter) recycle() {
 	sw.c, sw.w, sw.gen = nil, nil, 0
 	sw.method, sw.serverName, sw.altSvc = "", "", nil
 	sw.reqClose = false
@@ -267,10 +295,28 @@ func (sw *epollH1StreamWriter) release() {
 	epollH1StreamWriterPool.Put(sw)
 }
 
-func (c *epollConn) h1StreamPumpTask(w *epollWorker, sw *epollH1StreamWriter) {
+func (sw *epollH1StreamWriter) runPumpTask(w *epollWorker) {
 	sw.mu.Lock()
+	sw.tasksQueued--
 	sw.pumpQueued = false
+	if sw.lease.released {
+		recycle := sw.recyclableLocked()
+		sw.mu.Unlock()
+		if recycle {
+			sw.recycle()
+		}
+		return
+	}
+	c := sw.c
 	sw.mu.Unlock()
+	c.h1StreamPumpTask(w, sw)
+}
+
+func (sw *epollH1StreamWriter) recyclableLocked() bool {
+	return sw.lease.released && sw.lease.calls == 0 && sw.tasksQueued == 0
+}
+
+func (c *epollConn) h1StreamPumpTask(w *epollWorker, sw *epollH1StreamWriter) {
 	if c.generation != sw.gen || c.fd < 0 {
 		sw.fail(ErrStreamClosed)
 		return
@@ -397,6 +443,7 @@ func (c *epollConn) h1FinishOut(w *epollWorker) {
 	keepAlive := c.h1OutKeepAlive
 	if sw := c.h1Stream; sw != nil {
 		c.h1Stream = nil
+		keepAlive = keepAlive && sw.completed()
 		sw.release()
 	}
 	c.dispatching = false

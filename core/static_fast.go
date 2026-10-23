@@ -667,8 +667,7 @@ func (e *staticCacheEntry) serve(req *Request, resp *Response) {
 }
 
 func staticFileWriter(resp *Response) *epollH1StreamWriter {
-	sw, _ := resp.ensureSW().(*epollH1StreamWriter)
-	return sw
+	return h1StreamWriterOf(resp.ensureSW())
 }
 
 func (e *staticCacheEntry) serveFD(req *Request, resp *Response, sw *epollH1StreamWriter, h *staticFD) {
@@ -694,6 +693,6 @@ func (e *staticCacheEntry) writeFDHeaders(req *Request, resp *Response, sw *epol
 	if err := sw.WriteHeader(p.status, resp.Headers, e.contentType); err != nil {
 		return p, false
 	}
-	resp.SetStreamer(sw)
+	resp.SetStreamer(resp.ensureSW())
 	return p, true
 }

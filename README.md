@@ -140,7 +140,6 @@ All numbers are requests per second (mean of 2 rounds). Higher is better; the be
 | Workload | ALOS HTTP | Fiber v3 | gin | xitca-web | ntex |
 | --- | --- | --- | --- | --- | --- |
 | Plaintext `/plaintext` | **503.9k** | 400.5k | 217.2k | 446.6k | 437.0k |
-| Root `/` | **500.5k** | 409.4k | 218.5k | 450.4k | 444.2k |
 | JSON `/json` | **470.4k** | 373.4k | 209.7k | 436.5k | 431.0k |
 | Route param `/user/:id` | **469.3k** | 395.1k | 217.8k | 435.2k | 420.0k |
 | POST 1 KiB echo | **464.7k** | 370.8k | 173.0k | 408.9k | 380.8k |
@@ -161,7 +160,6 @@ All numbers are requests per second (mean of 2 rounds). Higher is better; the be
 | Workload | ALOS HTTP | Fiber v3 | gin | xitca-web | ntex |
 | --- | --- | --- | --- | --- | --- |
 | Plaintext `/plaintext` | **273.8k** | 247.9k | 158.0k | 254.1k | 257.4k |
-| Root `/` | **285.2k** | 251.9k | 160.0k | 253.2k | 254.6k |
 | JSON `/json` | **269.9k** | 236.6k | 155.5k | 249.6k | 252.6k |
 | Route param `/user/:id` | **272.8k** | 246.4k | 160.6k | 250.8k | 252.6k |
 | POST 1 KiB echo | **247.1k** | 221.2k | 133.7k | 230.6k | 224.7k |
@@ -184,7 +182,6 @@ Fiber v3 runs on fasthttp, which has no HTTP/2 server.
 | Workload | ALOS HTTP | Fiber v3 | gin | xitca-web | ntex |
 | --- | --- | --- | --- | --- | --- |
 | Plaintext `/plaintext` | **2.23M** | — | 144.7k | 1.48M | 950.3k |
-| Root `/` | **2.31M** | — | 144.0k | 1.55M | 1.04M |
 | JSON `/json` | **2.00M** | — | 143.7k | 1.42M | 922.6k |
 | Route param `/user/:id` | **2.10M** | — | 144.6k | 1.43M | 861.6k |
 | POST 1 KiB echo | **1.21M** | — | 109.9k | 811.2k | 399.0k |
@@ -201,7 +198,6 @@ Fiber v3 runs on fasthttp, which has no HTTP/2 server.
 | Workload | ALOS HTTP | Fiber v3 | gin | xitca-web | ntex |
 | --- | --- | --- | --- | --- | --- |
 | Plaintext `/plaintext` | **2.04M** | — | 139.3k | 1.37M | 890.3k |
-| Root `/` | **2.12M** | — | 133.9k | 1.42M | 959.4k |
 | JSON `/json` | **1.83M** | — | 128.3k | 1.31M | 860.1k |
 | Route param `/user/:id` | **1.99M** | — | 130.9k | 1.34M | 804.8k |
 | POST 1 KiB echo | **934.5k** | — | 108.1k | 677.5k | 376.4k |

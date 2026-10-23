@@ -247,7 +247,7 @@ func TestH2IdleDeadlineFinisherBranches(t *testing.T) {
 				writer := epollH2StreamWriterPool.Get().(*epollH2StreamWriter)
 				writer.c, writer.w, writer.stream, writer.gen, writer.streamID = c, w, stream, gen, 1
 				writer.headerReady, writer.finished = branch == "streamed-finished", branch == "streamed-finished"
-				stream.resp.sw = writer
+				stream.resp.sw = &h2StreamHandle{sw: writer, gen: writer.lease.acquire()}
 			case "pending-output":
 				stream.abandoned = true
 				c.writeBuf = append(c.writeBuf, 1)

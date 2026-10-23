@@ -15,9 +15,9 @@ import (
 	"time"
 )
 
-const fastRootRaceDuration = 150 * time.Millisecond
+const dispatchRecomputeRaceDuration = 150 * time.Millisecond
 
-func TestFastRootRecomputeWhileServing(t *testing.T) {
+func TestFastDispatchRecomputeWhileServing(t *testing.T) {
 	addr := freeLoopbackAddr(t)
 	s := New(Config{Addr: addr, PlainHTTP: true, Listeners: 1, MaxConnsPerIP: -1, HTTPAddr: "-", LogRequests: false})
 	s.Router.GET("/", func(req *Request, resp *Response) { resp.Status(200).String("root") })
@@ -69,7 +69,7 @@ func TestFastRootRecomputeWhileServing(t *testing.T) {
 			}
 		}()
 	}
-	deadline := time.Now().Add(fastRootRaceDuration)
+	deadline := time.Now().Add(dispatchRecomputeRaceDuration)
 	for time.Now().Before(deadline) {
 		s.OnRequest(func(req *Request, resp *Response) bool { return true })
 		s.hookMu.Lock()
@@ -83,6 +83,6 @@ func TestFastRootRecomputeWhileServing(t *testing.T) {
 		t.Fatal("no request served")
 	}
 	if n := bad.Load(); n != 0 {
-		t.Fatalf("%d root requests failed or returned a wrong body while the fast-root response was being recomputed", n)
+		t.Fatalf("%d root requests failed or returned a wrong body while fast dispatch was being recomputed", n)
 	}
 }

@@ -12,6 +12,7 @@ type h2BodyIn struct {
 	declared   int64
 	tooLarge   bool
 	tunnel     bool
+	deadline   int64
 }
 
 func (w *epollWorker) streamsH2Body(stream *H2Stream) bool {
@@ -28,7 +29,7 @@ func (w *epollWorker) streamsH2Body(stream *H2Stream) bool {
 }
 
 func (c *epollConn) openH2BodyIn(w *epollWorker, stream *H2Stream) *h2BodyIn {
-	in := &h2BodyIn{streamID: stream.ID, recvWindow: stream.RecvWindow, declared: stream.declaredLen, tunnel: stream.wsTunnel}
+	in := &h2BodyIn{streamID: stream.ID, recvWindow: stream.RecvWindow, declared: stream.declaredLen, tunnel: stream.wsTunnel, deadline: deadlineFrom(w.readTO)}
 	gen := c.generation
 	in.reader = newBodyReader(func() {
 		w.postTask(func(w *epollWorker) { c.h2BodyAcked(w, in, gen) })
@@ -69,6 +70,7 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 		} else if !c.h2BufferBody(in, payload) {
 			return false
 		}
+		in.deadline = deadlineFrom(c.worker.readTO)
 	}
 	if endStream {
 		if !in.tooLarge && h2LengthMismatch(in.declared, in.received) {
@@ -82,6 +84,10 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 		in.recvWindow += int64(padding)
 	}
 	return false
+}
+
+func (in *h2BodyIn) waitsForPeer() bool {
+	return !in.tunnel && !in.tooLarge && in.recvWindow > 0
 }
 
 func (c *epollConn) h2EndBodyIn(in *h2BodyIn, err error) {
@@ -118,6 +124,9 @@ func (c *epollConn) h2BodyAcked(w *epollWorker, in *h2BodyIn, gen uint32) {
 	frame := appendH2WindowUpdateFrame(w.h2FinishScratch[:0], in.streamID, uint32(n))
 	c.emitH2(frame)
 	w.h2FinishScratch = frame[:0]
+	if in.recvWindow <= 0 {
+		in.deadline = deadlineFrom(w.readTO)
+	}
 	in.recvWindow += int64(n)
 	w.markFlush(c)
 }

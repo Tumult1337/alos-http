@@ -9,11 +9,12 @@ const (
 )
 
 type h1BodyIn struct {
-	reader *BodyReader
-	left   int64
-	chunk  chunkedDecoder
-	done   bool
-	broken bool
+	reader       *BodyReader
+	left         int64
+	chunk        chunkedDecoder
+	done         bool
+	broken       bool
+	rejectStatus int
 }
 
 func (w *epollWorker) streamsH1Body(chunked, hasContentLength bool, contentLength int) bool {
@@ -33,6 +34,7 @@ func (c *epollConn) startH1BodyStream(w *epollWorker, out []byte, chunked bool, 
 		w.postTask(func(w *epollWorker) { c.h1BodyAcked(w, in, gen) })
 	})
 	in.reader.uploadConn, in.reader.uploadGlobal = c.connLimiter, w.server.globalLimiter
+	in.reader.chargeBudget(w.server, &c.h1BodyReserved)
 	c.h1In = in
 	c.req.Body = c.req.Body[:0]
 	c.req.bodyStream = in.reader
@@ -81,15 +83,18 @@ func (c *epollConn) h1FeedBody(w *epollWorker) {
 	if in == nil || in.done {
 		return
 	}
+	pushMax := w.h1BodyPushMax()
 	for !in.done {
 		data := c.h1Unread()
-		room := h1BodyStreamCap - in.reader.buffered()
+		room := min(h1BodyStreamCap-in.reader.buffered(), pushMax)
 		if len(data) == 0 || room <= 0 {
 			break
 		}
 		if in.left != h1NoContentLength {
 			n := int(min(int64(len(data)), int64(room), in.left))
-			in.reader.push(data[:n])
+			if !c.h1PushBody(in, data[:n]) {
+				break
+			}
 			c.h1Advance(n)
 			in.left -= int64(n)
 			if in.left == 0 {
@@ -101,6 +106,7 @@ func (c *epollConn) h1FeedBody(w *epollWorker) {
 		if in.chunk.state == chunkedInData {
 			src = data[:min(len(data), room)]
 		}
+		decoder := in.chunk
 		consumed, chunk, err := in.chunk.next(src)
 		if err != nil {
 			in.end(err)
@@ -111,10 +117,13 @@ func (c *epollConn) h1FeedBody(w *epollWorker) {
 		}
 		if len(chunk) > 0 {
 			if w.bodyTooLarge(in.reader.receivedBytes() + int64(len(chunk))) {
-				in.end(ErrBodyTooLarge)
+				in.reject(ErrBodyTooLarge, 413)
 				break
 			}
-			in.reader.push(chunk)
+			if !c.h1PushBody(in, chunk) {
+				in.chunk = decoder
+				break
+			}
 		}
 		c.h1Advance(consumed)
 		if in.chunk.done() {
@@ -122,6 +131,33 @@ func (c *epollConn) h1FeedBody(w *epollWorker) {
 		}
 	}
 	c.h1CompactUnread()
+}
+
+func (w *epollWorker) h1BodyPushMax() int {
+	limit := w.server.config.MaxInFlightBodyBytes
+	if limit < 0 {
+		return h1BodyStreamCap
+	}
+	return int(min(max(limit/bodyBudgetConnShareDivisor, 1), h1BodyStreamCap))
+}
+
+func (c *epollConn) h1PushBody(in *h1BodyIn, data []byte) bool {
+	if in.reader.reservePush(data) {
+		return true
+	}
+	if in.reader.buffered() > 0 {
+		return false
+	}
+	if in.reader.reservePush(data) {
+		return true
+	}
+	in.reject(ErrBodyStreamAborted, 503)
+	return false
+}
+
+func (in *h1BodyIn) reject(err error, status int) {
+	in.rejectStatus = status
+	in.end(err)
 }
 
 func (in *h1BodyIn) end(err error) {
@@ -158,24 +194,31 @@ func (c *epollConn) h1BodyAcked(w *epollWorker, in *h1BodyIn, gen uint32) {
 	w.serviceBuffered(c, false, false)
 }
 
-func (c *epollConn) h1EndBodyStream() (mustClose bool) {
+func (c *epollConn) h1EndBodyStream() (mustClose bool, rejectStatus int) {
 	in := c.h1In
 	if in == nil {
-		return false
+		return false, 0
 	}
 	c.h1In = nil
 	if !in.done {
-		in.reader.finish(ErrBodyStreamAborted)
-		return true
+		in.reader.abort(ErrBodyStreamAborted)
+		return true, 0
 	}
-	return in.broken
+	return in.broken, in.rejectStatus
 }
 
 func (c *epollConn) h1AbortIn() {
 	if in := c.h1In; in != nil {
 		c.h1In = nil
 		if !in.done {
-			in.reader.finish(ErrBodyStreamAborted)
+			in.reader.abort(ErrBodyStreamAborted)
 		}
 	}
+}
+
+func h1RejectText(status int) string {
+	if status == 503 {
+		return "Request Body Capacity Exhausted"
+	}
+	return "Payload Too Large"
 }

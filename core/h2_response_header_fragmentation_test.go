@@ -149,34 +149,10 @@ func TestH2ResponseHeaderFragmentationStatusOnly(t *testing.T) {
 	}
 }
 
-func TestH2ResponseHeaderFragmentationRootTemplates(t *testing.T) {
-	for _, size := range []int{64, 16384, 16385, 32769} {
-		_, block := responseHeaderBlockOfSize(t, size)
-		for _, body := range [][]byte{nil, []byte("body"), bytes.Repeat([]byte("b"), 32769)} {
-			cached := newH2RootFastResponse(bytes.Clone(block), bytes.Clone(body))
-			originalHeader, originalBody := bytes.Clone(cached.headerPayload), bytes.Clone(cached.body)
-			for _, streamID := range []uint32{1, 3} {
-				wire := appendFastH2RootResponse(nil, cached, streamID, H2DefaultMaxFrameSize)
-				got, actual, _ := responseHeaderFlight(t, wire, streamID, H2DefaultMaxFrameSize, len(body) == 0)
-				if !bytes.Equal(got, block) || !bytes.Equal(actual, body) {
-					t.Fatal("root template header/body changed")
-				}
-			}
-			if !bytes.Equal(originalHeader, cached.headerPayload) || !bytes.Equal(originalBody, cached.body) {
-				t.Fatal("cached template changed")
-			}
-			shouldFrame := size <= 16384 && len(body) <= 16384
-			if (len(cached.framed) > 0) != shouldFrame {
-				t.Fatalf("header=%d body=%d preframed=%v", size, len(body), len(cached.framed) > 0)
-			}
-		}
-	}
-}
-
 func TestH2ResponseHeaderFragmentationStreamAndBodyFlow(t *testing.T) {
 	headers, _ := responseHeaderBlockOfSize(t, 32769)
 	for _, onlyHeaders := range []bool{false, true} {
-		connection := &epollConn{}
+		connection := &epollConn{worker: &epollWorker{}}
 		connection.h2.maxFrameSize = H2DefaultMaxFrameSize
 		stream := &H2Stream{}
 		writer := newEpollH2StreamWriter().(*epollH2StreamWriter)
@@ -328,69 +304,5 @@ func TestH2ResponseHeaderFragmentationAppenderEdges(t *testing.T) {
 	got, _, frames := responseHeaderFlight(t, wire, 33, H2MaxFrameSize, true)
 	if frames != 2 || !bytes.Equal(got, block) {
 		t.Fatal("24-bit frame limit lost bytes")
-	}
-}
-
-func TestH2ResponseHeaderFragmentationAltSvcAndTLS(t *testing.T) {
-	_, block := responseHeaderBlockOfSize(t, 16384)
-	base := newH2RootFastResponse(bytes.Clone(block), []byte("body"))
-	if len(base.framed) == 0 {
-		t.Fatal("exact-limit base stopped using preframed path")
-	}
-	server := New(Config{})
-	server.altSvc.Store(newAltSvcHeader(443))
-	attached := server.attachAltSvc(base)
-	if attached.withAltSvc == nil || len(attached.withAltSvc.headerPayload) <= 16384 || len(attached.withAltSvc.framed) != 0 {
-		t.Fatal("Alt-Svc crossing did not use fragmenting fallback")
-	}
-	wire := appendFastH2RootResponse(nil, attached.forConn(true), 35, 16384)
-	got, body, _ := responseHeaderFlight(t, wire, 35, 16384, false)
-	decoder := newHpackDecoder(4096)
-	fields, err := decoder.Decode(got)
-	if err != nil {
-		t.Fatal(err)
-	}
-	altCount := 0
-	for _, field := range fields {
-		if field[0] == "alt-svc" {
-			altCount++
-		}
-	}
-	if altCount != 1 || string(body) != "body" || !bytes.Equal(base.headerPayload, block) {
-		t.Fatal("Alt-Svc header/body/base template changed")
-	}
-	suite := &SupportedSuites[0]
-	fixture := bytes.Repeat([]byte{7}, suite.HashLen)
-	writer, err := NewTrafficAEAD(suite.HashFn, fixture, suite)
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader, err := NewTrafficAEAD(suite.HashFn, fixture, suite)
-	if err != nil {
-		t.Fatal(err)
-	}
-	connection := &epollConn{appWriter: writer}
-	records := connection.sealTLSAppData(nil, wire)
-	var plain []byte
-	for len(records) > 0 {
-		if len(records) < 5 {
-			t.Fatal("short TLS header")
-		}
-		size := int(records[3])<<8 | int(records[4])
-		if size > len(records)-5 {
-			t.Fatal("short TLS record")
-		}
-		payload, err := reader.Decrypt(bytes.Clone(records[5 : 5+size]))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(payload) == 0 || payload[len(payload)-1] != 0x17 {
-			t.Fatal("wrong inner type")
-		}
-		plain = append(plain, payload[:len(payload)-1]...)
-		records = records[5+size:]
-	}
-	if !bytes.Equal(plain, wire) {
-		t.Fatal("TLS flight altered fragmented response")
 	}
 }

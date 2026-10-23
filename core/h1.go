@@ -3,7 +3,6 @@
 package core
 
 import (
-	"bytes"
 	"net"
 	"net/http"
 	"sync/atomic"
@@ -94,32 +93,6 @@ func appendH1HeaderFields(dst []byte, headers [][2]string) []byte {
 		dst = append(dst, '\r', '\n')
 	}
 	return dst
-}
-
-func appendRootFastResponse(dst, memo []byte, refreshDate bool) []byte {
-	if !refreshDate {
-		return append(dst, memo...)
-	}
-	return appendMemoizedResponse(dst, memo)
-}
-
-func appendMemoizedResponse(dst, memo []byte) []byte {
-	base := len(dst)
-	dst = append(dst, memo...)
-	refreshMemoizedDate(dst[base:])
-	return dst
-}
-
-func refreshMemoizedDate(response []byte) {
-	at := bytes.IndexByte(response, '\n') + 1
-	if at == 0 || len(response)-at < httpDateLineLen {
-		return
-	}
-	line := response[at : at+httpDateLineLen]
-	if string(line[:len(dateHeaderPrefix)]) != dateHeaderPrefix || string(line[httpDateLineLen-2:]) != "\r\n" {
-		return
-	}
-	copy(line, currentHTTPDateLine()[:])
 }
 
 var statusLines [600][]byte

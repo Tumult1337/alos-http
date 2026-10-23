@@ -24,25 +24,6 @@ func currentH2DateField() []byte {
 	return currentHTTPDate().h2
 }
 
-func h2StatusFieldLen(block []byte) int {
-	if len(block) == 0 {
-		return 0
-	}
-	if block[0]&0x80 != 0 || len(block) < 2 {
-		return 1
-	}
-	return 2 + int(block[1]&0x7f)
-}
-
-func refreshH2DateField(headerBlock []byte) {
-	at := h2StatusFieldLen(headerBlock)
-	field := currentH2DateField()
-	if len(headerBlock)-at < len(field) || string(headerBlock[at:at+len(h2DateFieldPrefix)]) != string(h2DateFieldPrefix) {
-		return
-	}
-	copy(headerBlock[at:at+len(field)], field)
-}
-
 func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
 	encodeH2ResponseHeadersDated(enc, nil, nil, statusCode, contentType, contentLength, headers, serverName)
 }

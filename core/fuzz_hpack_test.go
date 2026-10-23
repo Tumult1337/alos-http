@@ -21,7 +21,7 @@ func FuzzHPACKDecodeRequest(f *testing.F) {
 	f.Fuzz(func(t *testing.T, block []byte) {
 		dec := NewHpackDecoder()
 		for range 2 {
-			headers, _, _, err := dec.DecodeRequest(nil, block)
+			headers, _, err := dec.DecodeRequest(nil, block)
 			if err != nil {
 				return
 			}

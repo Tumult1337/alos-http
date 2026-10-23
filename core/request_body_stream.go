@@ -37,6 +37,8 @@ type BodyReader struct {
 	budget     *Server
 	budgetConn *atomic.Int64
 	held       int64
+	readLimit  int64
+	limited    bool
 
 	deadlineAt    int64
 	deadlineHit   bool
@@ -56,6 +58,10 @@ func (b *BodyReader) Read(p []byte) (int, error) {
 	b.mu.Lock()
 	for b.off == len(b.buf) && !b.eof && b.err == nil && !b.closed && !b.deadlineHit {
 		b.ready.Wait()
+	}
+	if b.limited && b.received > b.readLimit {
+		b.mu.Unlock()
+		return 0, ErrBodyTooLarge
 	}
 	if b.off == len(b.buf) {
 		err := b.err
@@ -161,6 +167,21 @@ func (b *BodyReader) claimAckLocked() bool {
 	}
 	b.ackQueued = true
 	return true
+}
+
+func (b *BodyReader) limitReads(n int64) {
+	b.mu.Lock()
+	if !b.limited || n < b.readLimit {
+		b.readLimit, b.limited = n, true
+	}
+	b.mu.Unlock()
+}
+
+func (b *BodyReader) readLimitExceeded() bool {
+	b.mu.Lock()
+	exceeded := b.limited && b.received > b.readLimit
+	b.mu.Unlock()
+	return exceeded
 }
 
 func (b *BodyReader) push(data []byte) {
