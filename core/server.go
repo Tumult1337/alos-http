@@ -711,6 +711,9 @@ type trackedHandoffConn struct {
 	ipFromInFlig bool
 	closeOnce    sync.Once
 	onClose      func()
+	holdMu       sync.Mutex
+	holds        int
+	closed       bool
 }
 
 type ipReqCounter struct {
@@ -1134,12 +1137,7 @@ func (c *trackedHandoffConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		err = c.Conn.Close()
-		if c.server != nil {
-			c.server.untrackHandoffConn(c)
-		}
-		if c.onClose != nil {
-			c.onClose()
-		}
+		c.finishClose()
 	})
 	return err
 }

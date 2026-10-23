@@ -467,15 +467,16 @@ func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
 		if err != nil {
 			ws.releaseMessageBytes()
 			ws.noteCloseCode(wsStatusAbnormal)
-			_, tunneled := ws.conn.(*h2StreamConn)
-			closeHeld := h.OnClose != nil && srv != nil && !tunneled
-			if closeHeld {
-				srv.activeConns.Add(1)
+			var held *trackedHandoffConn
+			if h.OnClose != nil {
+				if tracked := trackedConnOf(ws.conn); tracked != nil && tracked.retainSlots() {
+					held = tracked
+				}
 			}
 			ws.Close()
 			wsDeliverClose(srv, ws, &h)
-			if closeHeld {
-				srv.releaseTrackedConn()
+			if held != nil {
+				held.releaseHold()
 			}
 			return
 		}

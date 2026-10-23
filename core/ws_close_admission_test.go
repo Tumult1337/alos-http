@@ -4,6 +4,7 @@ package core
 
 import (
 	"bufio"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
@@ -90,6 +91,10 @@ func wsCloseAdmissionServer(t *testing.T, blocker *wsBlockingClose, cfgFn func(*
 				ServeWebSocketEvents(req, resp, WSUpgradeOptions{}, blocker.handler())
 				blocker.upgrading <- struct{}{}
 				<-blocker.upgradeGate
+			})
+			r.GET("/ws-copied", func(req *Request, resp *Response) {
+				copied := *req
+				ServeWebSocketEvents(&copied, resp, WSUpgradeOptions{}, blocker.handler())
 			})
 			r.GET("/ping", func(req *Request, resp *Response) { resp.String("pong") })
 			r.GET("/ws-message", func(req *Request, resp *Response) {
@@ -216,7 +221,13 @@ func TestWSEventsBlockingPathOnCloseHoldsConnSlot(t *testing.T) {
 func awaitIdleAfterReadinessProbe(t *testing.T, ts *testServer, path string) {
 	t.Helper()
 	waitFor(t, wsEvCloseWait, func() bool {
-		c, err := net.DialTimeout("tcp4", ts.addr, harnessIOTimeout)
+		var c net.Conn
+		var err error
+		if ts.tls {
+			c, err = tls.DialWithDialer(&net.Dialer{Timeout: harnessIOTimeout}, "tcp4", ts.addr, ts.tlsConfig("http/1.1"))
+		} else {
+			c, err = net.DialTimeout("tcp4", ts.addr, harnessIOTimeout)
+		}
 		if err != nil {
 			return false
 		}
@@ -250,6 +261,67 @@ func TestWSEventsCloseDuringUpgradeHoldsPerIPConnSlot(t *testing.T) {
 	time.Sleep(wsCloseAdmissionSettle)
 	if status := wsCloseAdmissionUpgrade(t, ts); status != 0 && status != http.StatusTooManyRequests {
 		t.Fatalf("upgrade while OnClose of a conn closed mid-upgrade blocks: status %d, want refusal", status)
+	}
+	blocker.unblock()
+	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+}
+
+func TestWSEventsHijackedPathOnCloseHoldsSlots(t *testing.T) {
+	blocker := newWSBlockingClose()
+	ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) { cfg.MaxConnsPerIP = 1 })
+	c, _, _ := wsEvDial(t, ts, "/ws-copied")
+	_ = c.Close()
+	blocker.awaitEntered(t)
+	time.Sleep(wsCloseAdmissionSettle)
+	if got := ts.srv.activeConns.Load(); got != 1 {
+		t.Fatalf("activeConns with a blocked OnClose on a closed hijacked conn = %d, want 1", got)
+	}
+	for attempt := range 3 {
+		if status := wsCloseAdmissionUpgrade(t, ts); status != 0 && status != http.StatusTooManyRequests {
+			t.Fatalf("attempt %d with a blocked OnClose on a hijacked conn: status %d, want refusal", attempt, status)
+		}
+	}
+	blocker.unblock()
+	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+	if status := wsCloseAdmissionUpgrade(t, ts); status != http.StatusSwitchingProtocols {
+		t.Fatalf("upgrade after OnClose returned: status %d", status)
+	}
+}
+
+func TestWSEventsHijackedTLSPathOnCloseHoldsPerIPSlot(t *testing.T) {
+	blocker := newWSBlockingClose()
+	ts := newTestServer(t, testServerOptions{
+		TLS: true,
+		Config: func(cfg *Config) {
+			cfg.WebSocketOriginMode = WSOriginOff
+			cfg.MaxConnsPerIP = 1
+		},
+		Routes: func(r *Router) {
+			r.GET("/ws-copied", func(req *Request, resp *Response) {
+				copied := *req
+				ServeWebSocketEvents(&copied, resp, WSUpgradeOptions{}, blocker.handler())
+			})
+			r.GET("/ping", func(req *Request, resp *Response) { resp.String("pong") })
+		},
+	})
+	t.Cleanup(blocker.unblock)
+	awaitIdleAfterReadinessProbe(t, ts, "/ping")
+	c, _, _ := wsEvDial(t, ts, "/ws-copied")
+	_ = c.Close()
+	blocker.awaitEntered(t)
+	time.Sleep(wsCloseAdmissionSettle)
+	if got := ts.srv.activeConns.Load(); got != 1 {
+		t.Fatalf("activeConns with a blocked OnClose on a closed TLS hijacked conn = %d, want 1", got)
+	}
+	dialer := &net.Dialer{Timeout: harnessIOTimeout}
+	if conn, err := tls.DialWithDialer(dialer, "tcp4", ts.addr, ts.tlsConfig("http/1.1")); err == nil {
+		_ = conn.SetDeadline(wallDeadline(harnessIOTimeout))
+		_, werr := conn.Write([]byte(wsEvUpgradeRequest(ts.domain, "/ws-copied")))
+		resp, rerr := http.ReadResponse(bufio.NewReader(conn), nil)
+		_ = conn.Close()
+		if werr == nil && rerr == nil && resp.StatusCode == http.StatusSwitchingProtocols {
+			t.Fatal("a second TLS conn from the same IP upgraded while OnClose holds the per-IP slot")
+		}
 	}
 	blocker.unblock()
 	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
