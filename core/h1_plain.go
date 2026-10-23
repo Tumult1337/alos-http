@@ -24,7 +24,7 @@ func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, include
 		dst = append(dst, head...)
 	} else {
 		dst = appendStatusLine(dst, resp.StatusCode)
-		dst = appendDateUnlessSet(dst, resp.Headers)
+		dst = appendDateUnlessSet(dst, resp.StatusCode, resp.Headers)
 		if resp.ContentType != "" {
 			switch resp.ContentType {
 			case "application/json; charset=utf-8":

@@ -27,7 +27,7 @@ func classifyH1StreamHeaders(headers [][2]string) (bool, bool) {
 
 func appendH1StreamHead(buf []byte, statusCode int, headers [][2]string, contentType string, chunked, closeAfter bool, serverName string, altSvc *altSvcHeader) []byte {
 	buf = appendStatusLine(buf, statusCode)
-	buf = appendDateUnlessSet(buf, headers)
+	buf = appendDateUnlessSet(buf, statusCode, headers)
 	if contentType != "" {
 		buf = appendContentTypeHeader(buf, contentType)
 	}

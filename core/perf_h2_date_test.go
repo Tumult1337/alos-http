@@ -68,10 +68,10 @@ func TestH2ResponseHeadersKeepHandlerDate(t *testing.T) {
 }
 
 func TestH2MemoizedRootResponseRefreshesDate(t *testing.T) {
-	stale := newH2DateField(turbo.Unix() - 3600)
+	stale := newHTTPDateLine((turbo.Unix()-3600)*int64(time.Second), turbo.Now())
 	enc := HpackEncoder{}
 	enc.EncodeStatus(200)
-	enc.Buf = append(enc.Buf, stale.enc...)
+	enc.Buf = append(enc.Buf, stale.h2...)
 	enc.encodeStaticFieldCached(hpackStaticContentType, "text/plain")
 	for _, body := range [][]byte{[]byte("ok"), make([]byte, 2*H2DefaultMaxFrameSize)} {
 		fast := newH2RootFastResponse(append([]byte(nil), enc.Buf...), body)

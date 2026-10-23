@@ -5,10 +5,8 @@ package core
 import (
 	"bufio"
 	"bytes"
-	"fmt"
 	"net/http"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 )
@@ -165,16 +163,16 @@ func TestResponseDateRedirectAndACME(t *testing.T) {
 
 func TestResponseDateEligibility(t *testing.T) {
 	for _, status := range []int{0, 99, 100, 101, 199, 600, 999} {
-		if value := responseDateValueAt(status, nil, 1000000000); value != "" {
+		if value := responseDateValue(status, nil); value != "" {
 			t.Fatalf("status=%d generated Date=%q", status, value)
 		}
 		if got := appendProxyDate([]byte("PREFIX"), status, respHeaders{}); string(got) != "PREFIX" {
 			t.Fatalf("proxy status=%d generated metadata %q", status, got)
 		}
 	}
+	installSharedDate(t)
 	for _, status := range []int{200, 299, 300, 399, 400, 499, 500, 599} {
-		value := responseDateValueAt(status, nil, 1000000000)
-		if value != "Sun, 09 Sep 2001 01:46:40 GMT" {
+		if value := responseDateValue(status, nil); value != sharedDateText {
 			t.Fatalf("status=%d Date=%q", status, value)
 		}
 	}
@@ -200,55 +198,17 @@ func TestResponseDateDefaultRootClock(t *testing.T) {
 	dateRequireCurrent(t, dateMemoH2Fields(t, server.h2RootFast.Load()))
 }
 
-func TestResponseDateFormatterCacheIndependence(t *testing.T) {
+func TestResponseDateDoesNotTouchFileValidatorCache(t *testing.T) {
 	const mtime int64 = 946684800
 	fileDate := httpDate(mtime)
 	original := lastHTTPDate.Load()
-	for _, unix := range []int64{1767225600, 1767225601, 1767225600} {
-		value := responseDateValueAt(200, nil, unix)
-		want := time.Unix(unix, 0).UTC().Format(http.TimeFormat)
-		if value != want {
-			t.Fatalf("response Date=%q want=%q", value, want)
+	installSharedDate(t)
+	for _, status := range []int{200, 404} {
+		if responseDateValue(status, nil) != sharedDateText {
+			t.Fatal("response Date is not the shared entry")
 		}
 		if lastHTTPDate.Load() != original || httpDate(mtime) != fileDate {
 			t.Fatal("response Date evicted file validator cache")
 		}
-	}
-}
-
-func TestResponseDateFormatterConcurrentPublication(t *testing.T) {
-	const mtime int64 = 946684800
-	const current int64 = 1767225600
-	fileText, responseText := httpDate(mtime), responseHTTPDate(current)
-	fileEntry, responseEntry := lastHTTPDate.Load(), lastResponseHTTPDate.Load()
-	errors := make(chan error, 4)
-	var group sync.WaitGroup
-	for worker := 0; worker < 4; worker++ {
-		group.Add(1)
-		go func(worker int) {
-			defer group.Done()
-			for iteration := 0; iteration < 100; iteration++ {
-				unix := current + int64((worker+iteration)%4)
-				got := responseHTTPDate(unix)
-				want := time.Unix(unix, 0).UTC().Format(http.TimeFormat)
-				fileUnix := mtime + int64((worker+iteration)%4)
-				fileGot := httpDate(fileUnix)
-				fileWant := time.Unix(fileUnix, 0).UTC().Format(http.TimeFormat)
-				if got != want || fileGot != fileWant {
-					errors <- fmt.Errorf("response=%q want=%q file=%q want=%q", got, want, fileGot, fileWant)
-					return
-				}
-			}
-		}(worker)
-	}
-	group.Wait()
-	close(errors)
-	for err := range errors {
-		t.Error(err)
-	}
-	_ = httpDate(mtime + 10)
-	_ = responseHTTPDate(current + 10)
-	if fileEntry.unix != mtime || fileEntry.text != fileText || responseEntry.unix != current || responseEntry.text != responseText {
-		t.Fatal("formatter mutated a published cache entry")
 	}
 }

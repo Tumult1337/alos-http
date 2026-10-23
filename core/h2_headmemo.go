@@ -12,7 +12,7 @@ type h2HeadMemo struct {
 	gen           uint32
 	status        int
 	contentLength int64
-	date          *h2DateField
+	date          *httpDateLine
 	ctLen         int
 	key           []byte
 	headerLens    []int
@@ -40,7 +40,7 @@ func h2HeadMemoEligible(headers [][2]string) bool {
 	return n <= h2HeadMemoMaxKey && !headersHaveFold(headers, "date")
 }
 
-func (m *h2HeadMemo) matches(gen uint32, date *h2DateField, status int, contentType string, contentLength int64, headers [][2]string, serverName string) bool {
+func (m *h2HeadMemo) matches(gen uint32, date *httpDateLine, status int, contentType string, contentLength int64, headers [][2]string, serverName string) bool {
 	if m.gen != gen || m.date != date || m.status != status || m.contentLength != contentLength ||
 		len(m.headerLens) != 2*len(headers) || len(m.block) == 0 || m.ctLen != len(contentType) {
 		return false
@@ -68,7 +68,7 @@ func (m *h2HeadMemo) headersMatch(off int, headers [][2]string) bool {
 	return off == len(m.key)
 }
 
-func (m *h2HeadMemo) remember(gen uint32, date *h2DateField, status int, contentType string, contentLength int64, headers [][2]string, serverName string, block []byte) {
+func (m *h2HeadMemo) remember(gen uint32, date *httpDateLine, status int, contentType string, contentLength int64, headers [][2]string, serverName string, block []byte) {
 	m.gen = gen
 	m.date = date
 	m.status = status
@@ -84,7 +84,7 @@ func (m *h2HeadMemo) remember(gen uint32, date *h2DateField, status int, content
 	m.probation = true
 }
 
-func encodeH2ResponseHeadersRemembered(enc *HpackEncoder, tbl *hpackEncTable, date *h2DateField, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
+func encodeH2ResponseHeadersRemembered(enc *HpackEncoder, tbl *hpackEncTable, date *httpDateLine, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
 	gen, start := tbl.gen, len(enc.Buf)
 	encodeH2ResponseHeadersDated(enc, tbl, date, statusCode, contentType, contentLength, headers, serverName)
 	if tbl.gen != gen {
