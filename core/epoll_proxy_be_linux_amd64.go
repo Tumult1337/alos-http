@@ -196,10 +196,13 @@ func (w *epollWorker) shouldStreamResponse(c *backendConn, contentLen int64) boo
 	// A cacheable response that the cache would accept is buffered so it can
 	// actually be stored. Without this a CDN silently stops caching everything
 	// above the buffering threshold, which is the opposite of what it wants.
-	if px.mayCache && contentLen <= px.cache.maxCacheableSize() {
+	if contentLen <= proxyBufferedResponseLimit {
 		return false
 	}
-	return contentLen > proxyBufferedResponseLimit
+	if px.mayCache && contentLen <= px.cache.maxCacheableSize() {
+		return !px.reserveResponseBuffer(contentLen)
+	}
+	return true
 }
 
 // beginStreamResponse emits the response head and switches the exchange to

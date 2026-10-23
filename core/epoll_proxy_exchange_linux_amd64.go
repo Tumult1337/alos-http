@@ -218,7 +218,7 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
 	px.keepClient = !reqClose
-	px.mayCache = cache != nil && cacheableMethod
+	px.mayCache = cache != nil && cacheableMethod && (reqCacheOK || pe.responseHook() != nil)
 	px.reqCacheOK = reqCacheOK
 	px.cacheHost = host
 	px.cacheKey = cachePath

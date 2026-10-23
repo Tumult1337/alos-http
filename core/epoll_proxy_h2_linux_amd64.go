@@ -59,7 +59,7 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 	px.method = req.Method
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
-	px.mayCache = cache != nil && cacheableMethod
+	px.mayCache = cache != nil && cacheableMethod && (reqCacheOK || pe.responseHook() != nil)
 	px.reqCacheOK = reqCacheOK
 	px.cacheHost = host
 	px.cacheKey = cachePath
@@ -180,7 +180,7 @@ func (w *epollWorker) admitH2Response(px *proxyExchange, contentLen int64) bool 
 	switch {
 	case contentLen > int64(w.beCfg.MaxResponseBody):
 		px.refusal = proxyRefusedTooLarge
-	case contentLen >= 0 && !px.reserveH2Buffer(contentLen):
+	case contentLen >= 0 && !px.reserveResponseBuffer(contentLen):
 		px.refusal = proxyRefusedBufferFull
 	case contentLen >= 0 && (contentLen <= proxyBufferedResponseLimit ||
 		px.mayCache && contentLen <= px.cache.maxCacheableSize()):
@@ -196,7 +196,7 @@ func (w *epollWorker) bufferH2Chunk(c *backendConn, px *proxyExchange, data []by
 			w.refuseResponse(c, px, proxyRefusedTooLarge)
 			return
 		}
-		if !px.reserveH2Buffer(int64(len(data))) {
+		if !px.reserveResponseBuffer(int64(len(data))) {
 			w.refuseResponse(c, px, proxyRefusedBufferFull)
 			return
 		}
@@ -209,7 +209,7 @@ func (w *epollWorker) refuseResponse(c *backendConn, px *proxyExchange, r proxyR
 	w.be.closeConn(c, errFPClientClosed)
 }
 
-func (px *proxyExchange) reserveH2Buffer(n int64) bool {
+func (px *proxyExchange) reserveResponseBuffer(n int64) bool {
 	c := px.c
 	if c.h2ProxyBuffered+n > proxyH2ConnBufferBudget {
 		return false
