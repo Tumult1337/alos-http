@@ -95,6 +95,7 @@ const wsStatusAbnormal uint16 = 1006
 const wsStatusInvalidPayload uint16 = 1007
 const wsStatusMessageTooBig uint16 = 1009
 const wsStatusInternalError uint16 = 1011
+const wsStatusTryAgainLater uint16 = 1013
 const wsMaxFrameHeaderLen = 10
 const wsMaxControlPayload = 125
 const wsDefaultReadTimeout = 120 * time.Second
@@ -109,6 +110,7 @@ const wsPingWindowMax = 100
 
 var errWSEventDriven = &staticError{"websocket: operation unavailable on an event-driven connection"}
 var errWSWriteQueueFull = &staticError{"websocket: write queue full"}
+var errWSBudgetExhausted = &staticError{"websocket: message buffer budget exhausted"}
 
 // WSConn is a server-side WebSocket connection (RFC 6455). Obtain one with ServeWebSocket (or UpgradeWebSocket) inside a route handler, then exchange data with ReadMessage and WriteMessage (or WriteText / WriteBinary).
 type WSConn struct {
@@ -133,6 +135,8 @@ type WSConn struct {
 	writeArmedAt  int64
 	writeDeadline bool
 	drain         wsDrainConn
+	server        *Server
+	bodyReserved  atomic.Int64
 }
 
 type WSUpgradeOptions struct {
@@ -333,6 +337,7 @@ func newNegotiatedWSConn(req *Request, opts WSUpgradeOptions) *WSConn {
 		writeTimeout:   wsDefaultWriteTimeout,
 		MaxMessageSize: wsDefaultMaxMessageSize,
 		subprotocol:    wsSelectSubprotocol(req.Headers, opts.Subprotocols),
+		server:         req.server,
 	}
 	if req.server != nil {
 		ws.readTimeout = optionalDuration(req.server.config.WSReadTimeout, wsDefaultReadTimeout)
@@ -443,8 +448,9 @@ func wsDeliverClose(srv *Server, ws *WSConn, h *WSEventHandler) {
 func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
 	var buf []byte
 	for {
-		op, msg, err := ws.ReadMessageInto(buf[:0])
+		op, msg, err := ws.readMessageReserved(buf[:0])
 		if err != nil {
+			ws.releaseMessageBytes()
 			ws.noteCloseCode(wsStatusAbnormal)
 			ws.Close()
 			wsDeliverClose(srv, ws, &h)
@@ -456,7 +462,20 @@ func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
 		if h.OnMessage != nil {
 			wsDeliverMessage(srv, ws, &h, op, msg)
 		}
+		ws.releaseMessageBytes()
 	}
+}
+
+func (ws *WSConn) reserveMessageBytes(n int) bool {
+	if ws.server.tryReserveConnBodyBytes(&ws.bodyReserved, n) {
+		return true
+	}
+	ws.closeWithStatus(wsStatusTryAgainLater)
+	return false
+}
+
+func (ws *WSConn) releaseMessageBytes() {
+	ws.server.releaseConnBodyBytes(&ws.bodyReserved, ws.bodyReserved.Load())
 }
 
 // NetConn returns the underlying hijacked connection, e.g. to set per-write deadlines so a dead peer cannot block WriteMessage forever.
@@ -479,6 +498,12 @@ func (ws *WSConn) ReadMessageInto(dst []byte) (byte, []byte, error) {
 	if ws.ev != nil {
 		return 0, nil, errWSEventDriven
 	}
+	op, msg, err := ws.readMessageReserved(dst)
+	ws.releaseMessageBytes()
+	return op, msg, err
+}
+
+func (ws *WSConn) readMessageReserved(dst []byte) (byte, []byte, error) {
 	var msgOpcode byte
 	assembled := dst[:0]
 	inMessage, msgCompressed := false, false
@@ -498,7 +523,7 @@ func (ws *WSConn) ReadMessageInto(dst []byte) (byte, []byte, error) {
 		}
 
 		if opcode >= wsOpClose {
-			payload, err := ws.readFramePayload(nil, b1)
+			payload, err := ws.readFramePayload(nil, b1, false)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -523,7 +548,7 @@ func (ws *WSConn) ReadMessageInto(dst []byte) (byte, []byte, error) {
 		}
 
 		var err error
-		assembled, err = ws.readFramePayload(assembled, b1)
+		assembled, err = ws.readFramePayload(assembled, b1, true)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -628,6 +653,9 @@ func (ws *WSConn) completeMessage(opcode byte, compressed bool, assembled []byte
 		case wsStatusInvalidPayload:
 			ws.closeWithStatus(status)
 			return nil, ErrWebSocketProtocol
+		}
+		if !ws.reserveMessageBytes(len(inflated)) {
+			return nil, errWSBudgetExhausted
 		}
 		assembled = inflated
 	}
@@ -738,7 +766,7 @@ func (ws *WSConn) closeWithPayload(payload []byte) error {
 	return ws.conn.Close()
 }
 
-func (ws *WSConn) readFramePayload(dst []byte, secondByte byte) ([]byte, error) {
+func (ws *WSConn) readFramePayload(dst []byte, secondByte byte, buffered bool) ([]byte, error) {
 	payloadLen := int64(secondByte & 0x7F)
 
 	switch payloadLen {
@@ -770,6 +798,9 @@ func (ws *WSConn) readFramePayload(dst []byte, secondByte byte) ([]byte, error) 
 	start := len(dst)
 	for remaining := payloadLen; remaining > 0; {
 		step := int(min(remaining, max(wsFrameReadChunk, int64(len(dst)-start))))
+		if buffered && !ws.reserveMessageBytes(step) {
+			return nil, errWSBudgetExhausted
+		}
 		dst = slices.Grow(dst, step)
 		if err := ws.readFull(dst[len(dst) : len(dst)+step]); err != nil {
 			return nil, err

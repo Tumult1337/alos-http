@@ -17,8 +17,8 @@ const proxyFixTLSDomain = "redirect.test"
 
 func proxyFixStartTLS(t testing.TB, cfg Config, tune func(*Server)) (srv *Server, httpsAddr, httpAddr string) {
 	t.Helper()
-	httpsAddr = proxyFixFreeAddr(t)
-	httpAddr = proxyFixFreeAddr(t)
+	httpsAddr = freeLoopbackAddr(t)
+	httpAddr = freeLoopbackAddr(t)
 	cfg.Addr = httpsAddr
 	cfg.HTTPAddr = httpAddr
 	if cfg.Listeners == 0 {

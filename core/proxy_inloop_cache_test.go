@@ -17,12 +17,7 @@ import (
 // startCachingProxy brings up a proxy with a response cache configured.
 func startCachingProxy(t *testing.T, cfg DomainConfig, cache ProxyCacheConfig, tune func(*ProxyEngine)) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr: addr, PlainHTTP: true, HTTPAddr: "-",
@@ -94,12 +89,7 @@ func TestInLoopProxyCacheServesSecondRequestFromCache(t *testing.T) {
 func TestInLoopProxyCacheReportsStats(t *testing.T) {
 	var hits atomic.Int64
 	o := cacheCountingOrigin(t, "ok", &hits)
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr: addr, PlainHTTP: true, HTTPAddr: "-",

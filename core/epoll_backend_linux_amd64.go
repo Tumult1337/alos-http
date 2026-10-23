@@ -378,7 +378,12 @@ type epollWorker struct {
 	writeBufs       epollBufStack
 	readScratchBuf  []byte
 	wsWake          atomic.Pointer[wsLoopConn]
+	wsDone          atomic.Pointer[wsLoopConn]
 	wsLive          int
+	wsCallbacks     int
+	inlineWatched   bool
+	inlineWS        atomic.Pointer[wsLoopConn]
+	inlineWSSet     bool
 	inlineRun       atomic.Uint64
 	inlineSeq       uint64
 	inlineRoute     uintptr
@@ -499,7 +504,7 @@ func (s *Server) startEpollWorkers(workers []*epollWorker) (<-chan error, error)
 	for _, worker := range workers {
 		worker.loopErr = errCh
 		if worker.inlineAll || s.Router.hasInlineRoutes() {
-			s.inlineWatch.add(worker)
+			worker.watchInline()
 		}
 		go func() {
 			if err := worker.run(); err != errEpollLoopHandedOff {
@@ -727,6 +732,9 @@ func (w *epollWorker) drainTasks() {
 			if w.takeoverUnpins.Load() != nil {
 				w.runTakeoverUnpins()
 			}
+			if w.wsDone.Load() != nil {
+				w.runWSDone()
+			}
 			if w.wsWake.Load() != nil {
 				w.runWSWakes()
 			}
@@ -861,7 +869,7 @@ func (w *epollWorker) loop() error {
 		w.flushStatsCounters()
 		if w.draining {
 			w.drainForShutdown()
-			if !w.hasClientConns() && w.pool.slotsHeld() == 0 {
+			if !w.hasClientConns() && w.pool.slotsHeld() == 0 && w.wsCallbacks == 0 {
 				return nil
 			}
 		}
@@ -919,7 +927,6 @@ func (w *epollWorker) loop() error {
 				if !w.runInlineQueue() {
 					return errEpollLoopHandedOff
 				}
-				w.inlineRan = true
 			}
 			if w.taskPending.Load() {
 				w.drainTasks()
@@ -1512,7 +1519,7 @@ func (w *epollWorker) readOnce(c *epollConn, peerClosed bool) (readAgain bool) {
 	if !bufferFull || closed || c.fd < 0 || c.lingering {
 		return false
 	}
-	if c.dispatching || c.tunnelPaused {
+	if c.dispatching || c.tunnelPaused || c.wsCallbackPending() {
 		c.readPending = true
 		return false
 	}
@@ -1623,6 +1630,10 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		if !w.flush(c) {
 			return
 		}
+	}
+	if c.wsCallbackPending() {
+		c.peerHup = c.peerHup || closed || peerClosed
+		return
 	}
 	if closed {
 		w.closeConn(c)
@@ -1881,7 +1892,7 @@ func (w *epollWorker) disarmOut(c *epollConn) {
 	if c.inFlight > 0 || c.dispatching {
 		c.deadline = 0
 	} else if c.ws != nil {
-		c.deadline = c.ws.readDeadline
+		c.deadline = c.ws.deadline(false)
 	} else if c.speaksH2() {
 		c.restoreH2Deadline(w)
 	} else if w.idleTO > 0 {

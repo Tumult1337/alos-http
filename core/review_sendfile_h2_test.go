@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -28,12 +27,7 @@ func TestSendFileWorksOnEpollHTTP2(t *testing.T) {
 	}
 	_ = f.Close()
 
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr: addr, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1, Listeners: 1,
 		Certs: []CertConfig{{Domain: "sendfile.test", Source: CertSelfSigned}},

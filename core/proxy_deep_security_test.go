@@ -464,12 +464,7 @@ func TestDeepErrorHookReportsEveryAttempt(t *testing.T) {
 
 func TestDeepPerIPLimitAppliesToProxiedRequests(t *testing.T) {
 	o := newInloopOrigin(t, dpFixed("ok"))
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr: addr, PlainHTTP: true, HTTPAddr: "-",
 		LogRequests: false, MaxConnsPerIP: 2,

@@ -135,12 +135,7 @@ func perfH2WaitPort(tb testing.TB, addr string) {
 
 func perfH2Launch(tb testing.TB, useTLS bool) (string, *Server) {
 	tb.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(tb)
 	srv := New(perfH2ServerConfig(addr, useTLS))
 	perfH2Routes(srv)
 	serve := srv.ListenAndServe

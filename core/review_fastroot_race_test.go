@@ -18,7 +18,7 @@ import (
 const fastRootRaceDuration = 150 * time.Millisecond
 
 func TestFastRootRecomputeWhileServing(t *testing.T) {
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	s := New(Config{Addr: addr, PlainHTTP: true, Listeners: 1, MaxConnsPerIP: -1, HTTPAddr: "-", LogRequests: false})
 	s.Router.GET("/", func(req *Request, resp *Response) { resp.Status(200).String("root") })
 	s.Router.GET("/ping", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
