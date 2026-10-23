@@ -233,6 +233,13 @@ func (sw *epollH1StreamWriter) claimPumpLocked() bool {
 	return true
 }
 
+func (sw *epollH1StreamWriter) completed() bool {
+	sw.mu.Lock()
+	ok := sw.err == nil && !sw.mustClose && sw.framingComplete()
+	sw.mu.Unlock()
+	return ok
+}
+
 func (sw *epollH1StreamWriter) framingComplete() bool {
 	return sw.contentLength == h1NoContentLength || sw.bodyBytes == sw.contentLength
 }
@@ -423,6 +430,7 @@ func (c *epollConn) h1FinishOut(w *epollWorker) {
 	keepAlive := c.h1OutKeepAlive
 	if sw := c.h1Stream; sw != nil {
 		c.h1Stream = nil
+		keepAlive = keepAlive && sw.completed()
 		sw.release()
 	}
 	c.dispatching = false
