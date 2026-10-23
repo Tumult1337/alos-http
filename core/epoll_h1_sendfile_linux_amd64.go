@@ -5,6 +5,7 @@ package core
 import (
 	"io"
 	"os"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -65,16 +66,21 @@ func (sw *epollH1StreamWriter) sendFileRange(file *os.File, start, length int64,
 		sw.w.postTask(sw.pumpFn)
 	}
 	sw.mu.Lock()
-	for sw.err == nil && sw.fileLeft > 0 {
-		sw.space.Wait()
-		if sw.fileNeedIO {
-			sw.warmFileLocked()
-		}
-	}
+	sw.waitFileLocked()
 	err := sw.err
 	sw.fileLeft = 0
 	sw.mu.Unlock()
 	return true, err
+}
+
+func (sw *epollH1StreamWriter) waitFileLocked() {
+	for sw.err == nil && sw.fileLeft > 0 {
+		if sw.fileNeedIO {
+			sw.warmFileLocked()
+			continue
+		}
+		sw.space.Wait()
+	}
 }
 
 func (sw *epollH1StreamWriter) sendFileDetached(h *staticFD, start, length int64) {
@@ -149,6 +155,8 @@ func (c *epollConn) h1SendHeadMore() bool {
 	return true
 }
 
+var h1SealFileColdReads atomic.Uint64
+
 func (c *epollConn) h1SealFile(sw *epollH1StreamWriter) {
 	room := c.h1OutRoom()
 	if room <= 0 {
@@ -168,6 +176,7 @@ func (c *epollConn) h1SealFile(sw *epollH1StreamWriter) {
 			room -= n
 		}
 		if err == unix.EAGAIN {
+			h1SealFileColdReads.Add(1)
 			sw.fileNeedIO = true
 			break
 		}

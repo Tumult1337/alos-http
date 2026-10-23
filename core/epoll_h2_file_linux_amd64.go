@@ -71,9 +71,11 @@ func (sw *epollH2StreamWriter) waitFileLocked() error {
 	sw.armFileStallLocked()
 	mark := sw.file.off
 	for sw.err == nil && sw.file.left > 0 {
-		sw.space.Wait()
-		if sw.file.needIO {
+		switch {
+		case sw.file.needIO:
 			sw.warmFileLocked()
+		case !sw.file.stallFired:
+			sw.space.Wait()
 		}
 		if !sw.file.stallFired {
 			continue

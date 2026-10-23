@@ -192,15 +192,21 @@ func TestH1TLSSealFileColdCacheDeliversIntactBody(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		probe := make([]byte, 4096)
-		_, probeErr := preadvAll(int(f.Fd()), preadTestIovecs(probe), 0, unix.RWF_NOWAIT)
+		_, probeErr := unix.Preadv2(int(f.Fd()), [][]byte{make([]byte, 4096)}, int64(len(content)-4096), unix.RWF_NOWAIT)
 		f.Close()
 		if probeErr != unix.EAGAIN {
+			if os.Getenv("ALOS_REQUIRE_COLD_CACHE") != "" {
+				t.Fatalf("a dropped cache must make RWF_NOWAIT return EAGAIN under /var/tmp: %v", probeErr)
+			}
 			t.Skipf("filesystem under /var/tmp serves RWF_NOWAIT reads from a dropped cache: %v", probeErr)
 		}
+		coldBefore := h1SealFileColdReads.Load()
 		resp, body, err := perfCoreH2FileGet(cl, ts.url("/s/big.bin"), "")
 		if err != nil || resp.StatusCode != 200 || resp.ProtoMajor != 1 || !bytes.Equal(body, content) {
 			t.Fatalf("round %d: err %v len %d equal=%v", round, err, len(body), bytes.Equal(body, content))
+		}
+		if h1SealFileColdReads.Load() == coldBefore {
+			t.Fatalf("round %d: the cold file never hit the RWF_NOWAIT EAGAIN path", round)
 		}
 	}
 }

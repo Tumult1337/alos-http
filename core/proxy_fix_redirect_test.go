@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -39,15 +40,24 @@ func proxyFixStartTLS(t testing.TB, cfg Config, tune func(*Server)) (srv *Server
 		if !proxyFixTLSHandshakeOK(httpsAddr) {
 			return false
 		}
-		c, err := net.DialTimeout("tcp", httpAddr, proxyFixStep)
-		if err != nil {
-			return false
-		}
-		_ = c.Close()
-		return true
+		return proxyFixRedirectRoundTrip(httpAddr)
 	})
 	proxyFixEventually(t, "probe connections released", func() bool { return srv.activeConns.Load() == 0 })
 	return srv, httpsAddr, httpAddr
+}
+
+func proxyFixRedirectRoundTrip(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, proxyFixStep)
+	if err != nil {
+		return false
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(proxyFixIOTimeout))
+	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+proxyFixTLSDomain+"\r\n\r\n"); err != nil {
+		return false
+	}
+	_, err = io.Copy(io.Discard, c)
+	return err == nil
 }
 
 func proxyFixTLSHandshakeOK(addr string) bool {
@@ -95,8 +105,21 @@ func TestProxyFixRedirectFloodCannotStarveHTTPS(t *testing.T) {
 
 const proxyFixRedirectPerIP = 3
 
+func proxyFixIPSlotsHeld(srv *Server, ip string) int64 {
+	limiter := srv.perIPConnLimiter.Load()
+	if limiter == nil {
+		return 0
+	}
+	counter, ok := limiter.m.Load(ip)
+	if !ok {
+		return 0
+	}
+	return counter.n.Load()
+}
+
 func TestProxyFixRedirectEnforcesPerIPLimit(t *testing.T) {
-	_, _, httpAddr := proxyFixStartTLS(t, Config{MaxConnsPerIP: proxyFixRedirectPerIP}, nil)
+	srv, _, httpAddr := proxyFixStartTLS(t, Config{MaxConnsPerIP: proxyFixRedirectPerIP}, nil)
+	proxyFixEventually(t, "readiness probe released its per-IP slot", func() bool { return proxyFixIPSlotsHeld(srv, "127.0.0.1") == 0 })
 	total := proxyFixRedirectPerIP + 1
 	conns := proxyFixOpenStalled(t, httpAddr, total)
 	closedByServer := make(chan bool, total)
@@ -115,8 +138,8 @@ func TestProxyFixRedirectEnforcesPerIPLimit(t *testing.T) {
 		}
 	}
 	held := total - closed
-	if closed < 1 || held < proxyFixRedirectPerIP-1 || held > proxyFixRedirectPerIP {
-		t.Fatalf("%d of %d connections from one IP to the redirect listener were held open; MaxConnsPerIP=%d admits %d, or %d when the startup probe still holds a slot",
-			held, total, proxyFixRedirectPerIP, proxyFixRedirectPerIP, proxyFixRedirectPerIP-1)
+	if held != proxyFixRedirectPerIP {
+		t.Fatalf("%d of %d connections from one IP to the redirect listener were held open, want MaxConnsPerIP=%d",
+			held, total, proxyFixRedirectPerIP)
 	}
 }
