@@ -202,7 +202,7 @@ func TestQUICFixPTOAfterPartialAckRecoversOnlyLivePackets(t *testing.T) {
 		ls.sent[quicSpaceAppData][i].sent -= int64(10 * time.Second)
 	}
 	ls.mu.Unlock()
-	frames := ls.ptoExpiredFrames(quicSpaceAppData)
+	frames := ls.ptoExpiredFrames(quicSpaceAppData, 0)
 	if len(frames) != 7 {
 		t.Fatalf("PTO recovered %d packets, want the 7 that were never acked", len(frames))
 	}

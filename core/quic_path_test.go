@@ -257,7 +257,7 @@ func TestQUICUnvalidatedPathHonoursAmplificationLimit(t *testing.T) {
 		p.qc.writeMu.Lock()
 		p.qc.drainCoalescedLocked()
 		p.qc.writeMu.Unlock()
-		for _, frames := range p.qc.loss.ptoExpiredFrames(quicSpaceAppData) {
+		for _, frames := range p.qc.loss.ptoExpiredFrames(quicSpaceAppData, 0) {
 			p.qc.sendFrames(quicSpaceAppData, frames, true)
 		}
 		turbo.Sleep(5 * time.Millisecond)

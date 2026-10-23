@@ -19,6 +19,7 @@ const (
 	quicPktThreshold     = 3
 	quicTimeThreshold    = 9.0 / 8.0
 	quicMaxTrackedSent   = 16384
+	quicPTOProbePackets  = 2
 )
 
 const quicSendTimeLogEntries = 128
@@ -208,7 +209,9 @@ func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay tim
 
 	ls.compactIfMostlyRemoved(space)
 
-	ls.ptoCount = 0
+	if tally.anyAcked {
+		ls.ptoCount = 0
+	}
 	first := ls.nextLive(space, 0)
 	return first < len(ls.sent[space]) && int64(ls.sent[space][first].pn) <= ls.largestAcked[space], nil
 }
@@ -412,7 +415,14 @@ func (ls *quicLossState) resetForNewPath() {
 }
 
 func (ls *quicLossState) ptoTimeout() time.Duration {
-	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity) + ls.peerMaxAckDelay
+	return ls.ptoPeriod(quicSpaceAppData)
+}
+
+func (ls *quicLossState) ptoPeriod(space int) time.Duration {
+	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity)
+	if space == quicSpaceAppData {
+		pto += ls.peerMaxAckDelay
+	}
 	return pto * time.Duration(1<<uint(ls.ptoCount))
 }
 
@@ -455,27 +465,29 @@ func (ls *quicLossState) largestAckedPN(space int) int64 {
 	return v
 }
 
-func (ls *quicLossState) ptoExpiredFrames(space int) [][]byte {
+func (ls *quicLossState) ptoExpiredFrames(space, limit int) [][]byte {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
 	first := ls.nextLive(space, 0)
 	if first == len(ls.sent[space]) {
 		return nil
 	}
-	pto := ls.ptoTimeout()
+	pto := ls.ptoPeriod(space)
 	cutoff := turbo.Now() - int64(pto)
 	if ls.sent[space][first].sent >= cutoff {
 		return nil
 	}
 
 	var frames [][]byte
+	taken := 0
 	remaining := ls.sent[space][:0]
 	for i := range ls.sent[space] {
 		sp := &ls.sent[space][i]
 		if sp.removed {
 			continue
 		}
-		if sp.ackElicit && sp.sent < cutoff {
+		if sp.ackElicit && sp.sent < cutoff && (limit == 0 || taken < limit) {
+			taken++
 			if sp.inFlight {
 				ls.bytesInFlight -= sp.size
 			}

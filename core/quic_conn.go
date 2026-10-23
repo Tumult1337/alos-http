@@ -1949,6 +1949,20 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	}
 }
 
+func (qc *QUICConn) probeHandshakeSpaces() {
+	for space := quicSpaceInitial; space <= quicSpaceHandshake; space++ {
+		qc.writeMu.Lock()
+		allowed := qc.addressValidated.Load() || qc.ampBudgetLocked() >= quicMaxPacketSize
+		qc.writeMu.Unlock()
+		if !allowed {
+			continue
+		}
+		for _, frames := range qc.loss.ptoExpiredFrames(space, quicPTOProbePackets) {
+			qc.retransmitFrames(space, frames)
+		}
+	}
+}
+
 func (qc *QUICConn) retransmitFrames(space int, frames []byte) {
 	qc.sendFrames(space, frames, true)
 }
