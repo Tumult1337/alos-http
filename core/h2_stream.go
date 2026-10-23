@@ -62,6 +62,7 @@ type H2Stream struct {
 	inlineSeq uint64
 	handler   HandlerFunc
 	route     *inlineRoute
+	waitBody  *h2BodyIn
 }
 
 // Reset clears an H2Stream so it can be reused from a pool.
@@ -108,4 +109,8 @@ func (s *H2Stream) Reset() {
 	s.conn = nil
 	s.handler = nil
 	s.route = nil
+	if s.waitBody != nil {
+		s.waitBody.reader.abort(ErrBodyStreamAborted)
+		s.waitBody = nil
+	}
 }

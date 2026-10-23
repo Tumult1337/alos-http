@@ -2,6 +2,8 @@ module github.com/guno1928/alos-http
 
 go 1.26.9
 
+toolchain go1.26.10
+
 require (
 	filippo.io/edwards25519 v1.2.0
 	github.com/andybalholm/brotli v1.2.1

@@ -122,6 +122,12 @@ var timeNow = time.Now
 //
 // H2MaxConcurrentStreams is the maximum number of concurrently active streams on one HTTP/2 connection; 0 uses the protocol default.
 //
+// H2MaxRunningHandlers caps the handlers that run at the same time on one HTTP/2 connection, inline or on the handler pool.
+// A new stream also waits while the connection holds MaxPendingWriteBytes of unsent response bytes. Waiting streams start
+// in arrival order. 0 or a negative value applies a default of 32; a value above the stream limit uses the stream limit.
+//
+//	Example: H2MaxRunningHandlers: 16.
+//
 // H2InitialWindowSize is the HTTP/2 per-stream receive window advertised to clients; 0 uses the protocol default.
 //
 // H2MaxFrameSize is the largest HTTP/2 frame accepted from clients; 0 uses the protocol default.
@@ -298,6 +304,7 @@ type Config struct {
 	H2InitialWindowSize    uint32
 	H2MaxFrameSize         uint32
 	H2HeaderTableSize      uint32
+	H2MaxRunningHandlers   int
 
 	QUICMaxData           int64
 	QUICMaxStreamData     int64
@@ -423,6 +430,16 @@ func (s *Server) requestBodyTooLarge(n int) bool {
 
 func (s *Server) h2MaxStreams() uint32 {
 	return defaultUint32(s.config.H2MaxConcurrentStreams, H2MaxConcurrentStream)
+}
+
+const h2DefaultMaxRunningHandlers = 32
+
+func (s *Server) h2MaxRunningHandlers() int {
+	value := s.config.H2MaxRunningHandlers
+	if value <= 0 {
+		value = h2DefaultMaxRunningHandlers
+	}
+	return min(value, int(s.h2MaxStreams()))
 }
 
 func (s *Server) h2InitialWindow() uint32 {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/turbo"
@@ -32,6 +33,10 @@ type BodyReader struct {
 
 	uploadConn   *ConnectionLimiter
 	uploadGlobal *GlobalLimiter
+
+	budget     *Server
+	budgetConn *atomic.Int64
+	held       int64
 
 	deadlineAt    int64
 	deadlineHit   bool
@@ -70,8 +75,10 @@ func (b *BodyReader) Read(p []byte) (int, error) {
 		b.buf, b.off = b.buf[:0], 0
 	}
 	b.unacked += n
+	released := b.releaseHeldLocked(int64(n))
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
+	b.budget.releaseConnBodyBytes(b.budgetConn, released)
 	if b.uploadConn != nil || b.uploadGlobal != nil {
 		throttleUploadBytes(b.uploadConn, b.uploadGlobal, int64(n))
 	}
@@ -90,9 +97,11 @@ func (b *BodyReader) Close() error {
 	b.closed = true
 	b.unacked += len(b.buf) - b.off
 	b.buf, b.off = nil, 0
+	released := b.releaseHeldLocked(b.held)
 	b.stopDeadlineLocked()
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
+	b.budget.releaseConnBodyBytes(b.budgetConn, released)
 	if notify {
 		b.onAck()
 	}
@@ -154,20 +163,63 @@ func (b *BodyReader) claimAckLocked() bool {
 }
 
 func (b *BodyReader) push(data []byte) {
+	b.pushReserved(data, 0)
+}
+
+func (b *BodyReader) chargeBudget(srv *Server, conn *atomic.Int64) {
+	b.budget, b.budgetConn = srv, conn
+}
+
+func (b *BodyReader) reservePush(data []byte) bool {
+	if b.budget == nil {
+		b.push(data)
+		return true
+	}
+	if !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
+		return false
+	}
+	if !b.pushReserved(data, int64(len(data))) {
+		b.budget.releaseConnBodyBytes(b.budgetConn, int64(len(data)))
+	}
+	return true
+}
+
+func (b *BodyReader) pushReserved(data []byte, reserved int64) bool {
 	b.mu.Lock()
 	b.received += int64(len(data))
 	if b.closed {
 		b.unacked += len(data)
 		b.mu.Unlock()
-		return
+		return false
 	}
 	if b.off > 0 && b.off >= len(b.buf)/2 {
 		b.buf = b.buf[:copy(b.buf, b.buf[b.off:])]
 		b.off = 0
 	}
 	b.buf = append(b.buf, data...)
+	b.held += reserved
 	b.ready.Broadcast()
 	b.mu.Unlock()
+	return true
+}
+
+func (b *BodyReader) releaseHeldLocked(n int64) int64 {
+	n = min(n, b.held)
+	b.held -= n
+	return n
+}
+
+func (b *BodyReader) abort(err error) {
+	b.mu.Lock()
+	if !b.eof && b.err == nil {
+		b.err = err
+	}
+	b.buf, b.off = nil, 0
+	b.closed = true
+	released := b.releaseHeldLocked(b.held)
+	b.ready.Broadcast()
+	b.mu.Unlock()
+	b.budget.releaseConnBodyBytes(b.budgetConn, released)
 }
 
 func (b *BodyReader) finish(err error) {

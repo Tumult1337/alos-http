@@ -46,8 +46,10 @@ type tlsWorkerH2State struct {
 	headerAccum        []byte
 	headersBuf         [][2]string
 
-	sending map[uint32]*H2Stream
-	busy    *H2Stream
+	sending   map[uint32]*H2Stream
+	busy      *H2Stream
+	waiting   []*H2Stream
+	admitting bool
 
 	rstCount     int
 	rstWindow    int64
@@ -98,6 +100,7 @@ func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
 			delete(st.sending, id)
 		}
 	}
+	st.releaseWaiting()
 	st.initialWindowSize = H2DefaultWindowSize
 	st.maxFrameSize = H2DefaultMaxFrameSize
 	st.connWindow = int64(H2DefaultWindowSize)
@@ -370,6 +373,34 @@ func (st *tlsWorkerH2State) cancelBusyStream(id uint32, cause error) *H2Stream {
 	s.abandoned = true
 	s.cancel.cancel(cause)
 	return s
+}
+
+func (st *tlsWorkerH2State) findWaiting(id uint32) (int, *H2Stream) {
+	for i, s := range st.waiting {
+		if s.ID == id {
+			return i, s
+		}
+	}
+	return -1, nil
+}
+
+func (st *tlsWorkerH2State) removeWaiting(i int) *H2Stream {
+	stream := st.waiting[i]
+	last := len(st.waiting) - 1
+	copy(st.waiting[i:], st.waiting[i+1:])
+	st.waiting[last] = nil
+	st.waiting = st.waiting[:last]
+	return stream
+}
+
+func (st *tlsWorkerH2State) releaseWaiting() {
+	for i, stream := range st.waiting {
+		st.waiting[i] = nil
+		stream.Reset()
+		StreamPool.Put(stream)
+	}
+	st.waiting = st.waiting[:0]
+	st.admitting = false
 }
 
 func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
