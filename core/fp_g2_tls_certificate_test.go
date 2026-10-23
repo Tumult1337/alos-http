@@ -66,6 +66,7 @@ func TestFPTLS13CertificateRejectsMalformedChain(t *testing.T) {
 		{"extensions past list", wrap(rawList([]byte{0, 0, 1, 0x30, 0, 9}))},
 		{"missing extensions length", wrap(rawList([]byte{0, 0, 1, 0x30}))},
 		{"context past body", []byte{5, 0}},
+		{"non-empty request context", append([]byte{1, 7}, rawList(withLen([]byte{0x30}, nil))...)},
 	} {
 		tr := &tlsTransport{skipVerify: true, version: 0x0304, state: tlsExpectEncrypted}
 		if err := tr.handleEncryptedHandshake(nil, append(append([]byte(nil), fpFixEE13...), fpFixHandshakeMsg(tlsHSCertificate, tc.body)...)); err == nil {

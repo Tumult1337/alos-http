@@ -276,3 +276,19 @@ func TestProxyTLSTunnelIdleClientIsReaped(t *testing.T) {
 		t.Fatalf("idle TLS tunnel was not closed within %v: %v", proxyG2TunnelReap, err)
 	}
 }
+
+func TestProxyTunnelIdleAfterClientBytesUsesIdleTimeout(t *testing.T) {
+	for _, headerTimeout := range []time.Duration{-1, time.Hour} {
+		o := newProxyG2TunnelOrigin(t, false)
+		_, addr := proxyFixStart(t, Config{IdleTimeout: proxyG2TunnelIdle, ReadHeaderTimeout: headerTimeout}, proxyFixSingleBackend(o.ln.Addr().String()), nil)
+		c := proxyFixTunnelUpgrade(t, addr)
+		if _, err := c.Write([]byte{'c'}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		proxyFixEventually(t, "client byte reaches the backend", func() bool { return o.received.Load() == 1 })
+		if _, err := proxyG2ReadUntilClosed(c, proxyG2TunnelReap); !errors.Is(err, io.EOF) {
+			t.Fatalf("ReadHeaderTimeout %v: tunnel idle after a client byte was not closed within %v: %v", headerTimeout, proxyG2TunnelReap, err)
+		}
+		_ = c.Close()
+	}
+}

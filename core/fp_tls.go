@@ -523,10 +523,10 @@ func (t *tlsTransport) certVerifyContent() []byte {
 func (t *tlsTransport) parseCertificate(body []byte) error {
 	p := 0
 	if t.version != tlsLegacyVersion12 {
-		if len(body) < 1 {
+		if len(body) < 1 || body[0] != 0 {
 			return errTLS
 		}
-		p = 1 + int(body[0])
+		p = 1
 	}
 	if p+3 > len(body) {
 		return errTLS
