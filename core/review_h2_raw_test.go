@@ -17,16 +17,19 @@ type h2RawFrame struct {
 	flags    byte
 	streamID uint32
 	payload  []byte
+	fields   [][2]string
+	fieldErr error
 }
 
 type h2RawConn struct {
 	t    *testing.T
 	conn net.Conn
+	dec  *HpackDecoder
 }
 
 func startPlainH2Server(t *testing.T) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr:          addr,
 		PlainHTTP:     true,
@@ -52,6 +55,16 @@ func h2RawDial(t *testing.T, addr string, settings []byte) *h2RawConn {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
+	return h2RawStart(t, conn, settings)
+}
+
+func h2RawDialRecvBuf(t *testing.T, addr string, settings []byte, recvBuf int) *h2RawConn {
+	t.Helper()
+	return h2RawStart(t, dialTCPRecvBuf(t, addr, 2*time.Second, recvBuf), settings)
+}
+
+func h2RawStart(t *testing.T, conn net.Conn, settings []byte) *h2RawConn {
+	t.Helper()
 	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
 	rc := &h2RawConn{t: t, conn: conn}
 	if _, err := conn.Write(H2ClientPreface[:]); err != nil {
@@ -103,6 +116,12 @@ func (rc *h2RawConn) tryRead() (h2RawFrame, error) {
 			return h2RawFrame{}, err
 		}
 	}
+	if f.typ == H2FrameHeaders {
+		if rc.dec == nil {
+			rc.dec = NewHpackDecoder()
+		}
+		f.fields, f.fieldErr = rc.dec.DecodeInto(nil, f.payload)
+	}
 	return f, nil
 }
 
@@ -126,8 +145,17 @@ func (rc *h2RawConn) awaitStreamOutcome(streamID uint32) (h2RawFrame, error) {
 
 func h2RawStatusFromHeaders(t *testing.T, block []byte) int {
 	t.Helper()
-	dec := NewHpackDecoder()
-	hdrs, err := dec.Decode(block)
+	hdrs, err := NewHpackDecoder().Decode(block)
+	return h2RawStatusField(t, hdrs, err)
+}
+
+func (f h2RawFrame) status(t *testing.T) int {
+	t.Helper()
+	return h2RawStatusField(t, f.fields, f.fieldErr)
+}
+
+func h2RawStatusField(t *testing.T, hdrs [][2]string, err error) int {
+	t.Helper()
 	if err != nil {
 		t.Fatalf("decode response headers: %v", err)
 	}
@@ -161,7 +189,7 @@ func TestH2PeerHeaderTableSizeDoesNotShrinkServerDecoder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request: %v", err)
 	}
-	if f.typ != H2FrameHeaders || h2RawStatusFromHeaders(t, f.payload) != 200 {
+	if f.typ != H2FrameHeaders || f.status(t) != 200 {
 		t.Fatalf("first request: frame type %d, want 200 HEADERS", f.typ)
 	}
 
@@ -174,7 +202,7 @@ func TestH2PeerHeaderTableSizeDoesNotShrinkServerDecoder(t *testing.T) {
 	if f.typ != H2FrameHeaders {
 		t.Fatalf("second request referencing the dynamic table got frame type %d: the peer's SETTINGS_HEADER_TABLE_SIZE was applied to the server's own decoder", f.typ)
 	}
-	if st := h2RawStatusFromHeaders(t, f.payload); st != 200 {
+	if st := f.status(t); st != 200 {
 		t.Fatalf("second request status = %d", st)
 	}
 }

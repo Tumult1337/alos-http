@@ -252,12 +252,12 @@ func TestQUICUnvalidatedPathHonoursAmplificationLimit(t *testing.T) {
 	}
 	challenge := p.lastChallengeTo(pathB)
 	p.sendFrom(pathB, 1200, pathResponseFrame(challenge))
-	for i := 0; i < 400 && p.finCountTo(pathB) == 0; i++ {
+	for i := 0; i < 400 && (p.finCountTo(pathB) == 0 || p.streamBytesTo(pathB, 0) < 60<<10); i++ {
 		p.ackAllFrom(pathB)
 		p.qc.writeMu.Lock()
 		p.qc.drainCoalescedLocked()
 		p.qc.writeMu.Unlock()
-		for _, frames := range p.qc.loss.ptoExpiredFrames(quicSpaceAppData) {
+		for _, frames := range p.qc.loss.ptoExpiredFrames(quicSpaceAppData, 0) {
 			p.qc.sendFrames(quicSpaceAppData, frames, true)
 		}
 		turbo.Sleep(5 * time.Millisecond)
@@ -265,17 +265,21 @@ func TestQUICUnvalidatedPathHonoursAmplificationLimit(t *testing.T) {
 	if p.finCountTo(pathB) == 0 {
 		t.Fatal("response never completed on the validated new path")
 	}
+	if body := p.streamBytesTo(pathB, 0); body < 60<<10 {
+		t.Fatalf("delivered %d response bytes, want at least %d", body, 60<<10)
+	}
+}
+
+func (p *quicTestPeer) streamBytesTo(addr netip.AddrPort, streamID uint64) int {
 	body := 0
-	for _, v := range p.packetsTo(pathB) {
+	for _, v := range p.packetsTo(addr) {
 		for _, s := range v.frames.streams {
-			if s.streamID == 0 {
+			if s.streamID == streamID {
 				body += len(s.data)
 			}
 		}
 	}
-	if body < 60<<10 {
-		t.Fatalf("delivered %d response bytes, want at least %d", body, 60<<10)
-	}
+	return body
 }
 
 func (p *quicTestPeer) finCountTo(addr netip.AddrPort) int {

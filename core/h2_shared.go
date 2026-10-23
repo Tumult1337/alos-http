@@ -19,6 +19,12 @@ const (
 	h2GoAwayMinPayload   = 8
 	h2MaxRequestFields   = 128
 
+	h2ParkedBytesHardFactor = 8
+
+	h2FrameHeaderLen    = 9
+	h2SealedDataMax     = MaxRecordPayload - 1 - h2FrameHeaderLen
+	h2DirectSealMinBody = H2DefaultMaxFrameSize
+
 	h2StatusHeaderListTooLarge = 431
 )
 
@@ -40,17 +46,30 @@ type tlsWorkerH2State struct {
 	headerAccum        []byte
 	headersBuf         [][2]string
 
-	sending map[uint32]*H2Stream
-	busy    *H2Stream
+	sending   map[uint32]*H2Stream
+	busy      *H2Stream
+	waiting   []*H2Stream
+	admitting bool
 
 	rstCount     int
 	rstWindow    int64
 	sendingBytes int64
+	parkedBytes  int64
 	ctrlCount    int
 	ctrlWindow   int64
 
 	peerGoingAway bool
 	bodyReserved  atomic.Int64
+
+	encTable hpackEncTable
+
+	sealBatch     bool
+	sealedOut     []byte
+	sealedBacklog int
+	directSent    uint64
+	doneHead      *H2Stream
+	doneTail      *H2Stream
+	doneConnNext  *epollConn
 }
 
 func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
@@ -81,6 +100,7 @@ func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
 			delete(st.sending, id)
 		}
 	}
+	st.releaseWaiting()
 	st.initialWindowSize = H2DefaultWindowSize
 	st.maxFrameSize = H2DefaultMaxFrameSize
 	st.connWindow = int64(H2DefaultWindowSize)
@@ -102,9 +122,11 @@ func (st *tlsWorkerH2State) init(tableSize uint32, headerListLimit int) {
 	st.rstCount = 0
 	st.rstWindow = 0
 	st.sendingBytes = 0
+	st.parkedBytes = 0
 	st.ctrlCount = 0
 	st.ctrlWindow = 0
 	st.peerGoingAway = false
+	st.encTable.reset()
 }
 
 func (st *tlsWorkerH2State) countReset() bool {
@@ -149,59 +171,32 @@ func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 	return appendH2WindowUpdateFrame(dst, 0, uint32(H2ConnectionWindowSize-H2DefaultWindowSize))
 }
 
-func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uint32, maxFrame int) []byte {
-	maxFrame = h2ResponseFrameLimit(maxFrame)
-	off := len(dst)
-	if len(fast.framed) > 0 {
-		dst = append(dst, fast.framed...)
-		dst[off+5] = byte(streamID >> 24)
-		dst[off+6] = byte(streamID >> 16)
-		dst[off+7] = byte(streamID >> 8)
-		dst[off+8] = byte(streamID)
-		if fast.dataFrameOff >= 0 {
-			dataOff := off + fast.dataFrameOff
-			dst[dataOff+5] = byte(streamID >> 24)
-			dst[dataOff+6] = byte(streamID >> 16)
-			dst[dataOff+7] = byte(streamID >> 8)
-			dst[dataOff+8] = byte(streamID)
-		}
-		return dst
-	}
-	if len(fast.body) == 0 {
-		return appendH2ResponseHeaderBlock(dst, streamID, H2FlagEndStream, fast.headerPayload, maxFrame)
-	}
-	dst = appendH2ResponseHeaderBlock(dst, streamID, 0, fast.headerPayload, maxFrame)
-	remaining := fast.body
-	for len(remaining) > 0 {
-		chunk := remaining
-		if len(chunk) > maxFrame {
-			chunk = chunk[:maxFrame]
-		}
-		flags := byte(0)
-		if len(chunk) == len(remaining) {
-			flags = H2FlagEndStream
-		}
-		dst = appendH2Frame(dst, H2FrameData, flags, streamID, chunk)
-		remaining = remaining[len(chunk):]
-	}
-	return dst
-}
-
-func appendH2StatusOnlyResponse(dst []byte, streamID uint32, status int, serverName string, maxFrame int) []byte {
+func appendH2StatusOnlyResponseIndexed(dst []byte, streamID uint32, status int, serverName string, tbl *hpackEncTable, maxFrame int) []byte {
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, nil)}
-	encodeH2ResponseHeaders(&enc, status, "", 0, nil, serverName)
+	encodeH2ResponseHeadersIndexed(&enc, tbl, status, "", 0, nil, serverName)
 	return finishH2ResponseHeaderBlock(enc.Buf, off, maxFrame)
 }
 
-func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, endStream bool, maxFrame int) []byte {
+func appendH2HeaderBlockFrame(dst []byte, streamID uint32, flags byte, tbl *hpackEncTable, block []byte, maxFrame int) []byte {
+	if !tbl.pendingUpdate {
+		return appendH2ResponseHeaderBlock(dst, streamID, flags, block, maxFrame)
+	}
+	off := len(dst)
+	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
+	tbl.beginBlock(&enc)
+	enc.Buf = append(enc.Buf, block...)
+	return finishH2ResponseHeaderBlock(enc.Buf, off, maxFrame)
+}
+
+func appendH2ResponseHeadersFrameIndexed(dst []byte, streamID uint32, resp *Response, endStream bool, tbl *hpackEncTable, serverName string, maxFrame int) []byte {
 	flags := byte(H2FlagEndHeaders)
 	if endStream {
 		flags |= H2FlagEndStream
 	}
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, flags, streamID, nil)}
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, respServerName(resp))
+	encodeH2ResponseHeadersIndexed(&enc, tbl, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, serverName)
 	return finishH2ResponseHeaderBlock(enc.Buf, off, maxFrame)
 }
 
@@ -336,9 +331,38 @@ func (st *tlsWorkerH2State) cancelBusyStream(id uint32, cause error) *H2Stream {
 	return s
 }
 
+func (st *tlsWorkerH2State) findWaiting(id uint32) (int, *H2Stream) {
+	for i, s := range st.waiting {
+		if s.ID == id {
+			return i, s
+		}
+	}
+	return -1, nil
+}
+
+func (st *tlsWorkerH2State) removeWaiting(i int) *H2Stream {
+	stream := st.waiting[i]
+	last := len(st.waiting) - 1
+	copy(st.waiting[i:], st.waiting[i+1:])
+	st.waiting[last] = nil
+	st.waiting = st.waiting[:last]
+	return stream
+}
+
+func (st *tlsWorkerH2State) releaseWaiting() {
+	for i, stream := range st.waiting {
+		st.waiting[i] = nil
+		stream.Reset()
+		StreamPool.Put(stream)
+	}
+	st.waiting = st.waiting[:0]
+	st.admitting = false
+}
+
 func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
 	delete(st.sending, id)
 	st.sendingBytes -= int64(stream.stallBytes)
+	st.parkedBytes -= int64(stream.parkedBytes)
 	stream.Reset()
 	StreamPool.Put(stream)
 }
@@ -346,12 +370,26 @@ func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
 func appendH2Frame(dst []byte, typ, flags byte, streamID uint32, payload []byte) []byte {
 	pLen := len(payload)
 	off := len(dst)
-	needed := off + 9 + pLen
+	needed := off + h2FrameHeaderLen + pLen
 	if cap(dst) < needed {
-		dst = slices.Grow(dst, 9+pLen)
+		dst = slices.Grow(dst, h2FrameHeaderLen+pLen)
 	}
 	dst = dst[:needed]
-	frame := dst[off:]
+	putH2FrameHeader(dst[off:], typ, flags, streamID, pLen)
+	if pLen > 0 {
+		copy(dst[off+h2FrameHeaderLen:], payload)
+	}
+	return dst
+}
+
+func appendH2FrameHeader(dst []byte, typ, flags byte, streamID uint32, pLen int) []byte {
+	off := len(dst)
+	dst = slices.Grow(dst, h2FrameHeaderLen)[:off+h2FrameHeaderLen]
+	putH2FrameHeader(dst[off:], typ, flags, streamID, pLen)
+	return dst
+}
+
+func putH2FrameHeader(frame []byte, typ, flags byte, streamID uint32, pLen int) {
 	_ = frame[8]
 	frame[0] = byte(pLen >> 16)
 	frame[1] = byte(pLen >> 8)
@@ -362,8 +400,4 @@ func appendH2Frame(dst []byte, typ, flags byte, streamID uint32, payload []byte)
 	frame[6] = byte(streamID >> 16)
 	frame[7] = byte(streamID >> 8)
 	frame[8] = byte(streamID)
-	if pLen > 0 {
-		copy(frame[9:], payload)
-	}
-	return dst
 }

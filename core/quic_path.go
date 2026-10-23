@@ -13,6 +13,7 @@ import (
 
 const (
 	quicPathChallengeLen       = 8
+	quicPathFrameLen           = 1 + quicPathChallengeLen
 	quicPathProbeDatagram      = quicMinInitialDatagram
 	quicPathValidationPTOs     = 3
 	quicMaxPathChallenges      = 3
@@ -22,6 +23,31 @@ const (
 	quicAmplificationFactor    = 3
 	quicShortHeaderMaxOverhead = 1 + quicMaxCIDLen + quicMaxPNLen + quicAEADTagLen
 )
+
+type quicOffPathBudget struct {
+	addr     netip.AddrPort
+	received uint64
+	sent     uint64
+}
+
+func (b *quicOffPathBudget) credit(addr netip.AddrPort, size int) {
+	if b.addr != addr {
+		*b = quicOffPathBudget{addr: addr}
+	}
+	b.received += uint64(size)
+}
+
+func (b *quicOffPathBudget) remaining() int {
+	limit := quicAmplificationFactor * b.received
+	if b.sent >= limit {
+		return 0
+	}
+	return int(limit - b.sent)
+}
+
+func (b *quicOffPathBudget) allows(size int) bool {
+	return b.sent+uint64(size) <= quicAmplificationFactor*b.received
+}
 
 type quicPathProbe struct {
 	addr       netip.AddrPort
@@ -73,9 +99,27 @@ func (qc *QUICConn) initPath(addr net.Addr) {
 func (qc *QUICConn) notePacketSource(from netip.AddrPort, size int) {
 	qc.rxFrom = from
 	qc.rxLen = size
-	if !qc.addressValidated.Load() && (!from.IsValid() || from == qc.receivePath()) {
-		qc.bytesReceived.Add(uint64(size))
+	if !from.IsValid() || from == qc.receivePath() {
+		if !qc.addressValidated.Load() {
+			qc.bytesReceived.Add(uint64(size))
+		}
+		return
 	}
+	qc.writeMu.Lock()
+	qc.offPath.credit(from, size)
+	qc.writeMu.Unlock()
+}
+
+func (qc *QUICConn) creditDiscardedDatagram(from netip.AddrPort, size int) {
+	if from == qc.currentPath() {
+		if !qc.addressValidated.Load() {
+			qc.bytesReceived.Add(uint64(size))
+		}
+		return
+	}
+	qc.writeMu.Lock()
+	qc.offPath.credit(from, size)
+	qc.writeMu.Unlock()
 }
 
 func (qc *QUICConn) receivePath() netip.AddrPort {
@@ -144,13 +188,19 @@ func (qc *QUICConn) migrateTo(from netip.AddrPort) {
 
 	qc.writeMu.Lock()
 	qc.setSendPathLocked(from)
-	if returning {
+	switch {
+	case returning:
 		qc.addressValidated.Store(true)
-	} else {
+	case qc.offPath.addr == from:
+		qc.addressValidated.Store(false)
+		qc.bytesSent.Store(qc.offPath.sent)
+		qc.bytesReceived.Store(qc.offPath.received)
+	default:
 		qc.addressValidated.Store(false)
 		qc.bytesSent.Store(0)
 		qc.bytesReceived.Store(uint64(qc.rxLen))
 	}
+	qc.offPath = quicOffPathBudget{}
 	qc.writeMu.Unlock()
 
 	if returning {
@@ -196,16 +246,29 @@ func (qc *QUICConn) sendPathChallenge() {
 }
 
 func (qc *QUICConn) handlePathChallenge(data [quicPathChallengeLen]byte) {
-	frame := quicAppendPathFrame(nil, quicFramePathResponse, data)
+	qc.pathResponses = quicAppendPathFrame(qc.pathResponses, quicFramePathResponse, data)
+}
+
+func (qc *QUICConn) flushPathResponses() {
+	responses := qc.pathResponses
+	if len(responses) == 0 {
+		return
+	}
+	qc.pathResponses = responses[:0]
 	from := qc.rxFrom
 	qc.writeMu.Lock()
 	defer qc.writeMu.Unlock()
-	if !from.IsValid() || from == qc.currentPath() {
-		qc.sendFramesToLocked(quicSpaceAppData, quicPadProbe(frame, qc.ampBudgetLocked()-len(qc.pendingAck[quicSpaceAppData]), qc.dstCIDLen), false, nil)
-		return
+	chunkLen := qc.pktBudget - qc.pktBudget%quicPathFrameLen
+	onPath := !from.IsValid() || from == qc.currentPath()
+	for len(responses) > 0 {
+		chunk := responses[:min(len(responses), chunkLen)]
+		responses = responses[len(chunk):]
+		if onPath {
+			qc.sendFramesToLocked(quicSpaceAppData, quicPadProbe(chunk, qc.ampBudgetLocked()-len(qc.pendingAck[quicSpaceAppData]), qc.dstCIDLen), false, nil)
+			continue
+		}
+		qc.sendFramesToLocked(quicSpaceAppData, quicPadProbe(chunk, qc.offPath.remaining(), qc.dstCIDLen), false, &qc.offPath)
 	}
-	budget := quicAmplificationFactor * qc.rxLen
-	qc.sendFramesToLocked(quicSpaceAppData, quicPadProbe(frame, budget, qc.dstCIDLen), false, net.UDPAddrFromAddrPort(from))
 }
 
 func (qc *QUICConn) handlePathResponse(data [quicPathChallengeLen]byte) {

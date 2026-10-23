@@ -3,18 +3,14 @@
 package core
 
 import (
-	"compress/flate"
-	"compress/gzip"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -431,11 +427,11 @@ func SecurityHeaders(cfg SecurityHeadersConfig) MiddlewareFunc {
 
 // CompressConfig controls response compression.
 //
-// Level is the gzip/deflate compression level from 1 (fastest) to 9 (smallest); values outside 1–9 fall back to 6.
+// Level is the gzip/deflate compression level from 1 (fastest) to 9 (smallest); values outside 1–9 fall back to 2.
 //
 //	Example: Level: 1 favors speed over ratio.
 //	Example: Level: 9 favors ratio over speed.
-//	Example: Level: 0 is out of range and uses the default 6.
+//	Example: Level: 0 is out of range and uses the default 2.
 //
 // MinSize is the minimum body size in bytes to compress; smaller bodies are sent uncompressed. Values <= 0 fall back to 256.
 //
@@ -447,26 +443,10 @@ type CompressConfig struct {
 	BrotliLevel int
 }
 
-var gzipWriterPool = [10]sync.Pool{}
-var deflateWriterPool = [10]sync.Pool{}
-
-func init() {
-	for i := 1; i <= 9; i++ {
-		level := i
-		gzipWriterPool[i] = sync.Pool{
-			New: func() any {
-				w, _ := gzip.NewWriterLevel(io.Discard, level)
-				return w
-			},
-		}
-		deflateWriterPool[i] = sync.Pool{
-			New: func() any {
-				w, _ := flate.NewWriter(io.Discard, level)
-				return w
-			},
-		}
-	}
-}
+const (
+	defaultCompressLevel   = 2
+	defaultCompressMinSize = 256
+)
 
 // Compress returns middleware that brotli-, gzip- or deflate-compresses response bodies per the request's Accept-Encoding header, leaving streamed responses and bodies below cfg.MinSize untouched. See CompressConfig for defaults.
 //
@@ -474,25 +454,36 @@ func init() {
 // Example: app.Use(Compress(CompressConfig{Level: 6, MinSize: 512}))
 // Example: app.Use(Compress(CompressConfig{Level: 9, MinSize: 1024}))
 func Compress(cfg CompressConfig) MiddlewareFunc {
+	cfg = normalizeCompressConfig(cfg)
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
 			next(req, resp)
-			applyConfiguredCompression(req, resp, cfg)
+			applyNormalizedCompression(req, resp, &cfg)
 		}
 	}
 }
 
-func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig) {
-	level := cfg.Level
-	if level < 1 || level > 9 {
-		level = 6
+func normalizeCompressConfig(cfg CompressConfig) CompressConfig {
+	if cfg.Level < 1 || cfg.Level > 9 {
+		cfg.Level = defaultCompressLevel
 	}
-	minSize := cfg.MinSize
-	if minSize <= 0 {
-		minSize = 256
+	if cfg.MinSize <= 0 {
+		cfg.MinSize = defaultCompressMinSize
 	}
+	cfg.BrotliLevel = normalizeBrotliLevel(cfg.BrotliLevel)
+	return cfg
+}
 
-	if resp == nil || req == nil || resp.IsStreamed() || resp.StatusCode == http.StatusPartialContent {
+func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig) {
+	cfg = normalizeCompressConfig(cfg)
+	applyNormalizedCompression(req, resp, &cfg)
+}
+
+func applyNormalizedCompression(req *Request, resp *Response, cfg *CompressConfig) {
+	level := cfg.Level
+	minSize := cfg.MinSize
+
+	if resp == nil || req == nil || resp.IsStreamed() || resp.fileBody || resp.StatusCode == http.StatusPartialContent {
 		return
 	}
 	body := resp.transmittedBodyBytes()
@@ -512,7 +503,7 @@ func applyConfiguredCompression(req *Request, resp *Response, cfg CompressConfig
 		return
 	}
 	if enc == encodingBrotli {
-		level = normalizeBrotliLevel(cfg.BrotliLevel)
+		level = cfg.BrotliLevel
 	}
 
 	bp := LargeBufPool.Get().(*[]byte)
@@ -556,32 +547,15 @@ func responseHasHeader(headers [][2]string, name string) bool {
 	}
 }
 
-var bytesWriterPool = sync.Pool{
-	New: func() any {
-		return &bytesWriter{}
-	},
-}
-
 type bytesWriter struct {
-	buf *[]byte
-}
-
-func newBytesWriter(buf *[]byte) *bytesWriter {
-	w := bytesWriterPool.Get().(*bytesWriter)
-	w.buf = buf
-	return w
+	buf []byte
 }
 
 func (w *bytesWriter) Write(p []byte) (int, error) {
-	*w.buf = append(*w.buf, p...)
+	w.buf = append(w.buf, p...)
 	return len(p), nil
 }
 
-// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
-//
-// Example: app.Use(Timeout(5 * time.Second))
-// Example: app.Use(Timeout(100 * time.Millisecond))
-// Example: app.Use(Timeout(time.Minute))
 func cloneDetachedStrings(r *Request) {
 	r.Method = strings.Clone(r.Method)
 	r.Path = strings.Clone(r.Path)
@@ -612,9 +586,34 @@ func cloneDetachedStrings(r *Request) {
 	}
 }
 
+// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
+// The handler runs on its own goroutine with a copy of the request body. At most MaxConns such handlers run at once, counting
+// handlers that outlived their deadline. For one client IP at most MaxConnsPerIP run, or behind a trusted proxy at most
+// MaxRequestsPerIP when it is set and MaxConnsPerIP otherwise; the body copy counts against
+// MaxInFlightBodyBytes until the handler returns, in addition to the request's own body. A handler that outlives its
+// deadline also keeps its MaxConcurrentReqs slot and, behind a trusted proxy, its per-IP request slot until it returns.
+// A request over one of these limits gets 503 Service Unavailable or 429 Too Many Requests.
+//
+// Example: app.Use(Timeout(5 * time.Second))
+// Example: app.Use(Timeout(100 * time.Millisecond))
+// Example: app.Use(Timeout(time.Minute))
 func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
+			srv := req.server
+			admission, status := srv.admitTimeoutHandler(req)
+			if status != 0 {
+				statsBlocked()
+				resp.Status(status).String(http.StatusText(status))
+				return
+			}
+			if !srv.tryReserveBodyBytes(len(req.Body)) {
+				admission.release()
+				statsBlocked()
+				resp.Status(http.StatusServiceUnavailable).String(http.StatusText(http.StatusServiceUnavailable))
+				return
+			}
+			bodyHeld := int64(len(req.Body))
 			done := make(chan struct{}, 1)
 			tmpReq := *req
 			tmpReq.Params = req.Params
@@ -663,6 +662,8 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					if r := recover(); r != nil {
 						tmpReq.server.reportPanic(&tmpReq, r)
 					}
+					srv.releaseBodyBytes(bodyHeld)
+					admission.release()
 					done <- struct{}{}
 				}()
 				next(&tmpReq, tmpResp)
@@ -681,8 +682,10 @@ func Timeout(d time.Duration) MiddlewareFunc {
 				}
 			case <-ctx.Done():
 				timedOut.Store(true)
+				hold := srv.holdDetachedWork(req)
 				go func() {
 					<-done
+					hold.release()
 					tmpResp.Reset()
 					releaseResponseToPool(tmpResp)
 				}()
@@ -692,7 +695,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 	}
 }
 
-// BodyLimit returns middleware that rejects requests whose body exceeds maxBytes with 413 Payload Too Large, checking Content-Length first and then the actual body length.
+// BodyLimit returns middleware that rejects requests whose body exceeds maxBytes with 413 Payload Too Large, checking Content-Length first and then the actual body length. A streamed body (Request.BodyStream) returns ErrBodyTooLarge from Read once more than maxBytes arrive, and the response becomes 413 unless the handler already streamed one.
 //
 // Example: app.Use(BodyLimit(1 << 20))
 // Example: app.Use(BodyLimit(10 << 20))
@@ -714,7 +717,15 @@ func BodyLimit(maxBytes int64) MiddlewareFunc {
 				_ = maxStr
 				return
 			}
+			stream := req.BodyStream()
+			if stream != nil {
+				stream.limitReads(maxBytes)
+			}
 			next(req, resp)
+			if stream != nil && stream.readLimitExceeded() && !resp.IsStreamed() {
+				resp.resetFastH1()
+				resp.Status(413).String("Payload Too Large")
+			}
 		}
 	}
 }

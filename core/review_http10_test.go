@@ -15,7 +15,7 @@ import (
 )
 
 func TestHTTP10RequestWithoutKeepAliveIsClosed(t *testing.T) {
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	s := New(Config{Addr: addr, PlainHTTP: true, Listeners: 1, MaxConnsPerIP: 1 << 16, HTTPAddr: "-", LogRequests: false})
 	s.Router.GET("/ping", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
 	s.Router.GET("/legacy", func(req *Request, resp *Response) { resp.Status(200).String("proto=" + req.Proto) })
@@ -55,7 +55,7 @@ func TestHTTP10RequestWithoutKeepAliveIsClosed(t *testing.T) {
 }
 
 func TestHTTP10RequestWithKeepAliveStaysOpen(t *testing.T) {
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	s := New(Config{Addr: addr, PlainHTTP: true, Listeners: 1, MaxConnsPerIP: 1 << 16, HTTPAddr: "-", LogRequests: false})
 	s.Router.GET("/ping", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
 	go func() { _ = s.ListenAndServeEpollH2(addr) }()

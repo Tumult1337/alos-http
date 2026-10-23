@@ -12,7 +12,7 @@ import (
 
 func firstBytesAfterH2Preface(t *testing.T, disableHTTP2 bool) []byte {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	s := New(Config{Addr: addr, PlainHTTP: true, Listeners: 1, MaxConnsPerIP: -1, HTTPAddr: "-", DisableHTTP2: disableHTTP2})
 	s.Router.GET("/ping", func(req *Request, resp *Response) { resp.Status(200).String("ok") })
 	go func() { _ = s.ListenAndServeEpollH2(addr) }()

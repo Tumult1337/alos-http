@@ -22,6 +22,52 @@ func (c *epollConn) sealTLSAppDataParts(dst, head, body []byte) []byte {
 	return buildTLSAppDataRecordsParts(dst, c.appWriter, head, body)
 }
 
+func (c *epollConn) sealTLSResponseBody(dst, head, body []byte) []byte {
+	if c.tls12 != nil || len(head)+len(body) <= tlsMutableSealMinBytes || !c.resp.ownsBodyBuffer(body) {
+		return c.sealTLSAppDataParts(dst, head, body)
+	}
+	if c.appWriter.keyWornOut() {
+		dst = c.renewWriteKey(dst)
+	}
+	return buildTLSAppDataRecordsMutableBody(dst, c.appWriter, head, body)
+}
+
+func (c *epollConn) sealTLSFrameAroundBody(dst, head, body []byte, off, n int, mutable bool) []byte {
+	if !mutable || c.tls12 != nil || len(head) > tlsRecordAroundMaxPrefix || off < len(head) {
+		return c.sealTLSAppDataParts(dst, head, body[off:off+n])
+	}
+	if c.appWriter.keyWornOut() {
+		dst = c.renewWriteKey(dst)
+	}
+	return sealTLSRecordAround(dst, c.appWriter, head, body, off, n)
+}
+
+const (
+	tlsSealBatchRecords    = 3
+	tlsFirstSealRecords    = 1
+	tlsOneShotBodyRecords  = 3
+	tlsMutableSealMinBytes = 2 * (MaxRecordPayload - 1)
+)
+
+func (c *epollConn) tlsRecordsPayload(records int) int {
+	if c.tls12 != nil {
+		return records * MaxRecordPayload
+	}
+	return records * (MaxRecordPayload - 1)
+}
+
+func (c *epollConn) tlsSealBatch() int {
+	return c.tlsRecordsPayload(tlsSealBatchRecords)
+}
+
+func (c *epollConn) tlsFirstSeal() int {
+	return c.tlsRecordsPayload(tlsFirstSealRecords)
+}
+
+func (c *epollConn) tlsOneShotBodyMax() int {
+	return c.tlsRecordsPayload(tlsOneShotBodyRecords)
+}
+
 func (c *epollConn) renewWriteKey(dst []byte) []byte {
 	dst, renewed := appendKeyUpdateRecord(dst, c.appWriter)
 	if !renewed {

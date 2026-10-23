@@ -81,6 +81,7 @@ type quicTestPeer struct {
 
 func newQUICTestPeer(t *testing.T, routes func(*Router)) *quicTestPeer {
 	t.Helper()
+	startReqStreamWorkers()
 	srv := New(Config{})
 	if routes != nil {
 		routes(srv.Router)

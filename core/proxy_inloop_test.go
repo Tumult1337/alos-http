@@ -94,12 +94,7 @@ func (h *heldOrigin) releaseAll() { h.once.Do(func() { close(h.release) }) }
 // startInloopProxy brings up a proxy server on the epoll path for one domain.
 func startInloopProxy(t *testing.T, cfg DomainConfig, tune func(*ProxyEngine)) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr:          addr,

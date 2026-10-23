@@ -109,7 +109,7 @@ func BenchmarkGateHPACKDecodeRequest(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(int64(len(block)))
 	for i := 0; i < b.N; i++ {
-		out, _, _, err := dec.DecodeRequest(headers[:0], block)
+		out, _, err := dec.DecodeRequest(headers[:0], block)
 		if err != nil {
 			b.Fatal(err)
 		}

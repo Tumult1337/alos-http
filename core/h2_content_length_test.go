@@ -59,7 +59,7 @@ func TestHpackDecodeRequestCarriesContentLength(t *testing.T) {
 	block := enc.Buf
 	dec := NewHpackDecoder()
 	for round := 0; round < 2; round++ {
-		_, meta, _, err := dec.DecodeRequest(nil, block)
+		_, meta, err := dec.DecodeRequest(nil, block)
 		if err != nil {
 			t.Fatal(err)
 		}

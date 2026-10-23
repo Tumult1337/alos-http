@@ -40,7 +40,8 @@ type fpRequest struct {
 	DialTimeout time.Duration
 	ReadTimeout time.Duration
 
-	ensureResponseDate bool
+	ensureResponseDate  bool
+	consumerBoundsPause bool
 }
 
 type fpResponse struct {

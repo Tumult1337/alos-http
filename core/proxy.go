@@ -120,7 +120,8 @@ type ProxyError struct {
 type ProxyErrorFunc func(ProxyError)
 
 // ProxyRequest is passed to the OnRequest callback before the request is
-// forwarded to the backend. You can inspect or modify Headers, Host, and Path
+// forwarded to the backend, and before a cached response is served (then
+// Backend is "cache"). You can inspect or modify Headers, Host, and Path
 // to rewrite the outgoing request. Returning false from the callback rejects
 // the request with a 502 Bad Gateway.
 //
@@ -412,6 +413,7 @@ type backend struct {
 	ActiveConns   atomic.Int64
 	trust         *upstreamTrust
 	outlier       outlierState
+	fp            fpBackendTarget
 }
 
 type domainState struct {
@@ -438,7 +440,7 @@ func newDomainState(cfg DomainConfig, backends []*backend) *domainState {
 //
 // Hook into the proxy lifecycle with:
 //   - OnError: called when a backend request fails (connection error, timeout)
-//   - OnRequest: called before forwarding; modify headers/path or reject
+//   - OnRequest: called before forwarding and before a cache hit is served; modify headers/path or reject
 //   - OnResponse: called after the backend replies; modify headers/status or cache
 //
 // ProxyEngine is created internally by the Server. Use Server.OnProxyError,
@@ -543,6 +545,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 			TLS:           bc.TLS,
 			TLSSkipVerify: bc.TLSSkipVerify,
 			trust:         newUpstreamTrust(bc),
+			fp:            newFPBackendTarget(bc.Addr),
 		}
 		b.Healthy.Store(true)
 		backends[i] = b

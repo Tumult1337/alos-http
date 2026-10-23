@@ -26,12 +26,7 @@ func startInloopTLSProxy(t *testing.T, cfg DomainConfig, tune func(*ProxyEngine)
 // the workers they share.
 func startInloopTLSProxyMulti(t *testing.T, cfgs []DomainConfig, tune func(*ProxyEngine)) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	certs := make([]CertConfig, 0, len(cfgs))
 	for _, cfg := range cfgs {

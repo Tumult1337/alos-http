@@ -159,12 +159,7 @@ func TestUpstreamOpenCloseEarlyAbortsAndKeepsTheClientUsable(t *testing.T) {
 
 func TestUpstreamOpenReportsDialFailure(t *testing.T) {
 	client := newTimeoutClient(t)
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
+	addr := refusedLoopbackAddr(t)
 	if _, _, err := client.Open(&UpstreamRequest{Scheme: "http", Authority: addr, Path: "/"}); err == nil {
 		t.Fatal("Open succeeded against a closed port")
 	}

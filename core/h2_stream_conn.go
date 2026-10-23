@@ -9,12 +9,14 @@ import (
 )
 
 type h2StreamConn struct {
-	body   *BodyReader
-	sw     StreamWriter
-	remote streamAddr
-	mu     sync.Mutex
-	closed bool
-	done   chan struct{}
+	body    *BodyReader
+	sw      StreamWriter
+	remote  streamAddr
+	mu      sync.Mutex
+	closed  bool
+	done    chan struct{}
+	ipSlot  *ipReqCounter
+	holders int
 }
 
 type streamAddr string
@@ -23,7 +25,38 @@ func (a streamAddr) Network() string { return "tcp" }
 func (a streamAddr) String() string  { return string(a) }
 
 func newH2StreamConn(body *BodyReader, sw StreamWriter, remoteAddr string) *h2StreamConn {
-	return &h2StreamConn{body: body, sw: sw, remote: streamAddr(remoteAddr), done: make(chan struct{})}
+	return &h2StreamConn{body: body, sw: sw, remote: streamAddr(remoteAddr), done: make(chan struct{}), holders: 1}
+}
+
+func (c *h2StreamConn) adoptIPSlot(slot *ipReqCounter) {
+	c.mu.Lock()
+	c.ipSlot = slot
+	c.mu.Unlock()
+}
+
+func (c *h2StreamConn) retainSlots() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	c.holders++
+	c.mu.Unlock()
+}
+
+func (c *h2StreamConn) releaseSlots() {
+	if c == nil {
+		return
+	}
+	var slot *ipReqCounter
+	c.mu.Lock()
+	c.holders--
+	if c.holders == 0 {
+		slot, c.ipSlot = c.ipSlot, nil
+	}
+	c.mu.Unlock()
+	if slot != nil {
+		slot.release()
+	}
 }
 
 func (c *h2StreamConn) Read(p []byte) (int, error) { return c.body.Read(p) }
@@ -85,4 +118,5 @@ func (r *Request) waitH2Tunnel() {
 	case <-r.Context().Done():
 	}
 	t.detach()
+	t.releaseSlots()
 }

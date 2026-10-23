@@ -50,9 +50,7 @@ func newZeroCreditFixture(t *testing.T, params []byte) *zeroCreditFixture {
 	server := New(Config{QUICMaxData: 73, QUICMaxStreamData: 37})
 	conn := newQUICConn(server, nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, []byte{1}, []byte{2})
 	conn.pktBudget = 1200
-	conn.loss.mu.Lock()
-	conn.loss.bytesInFlight = int(conn.loss.cwnd)
-	conn.loss.mu.Unlock()
+	conn.addressValidated.Store(false)
 	var parsed ParsedClientHello
 	zeroCreditParse(t, &parsed, params)
 	conn.applyPeerTransportParams(&parsed)
@@ -70,8 +68,11 @@ func newZeroCreditFixture(t *testing.T, params []byte) *zeroCreditFixture {
 
 func (fixture *zeroCreditFixture) capturePreconditions(t *testing.T) {
 	t.Helper()
-	if fixture.conn.loss.canSend() || fixture.conn.pktBudget != 1200 {
-		t.Fatal("fixture permits packet draining or changed packet budget")
+	fixture.conn.writeMu.Lock()
+	ampBudget := fixture.conn.ampBudgetLocked()
+	fixture.conn.writeMu.Unlock()
+	if ampBudget != 0 || fixture.conn.loss.sendRoom() == 0 || fixture.conn.pktBudget != 1200 {
+		t.Fatalf("fixture must block draining but not queueing: amplification budget=%d send room=%d packet budget=%d", ampBudget, fixture.conn.loss.sendRoom(), fixture.conn.pktBudget)
 	}
 	if fixture.conn.maxDataLocal != 73 {
 		t.Fatalf("peer grant changed receive connection allowance to %d", fixture.conn.maxDataLocal)

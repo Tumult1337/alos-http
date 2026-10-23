@@ -37,9 +37,17 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath = proxyRequestTarget(req)
 		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			admission.release(w.server)
-			w.serveProxyCacheHit(pe, ds, cache, entry, req, &stream.resp)
-			return proxyStartServed
+			refusal, serve := w.cacheHitVerdict(pe, ds, req)
+			if refusal.status != 0 {
+				admission.release(w.server)
+				refusal.answer(&stream.resp)
+				return proxyStartServed
+			}
+			if serve {
+				admission.release(w.server)
+				w.serveProxyCacheHit(pe, ds, cache, entry, req, &stream.resp)
+				return proxyStartServed
+			}
 		}
 	}
 
@@ -59,7 +67,7 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 	px.method = req.Method
 	px.path = req.Path
 	px.clientAddr = req.RemoteAddr
-	px.mayCache = cache != nil && cacheableMethod
+	px.mayCache = cache != nil && cacheableMethod && (reqCacheOK || pe.responseHook() != nil)
 	px.reqCacheOK = reqCacheOK
 	px.cacheHost = host
 	px.cacheKey = cachePath
@@ -170,8 +178,6 @@ var (
 	proxyH2ServerBufferBudget int64 = 512 << 20
 )
 
-const proxyH2BodyKeep = 64 << 10
-
 var (
 	proxyRefusedBufferFull = proxyRefusal{503, "Proxy response buffer exhausted"}
 	proxyRefusedTooLarge   = proxyRefusal{502, "Upstream response too large"}
@@ -182,7 +188,7 @@ func (w *epollWorker) admitH2Response(px *proxyExchange, contentLen int64) bool 
 	switch {
 	case contentLen > int64(w.beCfg.MaxResponseBody):
 		px.refusal = proxyRefusedTooLarge
-	case contentLen >= 0 && !px.reserveH2Buffer(contentLen):
+	case contentLen >= 0 && !px.reserveResponseBuffer(contentLen):
 		px.refusal = proxyRefusedBufferFull
 	case contentLen >= 0 && (contentLen <= proxyBufferedResponseLimit ||
 		px.mayCache && contentLen <= px.cache.maxCacheableSize()):
@@ -198,7 +204,7 @@ func (w *epollWorker) bufferH2Chunk(c *backendConn, px *proxyExchange, data []by
 			w.refuseResponse(c, px, proxyRefusedTooLarge)
 			return
 		}
-		if !px.reserveH2Buffer(int64(len(data))) {
+		if !px.reserveResponseBuffer(int64(len(data))) {
 			w.refuseResponse(c, px, proxyRefusedBufferFull)
 			return
 		}
@@ -211,9 +217,9 @@ func (w *epollWorker) refuseResponse(c *backendConn, px *proxyExchange, r proxyR
 	w.be.closeConn(c, errFPClientClosed)
 }
 
-func (px *proxyExchange) reserveH2Buffer(n int64) bool {
+func (px *proxyExchange) reserveResponseBuffer(n int64) bool {
 	c := px.c
-	if c.h2ProxyBuffered+n > proxyH2ConnBufferBudget {
+	if c == nil || c.h2ProxyBuffered+n > proxyH2ConnBufferBudget {
 		return false
 	}
 	if px.pe.h2Buffered.Add(n) > proxyH2ServerBufferBudget {
@@ -222,6 +228,7 @@ func (px *proxyExchange) reserveH2Buffer(n int64) bool {
 	}
 	c.h2ProxyBuffered += n
 	px.h2Reserved += n
+	px.budgetConn = c
 	return true
 }
 
@@ -233,9 +240,8 @@ func (px *proxyExchange) discardH2Buffer() {
 	if px.h2Reserved == 0 {
 		return
 	}
-	if px.c != nil {
-		px.c.h2ProxyBuffered -= px.h2Reserved
-	}
+	px.budgetConn.h2ProxyBuffered -= px.h2Reserved
+	px.budgetConn = nil
 	px.pe.h2Buffered.Add(-px.h2Reserved)
 	px.h2Reserved = 0
 }

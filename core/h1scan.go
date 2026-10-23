@@ -142,31 +142,3 @@ func h1HeaderLineScalar(p []byte) (special, nameEnd int, hostSafe bool) {
 	}
 	return -1, nameEnd, false
 }
-
-const h1BlockMaxChunks = 16
-
-const h1BlockMaxBytes = h1BlockMaxChunks * 64
-
-const h1BlockMinBytes = 48
-
-type h1BlockIndexOut struct {
-	starts [h1BlockMaxChunks]uint64
-	ends   [h1BlockMaxChunks]uint64
-	cands  [h1BlockMaxChunks]uint64
-}
-
-func h1NextBit(words *[h1BlockMaxChunks]uint64, from, chunks int) int {
-	i := from >> 6
-	if i >= chunks {
-		return -1
-	}
-	w := words[i] & (^uint64(0) << (from & 63))
-	for w == 0 {
-		i++
-		if i >= chunks {
-			return -1
-		}
-		w = words[i]
-	}
-	return i<<6 | bits.TrailingZeros64(w)
-}

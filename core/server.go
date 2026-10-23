@@ -72,8 +72,15 @@ var timeNow = time.Now
 //	Example: MaxWriteSize: 5 << 20.
 
 // MaxInFlightBodyBytes caps aggregate request-body bytes buffered by multiplexed
-// HTTP/2 and HTTP/3 streams. 0 applies a 64 MiB default; -1 disables the budget
+// HTTP/2 and HTTP/3 streams and by streamed HTTP/1 bodies. 0 applies a 64 MiB default; -1 disables the budget
 // (unsafe on an Internet-facing server). Streams that would exceed it are reset.
+// The per-connection share check runs only while the server holds more than half of the budget. Below that
+// point one connection can reserve up to about half of the budget (32 MiB at the defaults) and keeps those
+// bytes when the pressure starts. The share is max(MaxInFlightBodyBytes/8, MaxBodySize) capped at
+// MaxInFlightBodyBytes, or the whole budget when MaxBodySize is -1. It applies to HTTP/2, HTTP/3, WebSocket
+// and streamed HTTP/1 connections. An HTTP/2 stream above it gets RST_STREAM(REFUSED_STREAM) while its
+// handler waits for admission and RST_STREAM(ENHANCE_YOUR_CALM) otherwise.
+// A streamed HTTP/1 body that finds no room while it holds no buffered bytes gets 503 and the connection closes.
 //
 //	Example: MaxInFlightBodyBytes: 32 << 20.
 //
@@ -122,6 +129,13 @@ var timeNow = time.Now
 //
 // H2MaxConcurrentStreams is the maximum number of concurrently active streams on one HTTP/2 connection; 0 uses the protocol default.
 //
+// H2MaxRunningHandlers caps the handlers that run at the same time on one HTTP/2 or HTTP/3 connection, inline or on the
+// handler pool. A new stream also waits while the connection holds MaxPendingWriteBytes of unsent response bytes. Waiting
+// streams start in arrival order. 0 or a negative value applies a default of 32; a value above H2MaxConcurrentStreams
+// uses H2MaxConcurrentStreams, and HTTP/3 also caps it at 256, its stream limit.
+//
+//	Example: H2MaxRunningHandlers: 16.
+//
 // H2InitialWindowSize is the HTTP/2 per-stream receive window advertised to clients; 0 uses the protocol default.
 //
 // H2MaxFrameSize is the largest HTTP/2 frame accepted from clients; 0 uses the protocol default.
@@ -162,11 +176,15 @@ var timeNow = time.Now
 //	Example: WorkerCount: 8.
 //	Example: WorkerCount: 0 auto-sizes.
 //
-// ConnBandwidth rate-limits each connection.
+// ConnBandwidth rate-limits each connection. It throttles only streamed request bodies read
+// through BodyStream (upload), and HTTP/1.1 responses written through a stream writer or sendfile
+// (download). Buffered request bodies, buffered responses, HTTP/2 and HTTP/3 responses, WebSocket
+// frames and proxied traffic are not throttled.
 //
 //	Example: ConnBandwidth: BandwidthConfig{MaxUploadRate: 100, MaxDownloadRate: 200} (Mbps).
 //
-// GlobalBandwidth rate-limits all connections in aggregate.
+// GlobalBandwidth rate-limits all connections in aggregate. It throttles the same traffic as
+// ConnBandwidth and nothing else.
 //
 //	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 1000} (Mbps).
 //
@@ -209,7 +227,7 @@ var timeNow = time.Now
 //
 //	Example: EnableCompress: true.
 //
-// CompressLevel is the compression level 1–9 used when EnableCompress is set; defaults to 6.
+// CompressLevel is the compression level 1–9 used when EnableCompress is set; defaults to 2.
 //
 //	Example: CompressLevel: 9.
 //
@@ -241,14 +259,25 @@ var timeNow = time.Now
 //
 //	Example: ProxyMode: true.
 //
-// InlineHandlers runs HTTP/1.1 handlers directly on the event-loop thread
-// instead of handing each request to a goroutine. It removes the goroutine
-// hand-off and wake-up from every request, which is measurably faster for
-// handlers that return in microseconds, but a handler that blocks (database
-// call, sleep, slow upstream) stalls every other connection on that worker
-// for as long as it runs. Leave it off unless every handler is non-blocking.
+// Handlers run on the event-loop thread by default (HTTP/1.1 and HTTP/2 on
+// the epoll backend), which removes the goroutine hand-off and wake-up from
+// every request. A handler that keeps the loop for more than about 2ms (sleep,
+// database call, slow upstream) has the loop handed to a fresh goroutine so
+// the other connections keep being served, and its route moves to goroutine
+// dispatch until it proves fast again. Handlers that stream, hijack or upgrade
+// the connection leave the loop the moment they do so. Requests with streamed
+// bodies, and every request on a server with a reverse proxy or HTTP routes
+// configured, use goroutine dispatch.
+//
+// InlineHandlers additionally buffers request bodies that StreamBodyAbove
+// would otherwise stream, so those requests run on the loop as well.
 //
 //	Example: InlineHandlers: true.
+//
+// DisableInlineHandlers hands every request to a goroutine instead, except on
+// routes marked with Route.Inline. InlineHandlers takes precedence.
+//
+//	Example: DisableInlineHandlers: true.
 //
 // WebSocketOriginMode controls Origin validation for WebSocket upgrades; defaults to WSOriginSameOrigin.
 //
@@ -287,6 +316,7 @@ type Config struct {
 	H2InitialWindowSize    uint32
 	H2MaxFrameSize         uint32
 	H2HeaderTableSize      uint32
+	H2MaxRunningHandlers   int
 
 	QUICMaxData           int64
 	QUICMaxStreamData     int64
@@ -330,6 +360,8 @@ type Config struct {
 	ProxyMode       bool
 	InlineHandlers  bool
 
+	DisableInlineHandlers bool
+
 	WSReadTimeout           time.Duration
 	WSWriteTimeout          time.Duration
 	WebSocketOriginMode     WSOriginMode
@@ -338,7 +370,7 @@ type Config struct {
 
 const minPreallocFloor = 1_024
 
-// DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 6, and request logging enabled.
+// DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 2, and request logging enabled.
 func DefaultConfig() Config {
 	return Config{
 		Addr:                 ":8443",
@@ -355,7 +387,7 @@ func DefaultConfig() Config {
 		MaxConcurrentReqs:    0,
 		MaxConns:             8192,
 		ServerName:           "ALOS",
-		CompressLevel:        6,
+		CompressLevel:        defaultCompressLevel,
 		CompressMinSize:      256,
 		CompressBrotliLevel:  defaultBrotliLevel,
 		WorkerCount:          0,
@@ -412,6 +444,16 @@ func (s *Server) h2MaxStreams() uint32 {
 	return defaultUint32(s.config.H2MaxConcurrentStreams, H2MaxConcurrentStream)
 }
 
+const h2DefaultMaxRunningHandlers = 32
+
+func (s *Server) h2MaxRunningHandlers() int {
+	value := s.config.H2MaxRunningHandlers
+	if value <= 0 {
+		value = h2DefaultMaxRunningHandlers
+	}
+	return min(value, int(s.h2MaxStreams()))
+}
+
 func (s *Server) h2InitialWindow() uint32 {
 	value := defaultUint32(s.config.H2InitialWindowSize, H2StreamWindowSize)
 	if value > 1<<31-1 {
@@ -451,6 +493,26 @@ func respServerName(resp *Response) string {
 		return resp.lazyReq.server.config.ServerName
 	}
 	return "ALOS"
+}
+
+var (
+	connKeepAliveTail = append(append([]byte(nil), connKeepAlive...), '\r', '\n')
+	connCloseTail     = append(append([]byte(nil), connClose...), '\r', '\n')
+)
+
+func serverConnHeadTail(resp *Response, keepAlive bool) []byte {
+	if resp != nil && resp.lazyReq != nil && resp.lazyReq.server != nil {
+		if s := resp.lazyReq.server; s.srvKeepAliveTail != nil {
+			if keepAlive {
+				return s.srvKeepAliveTail
+			}
+			return s.srvCloseTail
+		}
+	}
+	if keepAlive {
+		return connKeepAliveTail
+	}
+	return connCloseTail
 }
 
 func serverConnHeaders(resp *Response) (keepAlive, closeHdr []byte) {
@@ -619,15 +681,17 @@ type Server struct {
 	shutdownOnce      sync.Once
 	wakersMu          sync.Mutex
 	wakers            map[shutdownWaker]struct{}
+	inlineWatch       inlineWatchdog
+	inlineBatch       time.Duration
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
+	timeoutHandlers   atomic.Int64
+	timeoutPerIP      *perIPLimiter
+	_                 [CacheLineSize]byte
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
+	_                 [CacheLineSize - 8]byte
 	fastDispatch      atomic.Bool
-	plainRootFast     atomic.Pointer[plainRootFastResponse]
-	h2RootFast        atomic.Pointer[h2RootFastResponse]
-	rootFastMu        sync.Mutex
-	dateNow           func() int64
 	altSvc            atomic.Pointer[altSvcHeader]
 	trustedProxies    trustedProxyMatcher
 	perIPLimiter      *perIPRequestLimiter
@@ -641,6 +705,8 @@ type Server struct {
 	onResponseHooks   atomic.Pointer[[]func(*Request, *Response)]
 	srvKeepAlive      []byte
 	srvClose          []byte
+	srvKeepAliveTail  []byte
+	srvCloseTail      []byte
 }
 
 type trackedHandoffConn struct {
@@ -650,36 +716,14 @@ type trackedHandoffConn struct {
 	ipFromInFlig bool
 	closeOnce    sync.Once
 	onClose      func()
+	holdMu       sync.Mutex
+	holds        int
+	closed       bool
 }
 
 type ipReqCounter struct {
 	n atomic.Int64
-}
-
-type plainRootFastResponse struct {
-	dateUnix            int64
-	keepDate, closeDate responseDateSpan
-	getKeepAlive        []byte
-	getClose            []byte
-	getKeepAliveTLS     []byte
-	getCloseTLS         []byte
-	handlerAltSvc       bool
-	tlsKeepAlive        []byte
-	tlsClose            []byte
-}
-
-type h2RootFastResponse struct {
-	dateUnix      int64
-	date          responseDateSpan
-	headerPayload []byte
-	body          []byte
-	framed        []byte
-	dataFrameOff  int
-	tlsInner      []byte
-	headerIDOff   int
-	dataIDOff     int
-	handlerAltSvc bool
-	withAltSvc    *h2RootFastResponse
+	_ [CacheLineSize - 8]byte
 }
 
 // New creates a Server from the given Config, applying defaults to zero-valued fields; called with no arguments it uses DefaultConfig. The returned server is ready for route registration.
@@ -713,7 +757,7 @@ func New(configs ...Config) *Server {
 		cfg.ServerName = "ALOS"
 	}
 	if cfg.CompressLevel == 0 {
-		cfg.CompressLevel = 6
+		cfg.CompressLevel = defaultCompressLevel
 	}
 	if cfg.CompressMinSize == 0 {
 		cfg.CompressMinSize = 256
@@ -758,6 +802,8 @@ func New(configs ...Config) *Server {
 		s.srvKeepAlive = []byte("Connection: keep-alive\r\nServer: " + cfg.ServerName + "\r\n")
 		s.srvClose = []byte("Connection: close\r\nServer: " + cfg.ServerName + "\r\n")
 	}
+	s.srvKeepAliveTail = append(append([]byte(nil), s.srvKeepAlive...), '\r', '\n')
+	s.srvCloseTail = append(append([]byte(nil), s.srvClose...), '\r', '\n')
 	if cfg.ProxyMode {
 		s.trustedProxies = newTrustedProxyMatcher(nil, true)
 	} else if len(cfg.TrustedProxies) > 0 {
@@ -776,6 +822,8 @@ func New(configs ...Config) *Server {
 			s.perIPConnLimiter.Store(newPerIPConnLimiter())
 		}
 	}
+
+	s.timeoutPerIP = newPerIPRequestLimiter()
 
 	s.debug.Store(cfg.Debug)
 	s.logRequests.Store(cfg.LogRequests)
@@ -1077,12 +1125,7 @@ func (c *trackedHandoffConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		err = c.Conn.Close()
-		if c.server != nil {
-			c.server.untrackHandoffConn(c)
-		}
-		if c.onClose != nil {
-			c.onClose()
-		}
+		c.finishClose()
 	})
 	return err
 }
@@ -1266,6 +1309,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			s.perIPLimiter.Stop()
 		}
 		s.perIPConnLimiter.Load().Stop()
+		s.timeoutPerIP.Stop()
 		for _, ln := range s.listeners {
 			ln.Close()
 		}
@@ -1383,7 +1427,7 @@ func (s *Server) NewPlainH1StreamWriter(conn net.Conn) *PlainH1StreamWriter {
 	return w
 }
 
-func (s *Server) rootFastEligible() bool {
+func (s *Server) fastDispatchEligible() bool {
 	if s.rateLimitEngine.Load() != nil ||
 		s.corsEngine.Load() != nil ||
 		s.config.EnableCompress ||
@@ -1422,6 +1466,9 @@ func (s *Server) tryReserveBodyBytes(n int) bool {
 		return true
 	}
 	limit := s.config.MaxInFlightBodyBytes
+	if int64(n) > limit {
+		return false
+	}
 	for {
 		used := s.inFlightBodyBytes.Load()
 		if int64(n) > limit-used {
@@ -1464,14 +1511,13 @@ func (s *Server) tryReserveConnBodyBytes(connReserved *atomic.Int64, n int) bool
 	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
 		return true
 	}
-	if connReserved.Add(int64(n)) > s.connBodyShare() && s.bodyBudgetUnderPressure(n) {
-		connReserved.Add(-int64(n))
+	if connReserved.Load()+int64(n) > s.connBodyShare() && s.bodyBudgetUnderPressure(n) {
 		return false
 	}
 	if !s.tryReserveBodyBytes(n) {
-		connReserved.Add(-int64(n))
 		return false
 	}
+	connReserved.Add(int64(n))
 	return true
 }
 
@@ -1486,162 +1532,7 @@ func (s *Server) releaseConnBodyBytes(connReserved *atomic.Int64, n int64) {
 }
 
 func (s *Server) computeFastDispatch() {
-	if !s.Router.built.Load() {
-		s.fastDispatch.Store(false)
-		s.plainRootFast.Store(nil)
-		s.h2RootFast.Store(nil)
-		return
-	}
-	rootFast := s.rootFastEligible()
-	fast := rootFast && s.config.MaxConcurrentReqs <= 0
-	s.fastDispatch.Store(fast)
-	memoizeRoot := rootFast && !s.clientAuthConfigured()
-	s.computePlainRootFastResponse(memoizeRoot)
-	s.computeH2RootFastResponse(memoizeRoot)
-}
-
-func (s *Server) computePlainRootFastResponse(fast bool) {
-	s.rootFastMu.Lock()
-	s.plainRootFast.Store(s.attachPlainAltSvc(s.buildPlainRootFastResponse(fast)))
-	s.rootFastMu.Unlock()
-}
-
-func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
-	if !fast || len(s.Router.globalMiddleware) != 0 {
-		return nil
-	}
-	handler := s.lookupStaticHandler(methodGET, "/")
-	if handler == nil {
-		return nil
-	}
-	req := Request{Method: "GET", Path: "/", Proto: "HTTP/1.1", server: s}
-	resp := Response{
-		StatusCode: 200,
-		Headers:    make([][2]string, 0, 8),
-		body:       make([]byte, 0, 4096),
-	}
-	resp.lazyReq = &req
-	handler(&req, &resp)
-	if req.hijacked || resp.IsStreamed() {
-		return nil
-	}
-	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
-		return nil
-	}
-	unix := s.responseDateUnix()
-	date := responseDateValueAt(resp.StatusCode, resp.Headers, unix)
-	keepAlive, keepDate := appendPlainResponseModeAt(&resp, make([]byte, 0, resp.BodyLen()+128), true, true, date)
-	closeResp, closeDate := appendPlainResponseModeAt(&resp, make([]byte, 0, len(keepAlive)), false, true, date)
-	if len(keepAlive) == 0 || len(closeResp) == 0 {
-		return nil
-	}
-	keepAliveTLS := make([]byte, len(keepAlive)+1)
-	copy(keepAliveTLS, keepAlive)
-	keepAliveTLS[len(keepAlive)] = 0x17
-	closeTLS := make([]byte, len(closeResp)+1)
-	copy(closeTLS, closeResp)
-	closeTLS[len(closeResp)] = 0x17
-	return &plainRootFastResponse{
-		dateUnix: unix, keepDate: keepDate, closeDate: closeDate,
-		getKeepAlive:    keepAlive,
-		getClose:        closeResp,
-		getKeepAliveTLS: keepAliveTLS,
-		getCloseTLS:     closeTLS,
-		handlerAltSvc:   headersHaveFold(resp.Headers, altSvcHeaderName),
-	}
-}
-
-func (s *Server) computeH2RootFastResponse(fast bool) {
-	s.rootFastMu.Lock()
-	s.h2RootFast.Store(s.attachAltSvc(s.buildH2RootFastResponse(fast)))
-	s.rootFastMu.Unlock()
-}
-
-func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
-	if !fast || !s.http2Enabled() || len(s.Router.globalMiddleware) != 0 {
-		return nil
-	}
-	handler := s.lookupStaticHandler(methodGET, "/")
-	if handler == nil {
-		return nil
-	}
-	req := Request{Method: "GET", Path: "/", Proto: "HTTP/2"}
-	resp := Response{
-		StatusCode: 200,
-		Headers:    make([][2]string, 0, 8),
-		body:       make([]byte, 0, 4096),
-	}
-	handler(&req, &resp)
-	if req.hijacked || resp.IsStreamed() {
-		return nil
-	}
-	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
-		return nil
-	}
-
-	enc := HpackEncoder{}
-	headerPayload := make([]byte, 0, resp.BodyLen()+128)
-	enc.Reset(headerPayload)
-	unix := s.responseDateUnix()
-	date := responseDateValueAt(resp.StatusCode, resp.Headers, unix)
-	dateSpan := encodeH2ResponseHeadersAt(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName, date)
-
-	fastResp := newH2RootFastResponse(append([]byte(nil), enc.Buf...), append([]byte(nil), resp.transmittedBodyBytes()...))
-	fastResp.dateUnix, fastResp.date = unix, dateSpan
-	fastResp.handlerAltSvc = headersHaveFold(resp.Headers, altSvcHeaderName)
-	return fastResp
-}
-
-func newH2RootFastResponse(headerPayload, body []byte) *h2RootFastResponse {
-	fastResp := &h2RootFastResponse{
-		headerPayload: headerPayload,
-		body:          body,
-	}
-	if len(headerPayload) <= H2DefaultMaxFrameSize && len(body) <= int(H2DefaultMaxFrameSize) {
-		framed := make([]byte, 0, len(fastResp.headerPayload)+len(body)+18)
-		if len(body) == 0 {
-			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 0, fastResp.headerPayload)
-			fastResp.dataFrameOff = -1
-		} else {
-			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders, 0, fastResp.headerPayload)
-			fastResp.dataFrameOff = len(framed)
-			framed = appendH2Frame(framed, H2FrameData, H2FlagEndStream, 0, body)
-		}
-		fastResp.framed = framed
-		if len(framed)+1 <= MaxRecordPayload {
-			fastResp.tlsInner = make([]byte, len(framed)+1)
-			copy(fastResp.tlsInner, framed)
-			fastResp.tlsInner[len(framed)] = 0x17
-			fastResp.headerIDOff = 5
-			fastResp.dataIDOff = -1
-			if fastResp.dataFrameOff >= 0 {
-				fastResp.dataIDOff = fastResp.dataFrameOff + 5
-			}
-		}
-	}
-	return fastResp
-}
-
-func (s *Server) lookupStaticHandler(methodIdx int, path string) HandlerFunc {
-	if methodIdx < 0 || methodIdx >= len(s.Router.staticPaths) {
-		return nil
-	}
-	paths := s.Router.staticPaths[methodIdx]
-	if len(paths) == 0 {
-		return nil
-	}
-	hashes := s.Router.staticHashes[methodIdx]
-	handlers := s.Router.staticHandlers[methodIdx]
-	mask := s.Router.staticMask[methodIdx]
-	h := pathQuickHash(path)
-	idx := h & mask
-	for hashes[idx] != 0 {
-		if hashes[idx] == h && paths[idx] == path {
-			return handlers[idx]
-		}
-		idx = (idx + 1) & mask
-	}
-	return nil
+	s.fastDispatch.Store(s.Router.built.Load() && s.fastDispatchEligible() && s.config.MaxConcurrentReqs <= 0)
 }
 
 // SetProxy installs a reverse-proxy engine, replacing any existing one.
@@ -1699,7 +1590,8 @@ func (s *Server) OnProxyError(fn ProxyErrorFunc) {
 	s.computeFastDispatch()
 }
 
-// OnProxyRequest registers a callback invoked before a request is forwarded to a backend; modify pr.Headers or pr.Host to alter the outgoing request, or return false to reject with 502.
+// OnProxyRequest registers a callback invoked before a request is forwarded to a backend and before a cached response is served; modify pr.Path, pr.Headers or pr.Host to alter the outgoing request, or return false to reject with 502.
+// For a cache lookup the callback sees pr.Backend == "cache"; a rewritten request is never stored or served from the cache, so a request that bypasses a cached response runs the callback twice, once for the lookup with Backend "cache" and once for the forward with the real backend address.
 //
 // Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { pr.Headers = append(pr.Headers, [2]string{"X-Forwarded-For", pr.ClientAddr}); return true })
 // Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { return pr.Host != "blocked.example.com" })
@@ -1822,17 +1714,24 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 
 	clientIP := extractIP(req.RemoteAddr)
 	if s.perIPLimiter != nil {
-		if !s.perIPLimiter.acquire(clientIP, s.perIPRequestLimit()) {
+		slot, ok := s.perIPLimiter.hold(clientIP, s.perIPRequestLimit())
+		if !ok {
 			statsBlocked()
 			resp.Status(429).String("Too Many Requests")
 			return
 		}
-		defer func() {
-			if req.connTakenOver && s.trustedProxies.active {
-				return
-			}
-			s.perIPLimiter.release(clientIP)
-		}()
+		if slot != nil {
+			defer func() {
+				if req.h2Tunnel != nil {
+					req.h2Tunnel.adoptIPSlot(slot)
+					return
+				}
+				if req.connTakenOver && s.trustedProxies.active {
+					return
+				}
+				slot.release()
+			}()
+		}
 	}
 
 	if !s.runRequestHooks(req, resp) {

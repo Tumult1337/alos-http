@@ -2,91 +2,124 @@
 
 package core
 
-func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
-	encodeH2ResponseHeadersAt(enc, statusCode, contentType, contentLength, headers, serverName, responseDateValue(statusCode, headers))
+import (
+	"net/http"
+)
+
+const (
+	hpackStaticDate = 33
+	h2DateValueLen  = len(http.TimeFormat)
+)
+
+var h2DateFieldPrefix = appendH2DateFieldPrefix(nil)
+
+func appendH2DateFieldPrefix(dst []byte) []byte {
+	enc := HpackEncoder{Buf: dst}
+	enc.EncodeInt(0x00, 4, hpackStaticDate)
+	enc.EncodeInt(0x00, 7, uint64(h2DateValueLen))
+	return enc.Buf
 }
 
-func encodeH2ResponseHeadersAt(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName, date string) responseDateSpan {
+func currentH2DateField() []byte {
+	return currentHTTPDate().h2
+}
+
+func encodeH2ResponseHeaders(enc *HpackEncoder, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
+	encodeH2ResponseHeadersDated(enc, nil, nil, statusCode, contentType, contentLength, headers, serverName)
+}
+
+func encodeH2ResponseHeadersIndexed(enc *HpackEncoder, tbl *hpackEncTable, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
+	if tbl == nil || tbl.pendingUpdate || !tbl.headMemoReady(headers) {
+		encodeH2ResponseHeadersDated(enc, tbl, nil, statusCode, contentType, contentLength, headers, serverName)
+		return
+	}
+	date := currentHTTPDate()
+	if m := tbl.headMemo; m != nil && m.matches(tbl.gen, date, statusCode, contentType, contentLength, headers, serverName) {
+		m.probation = false
+		enc.Buf = append(enc.Buf, m.block...)
+		return
+	}
+	encodeH2ResponseHeadersRemembered(enc, tbl, date, statusCode, contentType, contentLength, headers, serverName)
+}
+
+func encodeH2ResponseHeadersDated(enc *HpackEncoder, tbl *hpackEncTable, dateField *httpDateLine, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
+	if tbl != nil {
+		tbl.beginBlock(enc)
+	}
 	enc.EncodeStatus(statusCode)
+	if dateEligible(statusCode, headers) {
+		if dateField == nil {
+			dateField = currentHTTPDate()
+		}
+		date := dateField.h2
+		if tbl == nil {
+			enc.Buf = append(enc.Buf, date...)
+		} else {
+			tbl.encodeField(enc, hpackStaticDate, "date", UnsafeString(date[len(h2DateFieldPrefix):]))
+		}
+	}
 
 	wroteContentType := false
 	wroteContentLength := false
 	wroteServer := false
 
 	if contentType != "" {
-		enc.encodeStaticFieldCached(hpackStaticContentType, contentType)
+		encodeH2StaticField(enc, tbl, hpackStaticContentType, "content-type", contentType)
 		wroteContentType = true
 	}
 	if contentLength >= 0 {
 		var clBuf [20]byte
 		clStr := appendUint(clBuf[:0], contentLength)
-		enc.encodeStaticFieldCached(hpackStaticContentLength, UnsafeString(clStr))
+		enc.EncodeInt(0x00, 4, hpackStaticContentLength)
+		enc.EncodeString(UnsafeString(clStr))
 		wroteContentLength = true
 	}
 
-	switch len(headers) {
-	case 0:
-	case 1:
-		name := headers[0][0]
-		if name != "" && name[0] != ':' && !isConnectionSpecificResponseField(name) {
-			switch {
-			case EqualFoldASCII(name, "content-type"):
-				if !wroteContentType {
-					wroteContentType = true
-					enc.EncodeHeaderFold(name, headers[0][1])
-				}
-			case EqualFoldASCII(name, "content-length"):
-				if !wroteContentLength {
-					wroteContentLength = true
-					enc.EncodeHeaderFold(name, headers[0][1])
-				}
-			case EqualFoldASCII(name, "server"):
-				if !wroteServer {
-					wroteServer = true
-					enc.EncodeHeaderFold(name, headers[0][1])
-				}
-			default:
-				enc.EncodeHeaderFold(name, headers[0][1])
-			}
+	for i := range headers {
+		name, value := headers[i][0], headers[i][1]
+		if name == "" || name[0] == ':' || isConnectionSpecificResponseField(name) {
+			continue
 		}
-	default:
-		for i := range headers {
-			name := headers[i][0]
-			if name == "" {
-				continue
-			}
-			if name[0] == ':' || isConnectionSpecificResponseField(name) {
-				continue
-			}
-			switch {
-			case EqualFoldASCII(name, "content-type"):
-				if wroteContentType {
-					continue
-				}
+		switch {
+		case EqualFoldASCII(name, "content-type"):
+			if !wroteContentType {
 				wroteContentType = true
-			case EqualFoldASCII(name, "content-length"):
-				if wroteContentLength {
-					continue
-				}
-				wroteContentLength = true
-			case EqualFoldASCII(name, "server"):
-				if wroteServer {
-					continue
-				}
-				wroteServer = true
+				encodeH2StaticField(enc, tbl, hpackStaticContentType, "content-type", value)
 			}
-			enc.EncodeHeaderFold(name, headers[i][1])
+		case EqualFoldASCII(name, "content-length"):
+			if !wroteContentLength {
+				wroteContentLength = true
+				enc.EncodeHeaderFold(name, value)
+			}
+		case EqualFoldASCII(name, "server"):
+			if !wroteServer {
+				wroteServer = true
+				encodeH2StaticField(enc, tbl, hpackStaticServer, "server", value)
+			}
+		default:
+			encodeH2CustomField(enc, tbl, name, value)
 		}
 	}
 
 	if !wroteServer {
-		enc.encodeStaticFieldCached(hpackStaticServer, serverName)
+		encodeH2StaticField(enc, tbl, hpackStaticServer, "server", serverName)
 	}
-	var span responseDateSpan
-	if date != "" {
-		span.start = len(enc.Buf)
-		enc.EncodeHeaderFold("date", date)
-		span.end = len(enc.Buf)
+}
+
+func encodeH2StaticField(enc *HpackEncoder, tbl *hpackEncTable, staticIdx int, lowerName, value string) {
+	if tbl == nil {
+		enc.encodeStaticFieldCached(staticIdx, value)
+		return
 	}
-	return span
+	tbl.encodeField(enc, staticIdx, lowerName, value)
+}
+
+func encodeH2CustomField(enc *HpackEncoder, tbl *hpackEncTable, name, value string) {
+	if tbl != nil {
+		if lower, ok := h2IndexableResponseField(name); ok {
+			tbl.encodeField(enc, hpackFindStaticNameFold(lower), lower, value)
+			return
+		}
+	}
+	enc.EncodeHeaderFold(name, value)
 }

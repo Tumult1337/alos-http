@@ -225,16 +225,13 @@ func TestCT_PerIPRequestLimiter(t *testing.T) {
 	})
 }
 
-func TestCT_AcquireIPConn_ProxyVsDirect(t *testing.T) {
-	t.Run("proxy mode rewrites real IP and never limits", func(t *testing.T) {
+func TestCT_ApplyTrustedIP_ProxyVsDirect(t *testing.T) {
+	t.Run("proxy mode rewrites the real IP", func(t *testing.T) {
 		s := New(Config{ProxyMode: true, MaxConnsPerIP: 2})
 		defer s.perIPConnLimiter.Load().Stop()
 		for i := 0; i < 50; i++ {
 			req := xffReq(strconv.Itoa(i), "198.51.100.7")
-			c := &epollConn{}
-			if !c.acquireIPConn(s, req) {
-				t.Fatalf("conn %d from same real IP must acquire behind a proxy", i)
-			}
+			applyTrustedIP(s, req)
 			if req.RemoteAddr != "198.51.100.7" {
 				t.Fatalf("conn %d RemoteAddr=%q want rewritten real IP", i, req.RemoteAddr)
 			}
@@ -245,35 +242,16 @@ func TestCT_AcquireIPConn_ProxyVsDirect(t *testing.T) {
 		defer s.perIPConnLimiter.Load().Stop()
 		a := xffReq("1", "203.0.113.10")
 		b := xffReq("2", "203.0.113.11")
-		ca, cb := &epollConn{}, &epollConn{}
-		if !ca.acquireIPConn(s, a) || !cb.acquireIPConn(s, b) {
-			t.Fatal("both conns must acquire behind a proxy regardless of limit")
-		}
+		applyTrustedIP(s, a)
+		applyTrustedIP(s, b)
 		if a.RemoteAddr != "203.0.113.10" || b.RemoteAddr != "203.0.113.11" {
 			t.Fatalf("real IPs mis-rewritten: a=%q b=%q", a.RemoteAddr, b.RemoteAddr)
 		}
 	})
-	t.Run("non-proxy defers to accept and does not set ipHeld", func(t *testing.T) {
-		s := New(Config{MaxConnsPerIP: 1})
-		defer s.perIPConnLimiter.Load().Stop()
-		c := &epollConn{}
-		if !c.acquireIPConn(s, &Request{RemoteAddr: "10.0.0.1:5"}) {
-			t.Fatal("non-proxy acquireIPConn must return true")
-		}
-		if c.ipHeld {
-			t.Fatal("non-proxy acquireIPConn must not hold a slot here")
-		}
-	})
-	t.Run("disabled limiter is always a no-op", func(t *testing.T) {
+	t.Run("negative MaxConnsPerIP disables the limiter", func(t *testing.T) {
 		s := New(Config{ProxyMode: true, MaxConnsPerIP: -1})
 		if s.perIPConnLimiter.Load() != nil {
 			t.Fatal("negative MaxConnsPerIP must disable the connection limiter")
-		}
-		c := &epollConn{}
-		for i := 0; i < 100; i++ {
-			if !c.acquireIPConn(s, xffReq("1", "203.0.113.1")) {
-				t.Fatal("disabled limiter must always allow")
-			}
 		}
 	})
 }

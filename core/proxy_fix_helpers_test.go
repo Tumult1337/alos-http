@@ -30,20 +30,9 @@ const proxyFixH2FrameHeaderLen = 9
 
 const proxyFixDomain = "origin.test"
 
-func proxyFixFreeAddr(t testing.TB) string {
-	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
-}
-
 func proxyFixStart(t testing.TB, cfg Config, domains []DomainConfig, tune func(*Server)) (*Server, string) {
 	t.Helper()
-	addr := proxyFixFreeAddr(t)
+	addr := freeLoopbackAddr(t)
 	cfg.Addr = addr
 	cfg.PlainHTTP = true
 	if cfg.HTTPAddr == "" {

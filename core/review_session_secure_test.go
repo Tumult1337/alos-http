@@ -16,7 +16,7 @@ import (
 
 func startSessionServer(t *testing.T, useTLS bool) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	cfg := Config{Addr: addr, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1, Listeners: 1}
 	if useTLS {
 		cfg.Certs = []CertConfig{{Domain: "sess.test", Source: CertSelfSigned}}

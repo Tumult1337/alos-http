@@ -87,7 +87,7 @@ func TestTLSEpollFixBodyAboveReadCapGets413(t *testing.T) {
 	}
 }
 
-func TestTLSEpollFixRootFastPathAnswers503WhenSaturated(t *testing.T) {
+func TestTLSEpollFixRootAnswers503WhenSaturated(t *testing.T) {
 	h := newBlockingHandler()
 	ts := newTestServer(t, testServerOptions{
 		Config: func(c *Config) { c.MaxConcurrentReqs = 1 },
@@ -96,9 +96,6 @@ func TestTLSEpollFixRootFastPathAnswers503WhenSaturated(t *testing.T) {
 			h.route(r)
 		},
 	})
-	if ts.srv.plainRootFast.Load() == nil {
-		t.Fatal("root fast path not active; the test would not exercise it")
-	}
 	blocked := ts.dial(t)
 	if _, err := io.WriteString(blocked, "GET /block HTTP/1.1\r\nHost: x\r\n\r\n"); err != nil {
 		t.Fatal(err)

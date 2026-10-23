@@ -80,9 +80,19 @@ func TestQUICStreamLimitAdvertisement(t *testing.T) {
 	}
 }
 
+func newQUICUnadmittedPeer(t *testing.T, routes func(*Router)) *quicTestPeer {
+	t.Helper()
+	srv := New(Config{H2MaxRunningHandlers: quicMaxConcurrentReqStreams})
+	routes(srv.Router)
+	srv.Router.Build()
+	p := newQUICTestPeerFor(t, srv)
+	p.qc.peerUniStreamWindow = 16 << 20
+	return p
+}
+
 func TestQUICStreamLimitFullWindowThenCreditReturns(t *testing.T) {
 	g := newGatedRoutes()
-	p := newQUICTestPeer(t, g.route)
+	p := newQUICUnadmittedPeer(t, g.route)
 	openGatedStreams(p, 0, quicMaxBidiStreams)
 	g.awaitEntered(t, quicMaxBidiStreams)
 
@@ -110,7 +120,7 @@ func TestQUICStreamLimitFullWindowThenCreditReturns(t *testing.T) {
 
 func TestQUICStreamLimitBeyondCreditIsAnError(t *testing.T) {
 	g := newGatedRoutes()
-	p := newQUICTestPeer(t, g.route)
+	p := newQUICUnadmittedPeer(t, g.route)
 	openGatedStreams(p, 0, quicMaxBidiStreams)
 	g.awaitEntered(t, quicMaxBidiStreams)
 	openGatedStreams(p, quicMaxBidiStreams, 1)
@@ -138,8 +148,13 @@ func TestQUICManySequentialRequestsOnOneConnection(t *testing.T) {
 			if turbo.Until(deadline) <= 0 {
 				t.Fatalf("streams are not being retired (%d tracked)", p.streamCount())
 			}
+			p.ackEverySent()
 			turbo.Sleep(time.Millisecond)
 		}
+	}
+	for p.streamCount() > 0 && turbo.Until(deadline) > 0 {
+		p.ackEverySent()
+		turbo.Sleep(time.Millisecond)
 	}
 	p.awaitStreamCount(0)
 	if got := p.sent(); len(got.closes) != 0 {

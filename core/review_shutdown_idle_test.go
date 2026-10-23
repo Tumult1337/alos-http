@@ -24,12 +24,7 @@ const (
 
 func startIdleShutdownServer(t *testing.T, useTLS bool) (*Server, string) {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	cfg := Config{
 		Addr: addr, HTTPAddr: "-",
 		LogRequests: false, MaxConnsPerIP: -1, Listeners: 1,

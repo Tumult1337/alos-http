@@ -27,6 +27,7 @@ func classifyH1StreamHeaders(headers [][2]string) (bool, bool) {
 
 func appendH1StreamHead(buf []byte, statusCode int, headers [][2]string, contentType string, chunked, closeAfter bool, serverName string, altSvc *altSvcHeader) []byte {
 	buf = appendStatusLine(buf, statusCode)
+	buf = appendDateUnlessSet(buf, statusCode, headers)
 	if contentType != "" {
 		buf = appendContentTypeHeader(buf, contentType)
 	}
@@ -50,7 +51,6 @@ func appendH1StreamHead(buf []byte, statusCode int, headers [][2]string, content
 		buf = append(buf, headers[i][1]...)
 		buf = append(buf, '\r', '\n')
 	}
-	buf = appendH1ResponseDate(buf, statusCode, headers)
 	if !hasConnection {
 		if closeAfter {
 			buf = append(buf, "Connection: close\r\n"...)

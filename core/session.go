@@ -149,14 +149,18 @@ func (s *Session) Regenerate() bool {
 type sessionEntry struct {
 	data      map[string]any
 	expiresAt int64
+	returned  atomic.Bool
 }
 
 type sessionEvictionCandidate struct {
-	id    string
-	entry *sessionEntry
+	id       string
+	entry    *sessionEntry
+	returned bool
 }
 
 // MemorySessionStore is an in-memory SessionStore suitable for single-process use.
+// When it is full, a save first evicts sessions that no request has read back since they were
+// created, soonest-expiring first, and then the soonest-expiring sessions that were read back.
 type MemorySessionStore struct {
 	entries       *alosmap.TypedMap[string, *sessionEntry]
 	maxEntries    int64
@@ -210,9 +214,7 @@ func (s *MemorySessionStore) makeRoom() {
 	live := s.evictionCandidates()
 	remaining := int64(len(live))
 	if excess := remaining - (s.maxEntries - s.evictionBatch); excess > 0 {
-		slices.SortFunc(live, func(a, b sessionEvictionCandidate) int {
-			return cmp.Compare(a.entry.expiresAt, b.entry.expiresAt)
-		})
+		slices.SortFunc(live, compareSessionEviction)
 		for _, victim := range live[:excess] {
 			if s.entries.CompareAndDelete(victim.id, victim.entry) {
 				remaining--
@@ -222,10 +224,20 @@ func (s *MemorySessionStore) makeRoom() {
 	s.tracked.Store(remaining)
 }
 
+func compareSessionEviction(a, b sessionEvictionCandidate) int {
+	if a.returned != b.returned {
+		if a.returned {
+			return 1
+		}
+		return -1
+	}
+	return cmp.Compare(a.entry.expiresAt, b.entry.expiresAt)
+}
+
 func (s *MemorySessionStore) evictionCandidates() []sessionEvictionCandidate {
 	live := make([]sessionEvictionCandidate, 0, min(s.maxEntries, int64(s.entries.Len())))
 	s.entries.Range(func(id string, entry *sessionEntry) bool {
-		live = append(live, sessionEvictionCandidate{id: id, entry: entry})
+		live = append(live, sessionEvictionCandidate{id: id, entry: entry, returned: entry.returned.Load()})
 		return true
 	})
 	return live
@@ -243,6 +255,9 @@ func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
 	v, ok := s.entries.Load(id)
 	if !ok {
 		return nil, false
+	}
+	if !v.returned.Load() {
+		v.returned.Store(true)
 	}
 	cp := make(map[string]any, len(v.data))
 	for k, val := range v.data {
@@ -262,7 +277,9 @@ func (s *MemorySessionStore) saveWithTTL(id string, data map[string]any, ttl tim
 		cp[k] = v
 	}
 	entry := &sessionEntry{data: cp, expiresAt: sessionExpiresAt(ttl)}
-	if !s.entries.Has(id) {
+	if old, ok := s.entries.Peek(id); ok {
+		entry.returned.Store(old.returned.Load())
+	} else {
 		s.reserveEntry()
 	}
 	if ttl > 0 {
