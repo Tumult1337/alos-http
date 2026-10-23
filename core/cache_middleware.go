@@ -321,7 +321,7 @@ func (rc *ResponseCache) newEntry(status int, resp *Response, body []byte, now i
 func (ent *cachedResponse) setAge(resp *Response, now int64) {
 	age := ent.initialAge + time.Duration(max(0, now-ent.storedAtNs))
 	var buf [20]byte
-	resp.SetHeaderUnsafe("Age", string(appendUint(buf[:0], int64(age/time.Second))))
+	resp.SetHeaderUnsafe("Age", string(appendUint(buf[:0], int64(clampCacheAge(age)/time.Second))))
 }
 
 func (rc *ResponseCache) storeBounded(key string, ent *cachedResponse) {

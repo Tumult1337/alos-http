@@ -308,3 +308,73 @@ func TestCache_ConcurrentStoresNeverExceedMaxEntries(t *testing.T) {
 		t.Fatalf("store holds %d entries, counter says %d", got, counted)
 	}
 }
+
+const cacheHostileYear1 = "Mon, 01 Jan 0001 00:00:00 GMT"
+
+func TestCache_HostileFreshnessIsNotStored(t *testing.T) {
+	now := time.Unix(0, turbo.UnixNano())
+	date := now.UTC().Format(http.TimeFormat)
+	cases := []struct {
+		name    string
+		headers [][2]string
+	}{
+		{name: "expires-year-1-with-age", headers: [][2]string{{"Date", date}, {"Expires", cacheHostileYear1}, {"Age", "10"}}},
+		{name: "expires-invalid-with-age", headers: [][2]string{{"Date", date}, {"Expires", "garbage"}, {"Age", "10"}}},
+		{name: "expires-invalid-no-date", headers: [][2]string{{"Expires", "garbage"}}},
+		{name: "date-year-1", headers: [][2]string{{"Cache-Control", "max-age=3600"}, {"Date", cacheHostileYear1}}},
+		{name: "age-overflow", headers: [][2]string{{"Cache-Control", "max-age=3600"}, {"Age", "99999999999999999999"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := NewResponseCache(CacheConfig{TTL: time.Minute})
+			defer rc.Stop()
+			rc.handle(cacheFreshHandler(tc.headers...), cReq("GET", "x", "/h", ""), cResp())
+			if _, ok := cacheFreshStored(t, rc, "/h"); ok {
+				t.Fatal("hostile freshness headers produced a stored response")
+			}
+		})
+	}
+}
+
+func TestCacheFreshnessAgeIsClamped(t *testing.T) {
+	now := time.Unix(0, turbo.UnixNano())
+	maxAge := time.Duration(cacheDeltaSecondsMax) * time.Second
+	cases := []struct {
+		name    string
+		headers [][2]string
+		want    time.Duration
+	}{
+		{name: "date-year-1", headers: [][2]string{{"Date", cacheHostileYear1}}, want: maxAge},
+		{name: "date-year-9999", headers: [][2]string{{"Date", "Fri, 31 Dec 9999 23:59:59 GMT"}}, want: 0},
+		{name: "age-overflow", headers: [][2]string{{"Age", "99999999999999999999"}}, want: maxAge},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseCacheFreshness(tc.headers, now).age; got != tc.want {
+				t.Fatalf("age %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCache_SetAgeSaturates(t *testing.T) {
+	now := turbo.UnixNano()
+	cases := []struct {
+		name string
+		ent  cachedResponse
+		want string
+	}{
+		{name: "max-initial-age-plus-resident", ent: cachedResponse{initialAge: time.Duration(cacheDeltaSecondsMax) * time.Second, storedAtNs: now - int64(time.Hour)}, want: "2147483648"},
+		{name: "negative-initial-age", ent: cachedResponse{initialAge: -5 * time.Second, storedAtNs: now}, want: "0"},
+		{name: "stored-in-future", ent: cachedResponse{storedAtNs: now + int64(time.Hour)}, want: "0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := cResp()
+			tc.ent.setAge(resp, now)
+			if ages := respHeaderValues(resp, "Age"); len(ages) != 1 || ages[0] != tc.want {
+				t.Fatalf("Age %v, want [%s]", ages, tc.want)
+			}
+		})
+	}
+}

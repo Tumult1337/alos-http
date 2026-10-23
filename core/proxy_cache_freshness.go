@@ -123,7 +123,7 @@ func parseCacheFreshness(headers [][2]string, received time.Time) cacheFreshness
 		base = date
 		age = max(age, received.Sub(date))
 	}
-	out := cacheFreshness{age: age, noStale: f.revalidate || f.sMaxAge.present}
+	out := cacheFreshness{age: clampCacheAge(age), noStale: f.revalidate || f.sMaxAge.present}
 	switch {
 	case f.sMaxAge.present:
 		out.explicit, out.lifetime = true, f.sMaxAge.lifetime
@@ -135,13 +135,16 @@ func parseCacheFreshness(headers [][2]string, received time.Time) cacheFreshness
 	return out
 }
 
+func clampCacheAge(age time.Duration) time.Duration {
+	return min(max(age, 0), cacheDeltaSecondsMax*time.Second)
+}
+
 func (f cacheFreshness) storeTTL(configured time.Duration) (time.Duration, bool) {
 	if !f.explicit {
 		return configured, true
 	}
-	remaining := f.lifetime - f.age
-	if remaining <= 0 {
+	if f.lifetime <= f.age {
 		return 0, false
 	}
-	return min(configured, remaining), true
+	return min(configured, f.lifetime-f.age), true
 }
