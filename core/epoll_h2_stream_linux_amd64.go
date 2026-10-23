@@ -64,6 +64,8 @@ type epollH2StreamWriter struct {
 	sendRST     bool
 	err         error
 	file        h2FileSend
+
+	lease streamWriterLease
 }
 
 func (c *epollConn) newH2StreamWriter(req *Request) StreamWriter {
@@ -79,7 +81,10 @@ func (c *epollConn) newH2StreamWriter(req *Request) StreamWriter {
 		sw.maxWrite = 0
 	}
 	sw.cors.bind(req)
-	return sw
+	sw.mu.Lock()
+	gen := sw.lease.acquire()
+	sw.mu.Unlock()
+	return &h2StreamHandle{sw: sw, gen: gen}
 }
 
 func (sw *epollH2StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
@@ -216,6 +221,19 @@ func (sw *epollH2StreamWriter) fail(err error) {
 }
 
 func (sw *epollH2StreamWriter) release() {
+	sw.mu.Lock()
+	if sw.err == nil {
+		sw.err = ErrStreamClosed
+	}
+	sw.space.Broadcast()
+	recycle := sw.lease.releaseLocked() && !sw.pumpQueued
+	sw.mu.Unlock()
+	if recycle {
+		sw.recycle()
+	}
+}
+
+func (sw *epollH2StreamWriter) recycle() {
 	sw.c, sw.w, sw.stream = nil, nil, nil
 	sw.gen, sw.streamID = 0, 0
 	sw.method, sw.serverName, sw.altSvc = "", "", nil
@@ -238,6 +256,17 @@ func (sw *epollH2StreamWriter) release() {
 }
 
 func (c *epollConn) h2PumpTask(w *epollWorker, sw *epollH2StreamWriter) {
+	sw.mu.Lock()
+	if sw.lease.released {
+		sw.pumpQueued = false
+		recycle := sw.lease.calls == 0
+		sw.mu.Unlock()
+		if recycle {
+			sw.recycle()
+		}
+		return
+	}
+	sw.mu.Unlock()
 	if c.generation != sw.gen || c.fd < 0 {
 		sw.mu.Lock()
 		sw.pumpQueued = false

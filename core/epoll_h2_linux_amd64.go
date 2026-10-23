@@ -1038,7 +1038,7 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 	if c.inFlight > 0 {
 		c.inFlight--
 	}
-	sw, _ := stream.resp.sw.(*epollH2StreamWriter)
+	sw := h2StreamWriterOf(stream.resp.sw)
 	if c.generation != gen || c.fd < 0 {
 		stream.asyncBusy = false
 		if sw != nil {

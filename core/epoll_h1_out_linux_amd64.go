@@ -72,6 +72,8 @@ type epollH1StreamWriter struct {
 	fileProgress bool
 	fileNeedIO   bool
 	fileRef      *staticFD
+
+	lease streamWriterLease
 }
 
 func (c *epollConn) newStreamWriter(req *Request) StreamWriter {
@@ -94,7 +96,10 @@ func (c *epollConn) newH1StreamWriter(req *Request) StreamWriter {
 	sw.limiter, sw.global = c.connLimiter, srv.globalLimiter
 	sw.maxWrite = srv.config.MaxWriteSize
 	sw.cors.bind(req)
-	return sw
+	sw.mu.Lock()
+	gen := sw.lease.acquire()
+	sw.mu.Unlock()
+	return &h1StreamHandle{sw: sw, gen: gen}
 }
 
 func (sw *epollH1StreamWriter) WriteHeader(statusCode int, headers [][2]string, contentType string) error {
@@ -243,6 +248,19 @@ func (sw *epollH1StreamWriter) fail(err error) {
 }
 
 func (sw *epollH1StreamWriter) release() {
+	sw.mu.Lock()
+	if sw.err == nil {
+		sw.err = ErrStreamClosed
+	}
+	sw.space.Broadcast()
+	recycle := sw.lease.releaseLocked() && !sw.pumpQueued
+	sw.mu.Unlock()
+	if recycle {
+		sw.recycle()
+	}
+}
+
+func (sw *epollH1StreamWriter) recycle() {
 	sw.c, sw.w, sw.gen = nil, nil, 0
 	sw.method, sw.serverName, sw.altSvc = "", "", nil
 	sw.reqClose = false
@@ -270,6 +288,14 @@ func (sw *epollH1StreamWriter) release() {
 func (c *epollConn) h1StreamPumpTask(w *epollWorker, sw *epollH1StreamWriter) {
 	sw.mu.Lock()
 	sw.pumpQueued = false
+	if sw.lease.released {
+		recycle := sw.lease.calls == 0
+		sw.mu.Unlock()
+		if recycle {
+			sw.recycle()
+		}
+		return
+	}
 	sw.mu.Unlock()
 	if c.generation != sw.gen || c.fd < 0 {
 		sw.fail(ErrStreamClosed)

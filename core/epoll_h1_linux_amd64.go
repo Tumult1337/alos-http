@@ -411,7 +411,7 @@ func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) 
 	if mustClose || w.server.shuttingDown.Load() {
 		reqClose = true
 	}
-	sw, _ := c.resp.sw.(*epollH1StreamWriter)
+	sw := h1StreamWriterOf(c.resp.sw)
 	if sw != nil {
 		c.resp.sw = nil
 		c.req.StreamWriter = nil

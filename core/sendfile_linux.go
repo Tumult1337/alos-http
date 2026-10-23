@@ -17,10 +17,10 @@ const nativeSendFileChunk = 64 << 10
 var nativeSendFileHook func(wrote int64)
 
 func trySendFileFastPath(sw StreamWriter, file *os.File, start, length int64, limiter *TokenBucket) (bool, error) {
-	if epollWriter, ok := sw.(*epollH1StreamWriter); ok {
+	if epollWriter, ok := sw.(*h1StreamHandle); ok {
 		return epollWriter.sendFileRange(file, start, length, limiter)
 	}
-	if h2Writer, ok := sw.(*epollH2StreamWriter); ok {
+	if h2Writer, ok := sw.(*h2StreamHandle); ok {
 		return h2Writer.sendFileRange(file, start, length, limiter)
 	}
 	writer, ok := sw.(*PlainH1StreamWriter)

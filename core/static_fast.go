@@ -667,8 +667,7 @@ func (e *staticCacheEntry) serve(req *Request, resp *Response) {
 }
 
 func staticFileWriter(resp *Response) *epollH1StreamWriter {
-	sw, _ := resp.ensureSW().(*epollH1StreamWriter)
-	return sw
+	return h1StreamWriterOf(resp.ensureSW())
 }
 
 func (e *staticCacheEntry) serveFD(req *Request, resp *Response, sw *epollH1StreamWriter, h *staticFD) {
