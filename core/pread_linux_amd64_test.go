@@ -116,4 +116,3 @@ func TestWarmFileRangeTruncatedAfterSizeSnapshotFails(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
-

@@ -83,3 +83,22 @@ func TestH2DirectScratchSendSkipsEmptySegments(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+func TestWsSendFrameDoesNotAllocate(t *testing.T) {
+	tx, rx := socketPairForSend(t)
+	payload := make([]byte, 64)
+	sink := make([]byte, 128)
+	allocs := testing.AllocsPerRun(100, func() {
+		var hdr [wsMaxFrameHeaderLen]byte
+		h := wsAppendFrameHeader(hdr[:0], 0x82, len(payload))
+		if _, err := wsSendFrame(tx, h, payload); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := unix.Read(rx, sink); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if allocs != 0 {
+		t.Fatalf("allocs=%v", allocs)
+	}
+}

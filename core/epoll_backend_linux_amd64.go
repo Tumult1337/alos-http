@@ -369,7 +369,6 @@ type epollWorker struct {
 	beScratch       []byte
 	hdrStrings      [][2]string
 	sendIov         [2]unix.Iovec
-	sendMsg         unix.Msghdr
 	acceptAddr      unix.RawSockaddrAny
 	acceptAddrLen   uint32
 	sockoptInherit  uint8
@@ -1849,7 +1848,7 @@ func (w *epollWorker) sendWithBody(c *epollConn) (int, error) {
 		return socketSend(c.fd, c.bodyOut)
 	}
 	iov := appendIovec(appendIovec(w.sendIov[:0], head), c.bodyOut)
-	return socketSendIovecs(c.fd, &w.sendMsg, iov)
+	return socketSendIovecs(c.fd, iov)
 }
 
 func (c *epollConn) advanceSent(n int) {

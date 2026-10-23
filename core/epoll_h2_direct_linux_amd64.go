@@ -15,7 +15,6 @@ type h2DirectScratch struct {
 	hdrs []byte
 	segs [][]byte
 	iov  []unix.Iovec
-	msg  unix.Msghdr
 }
 
 func (c *epollConn) h2SendsDirect(stream *H2Stream, budget int) bool {
@@ -107,7 +106,7 @@ func (d *h2DirectScratch) send(fd int, segs [][]byte) int {
 	for _, seg := range segs {
 		iov = appendIovec(iov, seg)
 	}
-	n, err := socketSendIovecs(fd, &d.msg, iov)
+	n, err := socketSendIovecs(fd, iov)
 	d.iov = iov[:0]
 	if err != nil {
 		return 0
