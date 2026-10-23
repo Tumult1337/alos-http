@@ -51,6 +51,7 @@ func (s *Server) attachAltSvc(fast *h2RootFastResponse) *h2RootFastResponse {
 	header := make([]byte, 0, len(fast.headerPayload)+len(alt.hpack))
 	header = append(append(header, fast.headerPayload...), alt.hpack...)
 	withAlt.withAltSvc = newH2RootFastResponse(header, fast.body)
+	withAlt.withAltSvc.refreshDate = fast.refreshDate
 	return &withAlt
 }
 

@@ -16,6 +16,8 @@ const httpDateLineLen = len("Date: ") + len(http.TimeFormat) + len("\r\n")
 
 type httpDateLine struct {
 	expiresMono int64
+	text        string
+	h2          []byte
 	line        [httpDateLineLen]byte
 	ok200       [len(plainContentTypePresets)][]byte
 }
@@ -46,6 +48,8 @@ func newHTTPDateLine(unixNano, mono int64) *httpDateLine {
 	b := append(d.line[:0], dateHeaderPrefix...)
 	b = time.Unix(sec, 0).UTC().AppendFormat(b, http.TimeFormat)
 	_ = append(b, '\r', '\n')
+	d.text = string(d.line[len(dateHeaderPrefix) : httpDateLineLen-2])
+	d.h2 = append(appendH2DateFieldPrefix(make([]byte, 0, len(h2DateFieldPrefix)+h2DateValueLen)), d.text...)
 	head := append(append([]byte(nil), statusLines[http.StatusOK]...), d.line[:]...)
 	for i, ct := range plainContentTypePresets {
 		d.ok200[i] = append(head[:len(head):len(head)], ct...)
@@ -75,8 +79,8 @@ func refreshHTTPDateLine() *httpDateLine {
 	return d
 }
 
-func appendDateUnlessSet(dst []byte, headers [][2]string) []byte {
-	if len(headers) != 0 && headersHaveFold(headers, "Date") {
+func appendDateUnlessSet(dst []byte, status int, headers [][2]string) []byte {
+	if !dateEligible(status, headers) {
 		return dst
 	}
 	return append(dst, currentHTTPDateLine()[:]...)
@@ -90,6 +94,13 @@ func appendH1HeaderFields(dst []byte, headers [][2]string) []byte {
 		dst = append(dst, '\r', '\n')
 	}
 	return dst
+}
+
+func appendRootFastResponse(dst, memo []byte, refreshDate bool) []byte {
+	if !refreshDate {
+		return append(dst, memo...)
+	}
+	return appendMemoizedResponse(dst, memo)
 }
 
 func appendMemoizedResponse(dst, memo []byte) []byte {
@@ -212,7 +223,7 @@ func BuildH1Response(resp *Response) ([]byte, *[]byte) {
 	headerBodyLen := resp.headerContentLength()
 
 	buf = appendStatusLine(buf, resp.StatusCode)
-	buf = appendDateUnlessSet(buf, resp.Headers)
+	buf = appendDateUnlessSet(buf, resp.StatusCode, resp.Headers)
 
 	if resp.ContentType != "" {
 		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
@@ -259,7 +270,7 @@ func WriteH1Response(conn net.Conn, writer *TrafficAEAD, resp *Response) error {
 	ibp := WriteBufPool.Get().(*[]byte)
 	inner := (*ibp)[:0]
 	inner = appendStatusLine(inner, resp.StatusCode)
-	inner = appendDateUnlessSet(inner, resp.Headers)
+	inner = appendDateUnlessSet(inner, resp.StatusCode, resp.Headers)
 	if resp.ContentType != "" {
 		if pre := ctPrefixLookup(resp.ContentType); pre != nil {
 			inner = append(inner, pre...)

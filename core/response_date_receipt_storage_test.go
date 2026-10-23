@@ -5,35 +5,29 @@ package core
 import (
 	"bytes"
 	"fmt"
-	"sync"
 	"testing"
 )
 
 func TestResponseDateMaterializedValueOwnership(t *testing.T) {
-	const cached = "Thu, 01 Jan 2026 00:00:00 GMT"
+	const cached = sharedDateText
 	for _, consumer := range []string{"parser", "worker"} {
 		for _, valueCase := range []struct {
 			name, value string
 			hit         bool
-			nilCache    bool
 		}{
-			{"date", cached, true, false},
-			{"date", cached, false, false},
-			{"date", cached, false, true},
-			{"date", "opaque Date", false, false},
-			{"date", "", false, false},
-			{"dAtE", cached, false, false},
-			{"x-other", cached, false, false},
+			{"date", cached, true},
+			{"date", cached, false},
+			{"date", "opaque Date", false},
+			{"date", "", false},
+			{"dAtE", cached, false},
+			{"x-other", cached, false},
 		} {
-			t.Run(fmt.Sprintf("%s/%s/%q/hit=%t/nil=%t", consumer, valueCase.name, valueCase.value, valueCase.hit, valueCase.nilCache), func(t *testing.T) {
-				entry := &httpDateEntry{unix: 1767225600, text: cached}
-				if !valueCase.hit {
-					entry = &httpDateEntry{unix: 1767225601, text: "Thu, 01 Jan 2026 00:00:01 GMT"}
+			t.Run(fmt.Sprintf("%s/%s/%q/hit=%t", consumer, valueCase.name, valueCase.value, valueCase.hit), func(t *testing.T) {
+				if valueCase.hit {
+					installDateUnix(t, sharedDateUnix)
+				} else {
+					installDateUnix(t, sharedDateUnix+1)
 				}
-				if valueCase.nilCache {
-					entry = nil
-				}
-				lastResponseHTTPDate.Store(entry)
 				rawName, rawValue := []byte(valueCase.name), []byte(valueCase.value)
 				raw := [][2][]byte{{rawName, rawValue}}
 				var fields [][2]string
@@ -48,7 +42,7 @@ func TestResponseDateMaterializedValueOwnership(t *testing.T) {
 					t.Fatalf("materialized fields=%q", fields)
 				}
 				retained := fields[0][1]
-				lastResponseHTTPDate.Store(&httpDateEntry{unix: 1767225602, text: "Thu, 01 Jan 2026 00:00:02 GMT"})
+				installDateUnix(t, sharedDateUnix+2)
 				for index := range rawValue {
 					rawValue[index] = '!'
 				}
@@ -59,41 +53,6 @@ func TestResponseDateMaterializedValueOwnership(t *testing.T) {
 					t.Fatalf("retained header changed after raw reuse: got=%q want=%q", retained, valueCase.value)
 				}
 			})
-		}
-	}
-}
-
-func TestResponseDateMaterializersConcurrentCacheReplacement(t *testing.T) {
-	const rawText = "Thu, 01 Jan 2026 00:00:00 GMT"
-	matching := &httpDateEntry{unix: 1767225600, text: rawText}
-	other := &httpDateEntry{unix: 1767225601, text: "Thu, 01 Jan 2026 00:00:01 GMT"}
-	lastResponseHTTPDate.Store(matching)
-	stop, started := make(chan struct{}), make(chan struct{})
-	var publisher sync.WaitGroup
-	publisher.Add(1)
-	go func() {
-		defer publisher.Done()
-		close(started)
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				lastResponseHTTPDate.Store(other)
-				lastResponseHTTPDate.Store(matching)
-			}
-		}
-	}()
-	<-started
-	defer func() { close(stop); publisher.Wait() }()
-	raw := [][2][]byte{{[]byte("date"), []byte(rawText)}}
-	parser, worker := h1Parser{hdr: raw}, epollWorker{}
-	for index := 0; index < 200000; index++ {
-		if got := parser.stringHeaders()[0][1]; got != rawText {
-			t.Fatalf("parser selected a different cache epoch: %q", got)
-		}
-		if got := worker.headerStrings(respHeaders{raw: raw})[0][1]; got != rawText {
-			t.Fatalf("worker selected a different cache epoch: %q", got)
 		}
 	}
 }
@@ -126,8 +85,8 @@ func TestResponseDateReceiptBufferReuse(t *testing.T) {
 }
 
 func TestResponseDateMaterializersReuseCachedString(t *testing.T) {
-	const text = "Thu, 01 Jan 2026 00:00:00 GMT"
-	lastResponseHTTPDate.Store(&httpDateEntry{unix: 1767225600, text: text})
+	const text = sharedDateText
+	installSharedDate(t)
 	raw := [][2][]byte{{[]byte("date"), []byte(text)}}
 	parser, worker := h1Parser{hdr: raw}, epollWorker{}
 	for _, consumer := range []string{"parser", "worker"} {

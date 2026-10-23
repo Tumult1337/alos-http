@@ -251,7 +251,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				return false, err
 			}
 			c.rbuf.consume(idx + 4)
-			if c.cur.req.ensureResponseDate && (p.status == 101 || p.status >= 200) {
+			if c.cur.req.ensureResponseDate && p.wantsReceiptDate() {
 				p.addReceiptDate()
 			}
 			if p.status == 101 {

@@ -700,6 +700,7 @@ type plainRootFastResponse struct {
 	getKeepAliveTLS []byte
 	getCloseTLS     []byte
 	handlerAltSvc   bool
+	refreshDate     bool
 	tlsKeepAlive    []byte
 	tlsClose        []byte
 }
@@ -713,6 +714,7 @@ type h2RootFastResponse struct {
 	headerIDOff   int
 	dataIDOff     int
 	handlerAltSvc bool
+	refreshDate   bool
 	withAltSvc    *h2RootFastResponse
 }
 
@@ -1592,6 +1594,7 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 		getKeepAliveTLS: keepAliveTLS,
 		getCloseTLS:     closeTLS,
 		handlerAltSvc:   headersHaveFold(resp.Headers, altSvcHeaderName),
+		refreshDate:     dateEligible(resp.StatusCode, resp.Headers),
 	}
 }
 
@@ -1630,6 +1633,7 @@ func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
 
 	fastResp := newH2RootFastResponse(append([]byte(nil), enc.Buf...), append([]byte(nil), resp.transmittedBodyBytes()...))
 	fastResp.handlerAltSvc = headersHaveFold(resp.Headers, altSvcHeaderName)
+	fastResp.refreshDate = dateEligible(resp.StatusCode, resp.Headers)
 	return fastResp
 }
 

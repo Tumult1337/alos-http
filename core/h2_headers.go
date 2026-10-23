@@ -4,10 +4,6 @@ package core
 
 import (
 	"net/http"
-	"sync/atomic"
-	"time"
-
-	"github.com/guno1928/turbo"
 )
 
 const (
@@ -15,15 +11,7 @@ const (
 	h2DateValueLen  = len(http.TimeFormat)
 )
 
-type h2DateField struct {
-	unix int64
-	enc  []byte
-}
-
-var (
-	h2DateFieldPrefix = appendH2DateFieldPrefix(nil)
-	currentH2Date     atomic.Pointer[h2DateField]
-)
+var h2DateFieldPrefix = appendH2DateFieldPrefix(nil)
 
 func appendH2DateFieldPrefix(dst []byte) []byte {
 	enc := HpackEncoder{Buf: dst}
@@ -32,23 +20,8 @@ func appendH2DateFieldPrefix(dst []byte) []byte {
 	return enc.Buf
 }
 
-func newH2DateField(unix int64) *h2DateField {
-	enc := appendH2DateFieldPrefix(make([]byte, 0, len(h2DateFieldPrefix)+h2DateValueLen))
-	return &h2DateField{unix: unix, enc: time.Unix(unix, 0).UTC().AppendFormat(enc, http.TimeFormat)}
-}
-
 func currentH2DateField() []byte {
-	return loadH2DateField().enc
-}
-
-func loadH2DateField() *h2DateField {
-	now := turbo.Unix()
-	f := currentH2Date.Load()
-	if f == nil || f.unix != now {
-		f = newH2DateField(now)
-		currentH2Date.Store(f)
-	}
-	return f
+	return currentHTTPDate().h2
 }
 
 func h2StatusFieldLen(block []byte) int {
@@ -79,7 +52,7 @@ func encodeH2ResponseHeadersIndexed(enc *HpackEncoder, tbl *hpackEncTable, statu
 		encodeH2ResponseHeadersDated(enc, tbl, nil, statusCode, contentType, contentLength, headers, serverName)
 		return
 	}
-	date := loadH2DateField()
+	date := currentHTTPDate()
 	if m := tbl.headMemo; m != nil && m.matches(tbl.gen, date, statusCode, contentType, contentLength, headers, serverName) {
 		m.probation = false
 		enc.Buf = append(enc.Buf, m.block...)
@@ -88,16 +61,16 @@ func encodeH2ResponseHeadersIndexed(enc *HpackEncoder, tbl *hpackEncTable, statu
 	encodeH2ResponseHeadersRemembered(enc, tbl, date, statusCode, contentType, contentLength, headers, serverName)
 }
 
-func encodeH2ResponseHeadersDated(enc *HpackEncoder, tbl *hpackEncTable, dateField *h2DateField, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
+func encodeH2ResponseHeadersDated(enc *HpackEncoder, tbl *hpackEncTable, dateField *httpDateLine, statusCode int, contentType string, contentLength int64, headers [][2]string, serverName string) {
 	if tbl != nil {
 		tbl.beginBlock(enc)
 	}
 	enc.EncodeStatus(statusCode)
-	if !headersHaveFold(headers, "date") {
+	if dateEligible(statusCode, headers) {
 		if dateField == nil {
-			dateField = loadH2DateField()
+			dateField = currentHTTPDate()
 		}
-		date := dateField.enc
+		date := dateField.h2
 		if tbl == nil {
 			enc.Buf = append(enc.Buf, date...)
 		} else {

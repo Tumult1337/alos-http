@@ -58,7 +58,7 @@ func TestPlainRootFastHeaderLimits(t *testing.T) {
 				if reject != h1RejectNone || parsed != limit.wantOK || tooLarge == limit.wantOK {
 					t.Fatalf("general parser: parsed=%v tooLarge=%v reject=%v; want accepted=%v", parsed, tooLarge, reject, limit.wantOK)
 				}
-				got, consumed, closeConn, ok := server.matchPlainRootFastRequest(raw, false)
+				got, consumed, closeConn, ok, _ := server.matchPlainRootFastRequest(raw, false)
 				if ok != limit.wantOK {
 					t.Fatalf("fast path accepted=%v; want %v (bytes=%d count=%d)", ok, limit.wantOK, limit.maxBytes, limit.maxCount)
 				}
@@ -82,7 +82,7 @@ func TestPlainRootFastDefaultHeaderCount(t *testing.T) {
 		server.plainRootFast.Store(&plainRootFastResponse{getKeepAlive: response})
 		for _, fields := range []int{128, 129} {
 			raw := []byte("GET / HTTP/1.1\r\nHost: a\r\n" + strings.Repeat("X: v\r\n", fields-1) + "\r\n")
-			got, consumed, closeConn, ok := server.matchPlainRootFastRequest(raw, false)
+			got, consumed, closeConn, ok, _ := server.matchPlainRootFastRequest(raw, false)
 			if fields == 128 {
 				if !ok || consumed != len(raw) || closeConn || !bytes.Equal(got, response) {
 					t.Errorf("configured=%d fields=%d: response=%q consumed=%d close=%v ok=%v", configured, fields, got, consumed, closeConn, ok)
@@ -102,11 +102,11 @@ func TestPlainRootFastLimitAppliesToFirstPipelinedRequest(t *testing.T) {
 	response := []byte("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
 	server.plainRootFast.Store(&plainRootFastResponse{getKeepAlive: response})
 	raw := []byte(first + second)
-	got, consumed, closeConn, ok := server.matchPlainRootFastRequest(raw, false)
+	got, consumed, closeConn, ok, _ := server.matchPlainRootFastRequest(raw, false)
 	if !ok || consumed != len(first) || closeConn || !bytes.Equal(got, response) {
 		t.Fatalf("first pipelined request: response=%q consumed=%d close=%v ok=%v", got, consumed, closeConn, ok)
 	}
-	got, consumed, closeConn, ok = server.matchPlainRootFastRequest(raw[consumed:], false)
+	got, consumed, closeConn, ok, _ = server.matchPlainRootFastRequest(raw[consumed:], false)
 	if ok || got != nil || consumed != 0 || closeConn {
 		t.Fatalf("oversized second request must fall through: response=%q consumed=%d close=%v ok=%v", got, consumed, closeConn, ok)
 	}
