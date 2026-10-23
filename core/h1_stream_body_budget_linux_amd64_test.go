@@ -113,13 +113,15 @@ func h1StreamPostWait(t *testing.T, addr, path string, body string, waitClose bo
 
 func TestH1StreamedBodyRefusedByFullBudgetGets503AndClose(t *testing.T) {
 	var read atomic.Int64
+	var readErr atomic.Bool
 	addr, srv := startH2FixServerWith(t, func(c *Config) {
 		c.StreamBodyAbove = 1
 		c.MaxInFlightBodyBytes = h1StreamBudgetLimit
 	}, func(s *Server) {
 		s.Router.POST("/body", func(req *Request, resp *Response) {
-			n, _ := io.Copy(io.Discard, req.BodyStream())
+			n, err := io.Copy(io.Discard, req.BodyStream())
 			read.Store(n)
+			readErr.Store(err != nil)
 			resp.Status(200).String("handler-ok")
 		})
 	})
@@ -130,8 +132,8 @@ func TestH1StreamedBodyRefusedByFullBudgetGets503AndClose(t *testing.T) {
 	if resp.StatusCode != 503 {
 		t.Fatalf("status=%d body=%q handler read %d bytes; want 503 while other requests hold all of MaxInFlightBodyBytes %d", resp.StatusCode, body, read.Load(), h1StreamBudgetLimit)
 	}
-	if read.Load() != 0 {
-		t.Fatalf("handler read %d body bytes that the budget refused", read.Load())
+	if read.Load() != 0 || !readErr.Load() {
+		t.Fatalf("handler read %d body bytes, error=%v; a refused body must end in an error", read.Load(), readErr.Load())
 	}
 	if !closed {
 		t.Fatal("connection stayed open after the body budget refused the request")
@@ -212,5 +214,38 @@ func TestBodyLimitCapsStreamedH2Body(t *testing.T) {
 	}
 	if n := read.Load(); n > h1StreamLimitBytes {
 		t.Fatalf("handler read %d body bytes through BodyLimit(%d)", n, h1StreamLimitBytes)
+	}
+}
+
+func TestH1StreamedBodyLargerThanBudgetStreams(t *testing.T) {
+	const budget = 16 << 10
+	w, c, _ := h1ReceivedFixture(t, Config{StreamBodyAbove: 1, MaxInFlightBodyBytes: budget})
+	var read atomic.Int64
+	var readErr atomic.Value
+	w.server.Router.POST("/body", func(req *Request, resp *Response) {
+		n, err := io.Copy(io.Discard, req.BodyStream())
+		read.Store(n)
+		readErr.Store(fmt.Sprint(err))
+		resp.Status(200).String("ok")
+	})
+	w.server.Router.Build()
+	w.server.computeFastDispatch()
+	body := strings.Repeat("b", h1StreamBudgetBody)
+	head := fmt.Sprintf("POST /body HTTP/1.1\r\nHost: body.test\r\nContent-Length: %d\r\n\r\n", len(body))
+	h1ReceivedInput(t, c, head+body)
+	if _, step := c.serveH1(w.server, nil); step != h1StepDispatched {
+		t.Fatalf("step=%d", step)
+	}
+	deadline := time.Now().Add(h2FixCeiling)
+	for w.h1Done.Load() == nil && time.Now().Before(deadline) {
+		w.drainTasks()
+		time.Sleep(time.Millisecond)
+	}
+	h1ReceivedFinish(t, w, c)
+	if read.Load() != h1StreamBudgetBody || readErr.Load() != "<nil>" {
+		t.Fatalf("handler read %d of %d bytes, err=%v, with MaxInFlightBodyBytes %d", read.Load(), h1StreamBudgetBody, readErr.Load(), budget)
+	}
+	if got := w.server.inFlightBodyBytes.Load(); got != 0 {
+		t.Fatalf("body budget after the request = %d, want 0", got)
 	}
 }
