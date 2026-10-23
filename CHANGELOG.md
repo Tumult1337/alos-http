@@ -110,8 +110,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
-- HTTP/2: a request body that waits for DATA is closed after `ReadTimeout` without body bytes, also while its handler streams it; PING and other control frames do not extend it. A response that waits for the peer's flow-control window is closed after `WriteTimeout` without sent DATA.
-- HTTP/2: after the peer half-closes the connection, in-flight responses are sent and the connection then closes.
+- HTTP/2: a stream whose request body gets no bytes for `ReadTimeout` while the peer may send, also while its handler streams the body, gets `RST_STREAM(CANCEL)`; PING and other control frames do not extend it. A response, buffered or streamed, that waits for the peer's flow-control window for `WriteTimeout` without sent DATA gets `RST_STREAM(CANCEL)`. Only that stream ends; the connection and other streams continue. WebSocket tunnels keep `WSReadTimeout` as their idle limit.
+- HTTP/2: after the peer half-closes the connection, body readers get `ErrBodyStreamAborted`, streams that still wait for body bytes or for a flow-control window are dropped, the remaining in-flight responses are sent, and the connection then closes.
 - HTTP/1: a streamed request body is charged to `MaxInFlightBodyBytes`. When the budget has no room the request gets `503` and the connection closes; an over-size chunked body gets `413`.
 - `BodyLimit` caps streamed request bodies: `Read` returns `ErrBodyTooLarge` past the limit and the response becomes `413`.
 - A stream writer kept by a handler after it returns can no longer write into a later response; its calls return `ErrStreamClosed`.
