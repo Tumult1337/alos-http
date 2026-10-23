@@ -4,6 +4,8 @@ package core
 
 import (
 	"bytes"
+	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -293,8 +295,8 @@ func TestHTTPDateRootFastAltSvcVariantRefreshesDate(t *testing.T) {
 	server.enableAltSvc(443)
 	installSharedDate(t)
 	fast := server.h2RootFast.Load().forConn(true)
-	if fast.withAltSvc != nil {
-		t.Fatal("variant not selected")
+	if fast == server.h2RootFast.Load() || !bytes.Contains(fast.headerPayload, server.altSvc.Load().hpack) {
+		t.Fatal("served response is not the Alt-Svc variant")
 	}
 	requireSharedDate(t, "h2-root-alt", dateMemoH2Fields(t, fast))
 }
@@ -305,6 +307,55 @@ func TestHTTPDateReceiptStatusRule(t *testing.T) {
 		parser := h1Parser{status: status}
 		if got := parser.wantsReceiptDate(); got != want {
 			t.Fatalf("status=%d wantsReceiptDate=%v want %v", status, got, want)
+		}
+	}
+}
+
+var receiptStatusCases = []struct {
+	status   int
+	wantDate bool
+}{
+	{200, true}, {404, true}, {599, true}, {600, false}, {999, false},
+}
+
+func TestHTTPDateReceiptStatusRuleFastProxyPath(t *testing.T) {
+	for _, tc := range receiptStatusCases {
+		connection := fpFixH1Conn("HTTP/1.1 " + strconv.Itoa(tc.status) + " X\r\nContent-Length: 0\r\n\r\n")
+		connection.cur.req.ensureResponseDate = true
+		if done, err := connection.h1.advance(connection); !done || err != nil {
+			t.Fatalf("status=%d done=%v err=%v", tc.status, done, err)
+		}
+		got := dateValues(connection.h1.stringHeaders())
+		if tc.wantDate {
+			dateRequireCurrent(t, connection.h1.stringHeaders())
+		} else if len(got) != 0 {
+			t.Fatalf("status=%d forwarded Date=%q", tc.status, got)
+		}
+	}
+}
+
+func TestHTTPDateReceiptStatusRuleUpgradeAnswerPath(t *testing.T) {
+	cases := append([]struct {
+		status   int
+		wantDate bool
+	}{{101, true}}, receiptStatusCases...)
+	for _, tc := range cases {
+		client, backend := net.Pipe()
+		go func() {
+			defer backend.Close()
+			_, _ = io.WriteString(backend, "HTTP/1.1 "+strconv.Itoa(tc.status)+" X\r\nContent-Length: 0\r\n\r\n")
+		}()
+		var parser h1Parser
+		_, _, err := readUpgradeAnswer(client, &parser, "GET", proxyFixIOTimeout)
+		client.Close()
+		if err != nil {
+			t.Fatalf("status=%d err=%v", tc.status, err)
+		}
+		got := dateValues(parser.stringHeaders())
+		if tc.wantDate {
+			dateRequireCurrent(t, parser.stringHeaders())
+		} else if len(got) != 0 {
+			t.Fatalf("status=%d forwarded Date=%q", tc.status, got)
 		}
 	}
 }
