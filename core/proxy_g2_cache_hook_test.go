@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -194,5 +195,67 @@ func TestProxyCacheNeverCrossesTenantsRewrittenByHook(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestProxyCacheBypassRunsRequestHookForLookupAndForward(t *testing.T) {
+	for _, p := range proxyG2CachePaths {
+		t.Run(p.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var backends []string
+			addr := proxyG2CacheStart(t, p, proxyG2TenantOrigin(t), func(pr *ProxyRequest) bool {
+				mu.Lock()
+				backends = append(backends, pr.Backend)
+				mu.Unlock()
+				if tenant := proxyG2TenantOf(pr); tenant != "" {
+					pr.Path = "/t/" + tenant
+				}
+				return true
+			})
+			seen := func() []string {
+				mu.Lock()
+				defer mu.Unlock()
+				return append([]string(nil), backends...)
+			}
+			if r := proxyG2GetAs(t, p, addr, "/data", ""); r.status != http.StatusOK || len(seen()) != 1 || seen()[0] == proxyCacheBackend {
+				t.Fatalf("a miss must run the hook once with the real backend: %+v, backends %q", r, seen())
+			}
+			if r := proxyG2GetAs(t, p, addr, "/data", "b"); !strings.HasPrefix(r.body, "path=/t/b ") {
+				t.Fatalf("bypassed request: %+v", r)
+			}
+			got := seen()
+			if len(got) != 3 || got[1] != proxyCacheBackend || got[2] == proxyCacheBackend {
+				t.Fatalf("a bypassed hit ran the hook with backends %q, want one cache lookup and one forward to the real backend", got)
+			}
+		})
+	}
+}
+
+func TestProxyCacheBypassForwardHonorsBackendDecision(t *testing.T) {
+	for _, p := range proxyG2CachePaths {
+		t.Run(p.name, func(t *testing.T) {
+			var served atomic.Int64
+			var denyReal atomic.Bool
+			addr := proxyG2CacheStart(t, p, proxyG2CacheOrigin(t, &served), func(pr *ProxyRequest) bool {
+				if !denyReal.Load() {
+					return true
+				}
+				if pr.Backend == proxyCacheBackend {
+					pr.Path = "/elsewhere"
+					return true
+				}
+				return false
+			})
+			if r := proxyG2Get(t, p, addr, "/c"); r.status != http.StatusOK || served.Load() != 1 {
+				t.Fatalf("seed request: %+v, origin served %d", r, served.Load())
+			}
+			denyReal.Store(true)
+			if r := proxyG2Get(t, p, addr, "/c"); r.status != http.StatusBadGateway {
+				t.Fatalf("a hook that denies the real backend did not stop the forward: %+v", r)
+			}
+			if got := served.Load(); got != 1 {
+				t.Fatalf("the backend the hook denied received %d requests", got-1)
+			}
+		})
 	}
 }

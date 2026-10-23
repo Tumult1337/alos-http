@@ -1739,7 +1739,8 @@ func (s *Server) OnProxyError(fn ProxyErrorFunc) {
 	s.computeFastDispatch()
 }
 
-// OnProxyRequest registers a callback invoked before a request is forwarded to a backend; modify pr.Headers or pr.Host to alter the outgoing request, or return false to reject with 502.
+// OnProxyRequest registers a callback invoked before a request is forwarded to a backend and before a cached response is served; modify pr.Path, pr.Headers or pr.Host to alter the outgoing request, or return false to reject with 502.
+// For a cache lookup the callback sees pr.Backend == "cache"; a rewritten request is never stored or served from the cache, so a request that bypasses a cached response runs the callback twice, once for the lookup with Backend "cache" and once for the forward with the real backend address.
 //
 // Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { pr.Headers = append(pr.Headers, [2]string{"X-Forwarded-For", pr.ClientAddr}); return true })
 // Example: s.OnProxyRequest(func(pr *ProxyRequest) bool { return pr.Host != "blocked.example.com" })
