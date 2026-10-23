@@ -46,6 +46,7 @@ func (b *wsBlockingClose) handler() WSEventHandler {
 func (b *wsBlockingClose) messageHandler() WSEventHandler {
 	return WSEventHandler{
 		OnMessage: func(ws *WSConn, op byte, msg []byte) {
+			_ = ws.Close()
 			b.entered <- struct{}{}
 			<-b.release
 		},
@@ -150,13 +151,17 @@ func TestWSEventsBlockedOnCloseHoldsConnSlot(t *testing.T) {
 func TestWSEventsBlockedOnMessageAfterTeardownHoldsConnSlot(t *testing.T) {
 	blocker := newWSBlockingClose()
 	ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) { cfg.MaxConns = 1 })
-	c, _, _ := wsEvDial(t, ts, "/ws-message")
+	c, br, _ := wsEvDial(t, ts, "/ws-message")
 	if _, err := c.Write(wsClientFrame(0x80|wsOpText, []byte("m"))); err != nil {
 		t.Fatal(err)
 	}
 	blocker.awaitEntered(t)
+	wsEvExpectBareClose(t, wsEvReadAll(br))
 	_ = c.Close()
 	time.Sleep(wsCloseAdmissionSettle)
+	if got := ts.srv.activeConns.Load(); got != 1 {
+		t.Fatalf("activeConns with a blocked OnMessage after teardown = %d, want 1", got)
+	}
 	for attempt := range 3 {
 		if status := wsCloseAdmissionUpgrade(t, ts); status != 0 {
 			t.Fatalf("attempt %d with a blocked OnMessage after teardown: status %d, want refusal", attempt, status)
