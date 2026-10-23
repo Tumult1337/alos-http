@@ -336,7 +336,7 @@ func TestWSEventsTeardownWhileCallbackPending(t *testing.T) {
 			probe.awaitEntered(t)
 			wsEvExpectBareClose(t, wsEvReadAll(br))
 			_ = c.Close()
-			waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+			waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 1 })
 			other, otherBr, _ := wsEvDial(t, ts, "/probe")
 			if _, err := other.Write(wsClientFrame(0x80|wsOpBinary, bytes.Repeat([]byte("Z"), 1000))); err != nil {
 				t.Fatal(err)
@@ -355,6 +355,7 @@ func TestWSEventsTeardownWhileCallbackPending(t *testing.T) {
 			waitFor(t, wsEvCloseWait, func() bool { return probe.closes.Load() == 1 })
 			_ = other.Close()
 			waitFor(t, wsEvCloseWait, func() bool { return probe.closes.Load() == 2 })
+			waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
 			wsAwaitInFlight(t, ts.srv, "budget must return after teardown", func(n int64) bool { return n == 0 })
 			events := probe.snapshotEvents()
 			if wsEventIndex(events, "close:P") < wsEventIndex(events, "returned:P") || wsEventIndex(events, "returned:P") < 0 {

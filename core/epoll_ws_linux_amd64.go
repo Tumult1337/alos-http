@@ -35,6 +35,8 @@ type wsLoopConn struct {
 	c             *epollConn
 	w             *epollWorker
 	ipKey         string
+	connIPKey     string
+	connHeld      bool
 	readDeadline  int64
 	writeDeadline int64
 	closing       bool
@@ -109,7 +111,7 @@ func (w *epollWorker) finishWSUpgrade(c *epollConn, gen uint32, ev *wsLoopConn) 
 		ev.ipKey = extractIP(c.req.RemoteAddr)
 	}
 	if c.generation != gen || c.fd < 0 {
-		w.wsAbandon(ev)
+		w.wsAbandon(ev, nil)
 		if c.fd < 0 && c.inFlight == 0 {
 			w.pool.put(c)
 		}
@@ -153,15 +155,16 @@ func (c *epollConn) wsGrowReadBuf(maxRead int) bool {
 	return true
 }
 
-func (w *epollWorker) wsAbandon(ev *wsLoopConn) {
+func (w *epollWorker) wsAbandon(ev *wsLoopConn, c *epollConn) {
 	ev.mu.Lock()
 	ev.dead = true
 	ev.outbox = nil
 	ev.mu.Unlock()
 	ev.ws.closed.Store(true)
-	if ev.ipKey != "" {
-		w.server.perIPLimiter.release(ev.ipKey)
-		ev.ipKey = ""
+	if ev.cbPending || ev.h.OnClose != nil {
+		w.holdSlotsForWSCallbacks(ev, c)
+	} else {
+		w.releaseWSSlots(ev)
 	}
 	if ev.cbPending {
 		ev.closeDue = true
@@ -184,7 +187,34 @@ func (w *epollWorker) wsTeardown(c *epollConn) {
 		ev.ws.noteCloseCode(wsStatusAbnormal)
 		w.wsSendFinalClose(c)
 	}
-	w.wsAbandon(ev)
+	w.wsAbandon(ev, c)
+}
+
+func (w *epollWorker) holdSlotsForWSCallbacks(ev *wsLoopConn, c *epollConn) {
+	if !ev.connHeld {
+		ev.connHeld = true
+		w.server.activeConns.Add(1)
+	}
+	if c != nil && c.ipHeld {
+		ev.connIPKey = c.ipKey
+		c.ipHeld = false
+		c.ipKey = ""
+	}
+}
+
+func (w *epollWorker) releaseWSSlots(ev *wsLoopConn) {
+	if ev.ipKey != "" {
+		w.server.perIPLimiter.release(ev.ipKey)
+		ev.ipKey = ""
+	}
+	if ev.connIPKey != "" {
+		w.server.perIPConnLimiter.Load().release(ev.connIPKey)
+		ev.connIPKey = ""
+	}
+	if ev.connHeld {
+		ev.connHeld = false
+		w.server.releaseTrackedConn()
+	}
 }
 
 func (w *epollWorker) wsSendFinalClose(c *epollConn) {
@@ -785,6 +815,7 @@ func (w *epollWorker) finishWSCallback(ev *wsLoopConn) {
 	ev.cbRoute = nil
 	w.wsCallbacks--
 	if ev.cbKind == wsCallbackClose {
+		w.releaseWSSlots(ev)
 		return
 	}
 	ev.releaseMessage()
@@ -792,6 +823,9 @@ func (w *epollWorker) finishWSCallback(ev *wsLoopConn) {
 		ev.closeDue = false
 		ev.msg = nil
 		w.queueWSClose(ev)
+		if !ev.cbPending {
+			w.releaseWSSlots(ev)
+		}
 		return
 	}
 	c := ev.c

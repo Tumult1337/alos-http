@@ -452,8 +452,15 @@ func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
 		if err != nil {
 			ws.releaseMessageBytes()
 			ws.noteCloseCode(wsStatusAbnormal)
+			closeHeld := h.OnClose != nil && srv != nil
+			if closeHeld {
+				srv.activeConns.Add(1)
+			}
 			ws.Close()
 			wsDeliverClose(srv, ws, &h)
+			if closeHeld {
+				srv.releaseTrackedConn()
+			}
 			return
 		}
 		if cap(msg) <= wsFrameReadChunk {
