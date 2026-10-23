@@ -62,9 +62,11 @@ func quicFix5DataBytes(t *testing.T, stream []byte) int {
 func newQUICFix5FreshStallPeer(t *testing.T) (*quicTestPeer, int64) {
 	t.Helper()
 	p := newQUICFixStalledPeer(t)
-	for i := 0; i < quicFix5OldStalledStreams; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < quicFix5OldStalledStreams; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
 	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap {
 		t.Fatalf("precondition: %d stalled bytes, soft cap %d", held, p.qc.stallSoftCap)

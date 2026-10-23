@@ -45,7 +45,7 @@ func TestQUICFixUnackedResponsesStayWithinTheCongestionWindow(t *testing.T) {
 	for i := 0; i < quicFixCwndRequests; i++ {
 		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
 	}
-	p.awaitHandlersIdle()
+	p.awaitAdmissionSettled()
 	queued, inFlight, cwnd := p.congestionState()
 	if inFlight == 0 {
 		t.Fatal("fixture sent nothing; the congestion window was never filled")
@@ -61,9 +61,11 @@ func TestQUICFixUnackedResponsesStayWithinTheCongestionWindow(t *testing.T) {
 
 func TestQUICFixCongestionStalledResponsesHitTheHardCap(t *testing.T) {
 	p := newQUICFixCwndPeer(t, quicFixCwndResponse)
-	for i := 0; i < quicFixCwndRequests; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < quicFixCwndRequests; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
 	pending, _ := p.pendingResponseBytes()
 	if limit := quicFixCwndPendingCap*quicStalledSendHardFactor + quicFixCwndResponse + 4096; pending > limit {
