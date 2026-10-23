@@ -149,6 +149,7 @@ func (s *Session) Regenerate() bool {
 type sessionEntry struct {
 	data      map[string]any
 	expiresAt int64
+	returned  atomic.Bool
 }
 
 type sessionEvictionCandidate struct {
@@ -157,6 +158,8 @@ type sessionEvictionCandidate struct {
 }
 
 // MemorySessionStore is an in-memory SessionStore suitable for single-process use.
+// When it is full, a save first evicts sessions that no request has read back since they were
+// created, soonest-expiring first, and then the soonest-expiring sessions that were read back.
 type MemorySessionStore struct {
 	entries       *alosmap.TypedMap[string, *sessionEntry]
 	maxEntries    int64
@@ -210,9 +213,7 @@ func (s *MemorySessionStore) makeRoom() {
 	live := s.evictionCandidates()
 	remaining := int64(len(live))
 	if excess := remaining - (s.maxEntries - s.evictionBatch); excess > 0 {
-		slices.SortFunc(live, func(a, b sessionEvictionCandidate) int {
-			return cmp.Compare(a.entry.expiresAt, b.entry.expiresAt)
-		})
+		slices.SortFunc(live, compareSessionEviction)
 		for _, victim := range live[:excess] {
 			if s.entries.CompareAndDelete(victim.id, victim.entry) {
 				remaining--
@@ -220,6 +221,16 @@ func (s *MemorySessionStore) makeRoom() {
 		}
 	}
 	s.tracked.Store(remaining)
+}
+
+func compareSessionEviction(a, b sessionEvictionCandidate) int {
+	if aReturned, bReturned := a.entry.returned.Load(), b.entry.returned.Load(); aReturned != bReturned {
+		if aReturned {
+			return 1
+		}
+		return -1
+	}
+	return cmp.Compare(a.entry.expiresAt, b.entry.expiresAt)
 }
 
 func (s *MemorySessionStore) evictionCandidates() []sessionEvictionCandidate {
@@ -244,6 +255,7 @@ func (s *MemorySessionStore) Get(id string) (map[string]any, bool) {
 	if !ok {
 		return nil, false
 	}
+	v.returned.Store(true)
 	cp := make(map[string]any, len(v.data))
 	for k, val := range v.data {
 		cp[k] = val
@@ -262,7 +274,9 @@ func (s *MemorySessionStore) saveWithTTL(id string, data map[string]any, ttl tim
 		cp[k] = v
 	}
 	entry := &sessionEntry{data: cp, expiresAt: sessionExpiresAt(ttl)}
-	if !s.entries.Has(id) {
+	if old, ok := s.entries.Peek(id); ok {
+		entry.returned.Store(old.returned.Load())
+	} else {
 		s.reserveEntry()
 	}
 	if ttl > 0 {
