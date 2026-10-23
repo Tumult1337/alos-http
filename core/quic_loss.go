@@ -3,7 +3,9 @@
 package core
 
 import (
+	"cmp"
 	"math"
+	"slices"
 	"sync"
 	"time"
 
@@ -17,6 +19,7 @@ const (
 	quicPktThreshold     = 3
 	quicTimeThreshold    = 9.0 / 8.0
 	quicMaxTrackedSent   = 16384
+	quicPTOProbePackets  = 2
 )
 
 const quicSendTimeLogEntries = 128
@@ -67,6 +70,7 @@ type quicSentPacket struct {
 	frames    []byte
 	framesBuf *[]byte
 	inFlight  bool
+	removed   bool
 }
 
 var quicFramePool = sync.Pool{
@@ -84,6 +88,8 @@ type quicLossState struct {
 	largestAcked [3]int64
 
 	sent          [3][]quicSentPacket
+	nextLiveIdx   [3][]int32
+	removedCount  [3]int
 	bytesInFlight int
 
 	cwnd     uint64
@@ -144,6 +150,7 @@ func (ls *quicLossState) onPacketSent(space int, pn uint64, size int, ackElicit 
 		inFlight:  ackElicit,
 	}
 	ls.sent[space] = append(ls.sent[space], sp)
+	ls.nextLiveIdx[space] = append(ls.nextLiveIdx[space], int32(len(ls.sent[space])-1))
 	ls.bytesInFlight += size
 }
 
@@ -200,9 +207,13 @@ func (ls *quicLossState) onAckReceived(space int, ack quicAckFrame, ackDelay tim
 		}
 	}
 
-	ls.ptoCount = 0
-	sent := ls.sent[space]
-	return len(sent) > 0 && int64(sent[0].pn) <= ls.largestAcked[space], nil
+	ls.compactIfMostlyRemoved(space)
+
+	if tally.anyAcked {
+		ls.ptoCount = 0
+	}
+	first := ls.nextLive(space, 0)
+	return first < len(ls.sent[space]) && int64(ls.sent[space][first].pn) <= ls.largestAcked[space], nil
 }
 
 func (ls *quicLossState) discardSpace(space int) {
@@ -218,6 +229,8 @@ func (ls *quicLossState) discardSpace(space int) {
 		}
 	}
 	ls.sent[space] = nil
+	ls.nextLiveIdx[space] = nil
+	ls.removedCount[space] = 0
 }
 
 func (ls *quicLossState) detectLostPackets(space int) [][]byte {
@@ -239,28 +252,83 @@ func (ls *quicLossState) largestAckedSentTime(space int, tally *quicAckTally, ne
 	}
 }
 
+func quicComparePN(sp quicSentPacket, pn uint64) int {
+	return cmp.Compare(sp.pn, pn)
+}
+
 func (ls *quicLossState) markAcked(space int, lo, hi uint64, tally *quicAckTally) {
-	remaining := ls.sent[space][:0]
+	sent := ls.sent[space]
+	start, _ := slices.BinarySearchFunc(sent, lo, quicComparePN)
+	for i := ls.nextLive(space, start); i < len(sent) && sent[i].pn <= hi; i = ls.nextLive(space, i+1) {
+		sp := &sent[i]
+		if sp.inFlight {
+			ls.bytesInFlight -= sp.size
+			tally.ackedInFlight += uint64(sp.size)
+		}
+		if sp.pn == tally.largest {
+			tally.largestSent = sp.sent
+			tally.largestTracked = true
+		}
+		tally.anyAcked = true
+		ls.removeAt(space, i)
+	}
+}
+
+func (ls *quicLossState) removeAt(space, i int) {
+	sp := &ls.sent[space][i]
+	if sp.framesBuf != nil {
+		quicFramePool.Put(sp.framesBuf)
+	}
+	*sp = quicSentPacket{pn: sp.pn, removed: true}
+	ls.nextLiveIdx[space][i] = int32(i + 1)
+	ls.removedCount[space]++
+}
+
+func (ls *quicLossState) compactIfMostlyRemoved(space int) {
+	if 2*ls.removedCount[space] > len(ls.sent[space]) {
+		ls.dropRemoved(space)
+	}
+}
+
+func (ls *quicLossState) nextLive(space, i int) int {
+	next := ls.nextLiveIdx[space]
+	for i < len(next) {
+		j := int(next[i])
+		if j == i {
+			return i
+		}
+		if j < len(next) {
+			next[i] = next[j]
+		}
+		i = int(next[i])
+	}
+	return len(next)
+}
+
+func (ls *quicLossState) liveSent(space int) int {
+	return len(ls.sent[space]) - ls.removedCount[space]
+}
+
+func (ls *quicLossState) resetLiveIndex(space int) {
+	next := ls.nextLiveIdx[space][:0]
 	for i := range ls.sent[space] {
-		sp := &ls.sent[space][i]
-		if sp.pn >= lo && sp.pn <= hi {
-			if sp.inFlight {
-				ls.bytesInFlight -= sp.size
-				tally.ackedInFlight += uint64(sp.size)
-			}
-			if sp.pn == tally.largest {
-				tally.largestSent = sp.sent
-				tally.largestTracked = true
-			}
-			tally.anyAcked = true
-			if sp.framesBuf != nil {
-				quicFramePool.Put(sp.framesBuf)
-			}
-		} else {
-			remaining = append(remaining, *sp)
+		next = append(next, int32(i))
+	}
+	ls.nextLiveIdx[space] = next
+	ls.removedCount[space] = 0
+}
+
+func (ls *quicLossState) dropRemoved(space int) {
+	sent := ls.sent[space]
+	kept := sent[:0]
+	for i := range sent {
+		if !sent[i].removed {
+			kept = append(kept, sent[i])
 		}
 	}
-	ls.sent[space] = remaining
+	clear(sent[len(kept):])
+	ls.sent[space] = kept
+	ls.resetLiveIndex(space)
 }
 
 func (ls *quicLossState) detectLost(space int, lostFrames [][]byte) [][]byte {
@@ -279,28 +347,22 @@ func (ls *quicLossState) detectLost(space int, lostFrames [][]byte) [][]byte {
 	cutoff := turbo.Now() - int64(lossDelay)
 
 	hadLoss := false
-	remaining := ls.sent[space][:0]
-	for i := range ls.sent[space] {
-		sp := &ls.sent[space][i]
-		lost := int64(sp.pn) <= ls.largestAcked[space] && (sp.pn < threshold || sp.sent < cutoff)
-		if lost {
-			if sp.inFlight {
-				ls.bytesInFlight -= sp.size
-				hadLoss = true
-			}
-			if len(sp.frames) > 0 {
-				fcopy := make([]byte, len(sp.frames))
-				copy(fcopy, sp.frames)
-				lostFrames = append(lostFrames, fcopy)
-			}
-			if sp.framesBuf != nil {
-				quicFramePool.Put(sp.framesBuf)
-			}
-		} else {
-			remaining = append(remaining, *sp)
+	sent := ls.sent[space]
+	for i := ls.nextLive(space, 0); i < len(sent) && sent[i].pn <= la; i = ls.nextLive(space, i+1) {
+		sp := &sent[i]
+		if sp.pn >= threshold && sp.sent >= cutoff {
+			continue
 		}
+		if sp.inFlight {
+			ls.bytesInFlight -= sp.size
+			hadLoss = true
+		}
+		if len(sp.frames) > 0 {
+			lostFrames = append(lostFrames, append([]byte(nil), sp.frames...))
+		}
+		ls.removeAt(space, i)
 	}
-	ls.sent[space] = remaining
+	ls.compactIfMostlyRemoved(space)
 
 	if hadLoss {
 		ls.ssthresh = ls.cwnd / 2
@@ -353,13 +415,30 @@ func (ls *quicLossState) resetForNewPath() {
 }
 
 func (ls *quicLossState) ptoTimeout() time.Duration {
-	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity) + ls.peerMaxAckDelay
+	return ls.ptoPeriod(quicSpaceAppData)
+}
+
+func (ls *quicLossState) ptoPeriod(space int) time.Duration {
+	pto := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity)
+	if space == quicSpaceAppData {
+		pto += ls.peerMaxAckDelay
+	}
 	return pto * time.Duration(1<<uint(ls.ptoCount))
+}
+
+func (ls *quicLossState) handshakeResendWindow(resends int) time.Duration {
+	ls.mu.Lock()
+	window := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity)
+	ls.mu.Unlock()
+	for i := 0; i < resends && window < math.MaxInt64/2; i++ {
+		window *= 2
+	}
+	return window
 }
 
 func (ls *quicLossState) hasSentPackets(space int) bool {
 	ls.mu.Lock()
-	n := len(ls.sent[space])
+	n := ls.liveSent(space)
 	ls.mu.Unlock()
 	return n > 0
 }
@@ -367,7 +446,16 @@ func (ls *quicLossState) hasSentPackets(space int) bool {
 func (ls *quicLossState) canSend() bool {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	return uint64(ls.bytesInFlight) < ls.cwnd && len(ls.sent[quicSpaceAppData]) < quicMaxTrackedSent
+	return uint64(ls.bytesInFlight) < ls.cwnd && ls.liveSent(quicSpaceAppData) < quicMaxTrackedSent
+}
+
+func (ls *quicLossState) sendRoom() int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if ls.liveSent(quicSpaceAppData) >= quicMaxTrackedSent {
+		return 0
+	}
+	return max(int(ls.cwnd)-ls.bytesInFlight, 0)
 }
 
 func (ls *quicLossState) largestAckedPN(space int) int64 {
@@ -377,23 +465,29 @@ func (ls *quicLossState) largestAckedPN(space int) int64 {
 	return v
 }
 
-func (ls *quicLossState) ptoExpiredFrames(space int) [][]byte {
+func (ls *quicLossState) ptoExpiredFrames(space, limit int) [][]byte {
 	ls.mu.Lock()
 	defer ls.mu.Unlock()
-	if len(ls.sent[space]) == 0 {
+	first := ls.nextLive(space, 0)
+	if first == len(ls.sent[space]) {
 		return nil
 	}
-	pto := ls.ptoTimeout()
+	pto := ls.ptoPeriod(space)
 	cutoff := turbo.Now() - int64(pto)
-	if ls.sent[space][0].sent >= cutoff {
+	if ls.sent[space][first].sent >= cutoff {
 		return nil
 	}
 
 	var frames [][]byte
+	taken := 0
 	remaining := ls.sent[space][:0]
 	for i := range ls.sent[space] {
 		sp := &ls.sent[space][i]
-		if sp.ackElicit && sp.sent < cutoff {
+		if sp.removed {
+			continue
+		}
+		if sp.ackElicit && sp.sent < cutoff && (limit == 0 || taken < limit) {
+			taken++
 			if sp.inFlight {
 				ls.bytesInFlight -= sp.size
 			}
@@ -410,10 +504,14 @@ func (ls *quicLossState) ptoExpiredFrames(space int) [][]byte {
 		}
 	}
 	ls.sent[space] = remaining
-	if len(frames) > 0 {
-		ls.ptoCount++
-	}
+	ls.resetLiveIndex(space)
 	return frames
+}
+
+func (ls *quicLossState) backoffPTO() {
+	ls.mu.Lock()
+	ls.ptoCount++
+	ls.mu.Unlock()
 }
 
 func max64(a, b time.Duration) time.Duration {

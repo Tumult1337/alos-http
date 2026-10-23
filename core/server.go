@@ -122,9 +122,10 @@ var timeNow = time.Now
 //
 // H2MaxConcurrentStreams is the maximum number of concurrently active streams on one HTTP/2 connection; 0 uses the protocol default.
 //
-// H2MaxRunningHandlers caps the handlers that run at the same time on one HTTP/2 connection, inline or on the handler pool.
-// A new stream also waits while the connection holds MaxPendingWriteBytes of unsent response bytes. Waiting streams start
-// in arrival order. 0 or a negative value applies a default of 32; a value above the stream limit uses the stream limit.
+// H2MaxRunningHandlers caps the handlers that run at the same time on one HTTP/2 or HTTP/3 connection, inline or on the
+// handler pool. A new stream also waits while the connection holds MaxPendingWriteBytes of unsent response bytes. Waiting
+// streams start in arrival order. 0 or a negative value applies a default of 32; a value above H2MaxConcurrentStreams
+// uses H2MaxConcurrentStreams, and HTTP/3 also caps it at 256, its stream limit.
 //
 //	Example: H2MaxRunningHandlers: 16.
 //

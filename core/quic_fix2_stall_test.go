@@ -26,12 +26,14 @@ func TestQUICFix2SendStallResetsStreamsNotConn(t *testing.T) {
 	srv.Router.Build()
 	p := newQUICTestPeerFor(t, srv)
 	p.qc.peerStreamWindow = 1
-	for i := 0; i < quicFix2StalledStreams; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < quicFix2StalledStreams; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
-	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap {
-		t.Fatalf("precondition: %d stalled bytes, want more than the %d soft cap", held, p.qc.stallSoftCap)
+	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap.Load() {
+		t.Fatalf("precondition: %d stalled bytes, want more than the %d soft cap", held, p.qc.stallSoftCap.Load())
 	}
 	p.qc.peerStreamWindow = quicFixBigResponse
 	now := turbo.UnixNano() + int64(quicFixStallTimeoutPlus)

@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -142,7 +143,7 @@ func (qc *QUICConn) trackStalledSend(s *QUICStream) {
 }
 
 func (qc *QUICConn) sendStalledTooLong(now int64) bool {
-	return qc.stalledSendBytes.Load() > qc.stallSoftCap && time.Duration(now-qc.lastSendProgress.Load()) > quicSendStallTimeout
+	return qc.stalledSendBytes.Load() > qc.stallSoftCap.Load() && time.Duration(now-qc.lastSendProgress.Load()) > quicSendStallTimeout
 }
 
 func (qc *QUICConn) resetStalledStreams(now int64) {
@@ -252,6 +253,8 @@ type QUICConn struct {
 		ee, cert, cv, fin []byte
 		sent              bool
 		initialOffset     uint64
+		lastSent          int64
+		resends           int
 	}
 
 	streams        map[uint64]*QUICStream
@@ -277,17 +280,23 @@ type QUICConn struct {
 	dstCIDSeq    uint64
 	rxDCID       [quicConnIDLen]byte
 
-	pathMu        sync.Mutex
-	pathAddr      netip.AddrPort
-	pathGen       atomic.Uint32
-	rxPath        netip.AddrPort
-	rxPathGen     uint32
-	lastValidAddr netip.AddrPort
-	probe         quicPathProbe
-	probing       atomic.Bool
-	rxFrom        netip.AddrPort
-	rxLen         int
-	rxNonProbing  bool
+	pathMu           sync.Mutex
+	pathAddr         netip.AddrPort
+	pathGen          atomic.Uint32
+	rxPath           netip.AddrPort
+	rxPathGen        uint32
+	lastValidAddr    netip.AddrPort
+	probe            quicPathProbe
+	probing          atomic.Bool
+	rxFrom           netip.AddrPort
+	rxLen            int
+	rxNonProbing     bool
+	pathResponses    []byte
+	inDatagram       bool
+	rxDatagramLen    int
+	flightInDatagram bool
+	handshakeAckDue  [quicSpaceAppData]bool
+	offPath          quicOffPathBudget
 
 	maxDataLocal    uint64
 	maxDataRemote   uint64
@@ -325,12 +334,18 @@ type QUICConn struct {
 	recvFlowLimit      atomic.Uint64
 	stalledSendBytes   atomic.Int64
 	lastSendProgress   atomic.Int64
-	stallSoftCap       int64
+	stallSoftCap       atomic.Int64
 	stallHardCap       int64
 	activeReqStreams   atomic.Int32
 	bidiStreamsRetired atomic.Uint64
 	uniStreamsRetired  atomic.Uint64
 	timerWork          atomic.Bool
+	congestionBlocked  atomic.Bool
+
+	admitMu        sync.Mutex
+	runningReqs    int
+	maxRunningReqs int
+	waitingReqs    []*QUICStream
 }
 
 func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dcid, scid []byte) *QUICConn {
@@ -360,8 +375,10 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	qc.handshakeDeadline = quicHandshakeDeadline(server)
 	qc.peerAckDelayExponent = quicDefaultAckDelayExponent
 	qc.recvFlowLimit.Store(maxData)
-	qc.stallSoftCap = quicStalledSendSoftCap(server)
-	qc.stallHardCap = qc.stallSoftCap * quicStalledSendHardFactor
+	softCap := quicStalledSendSoftCap(server)
+	qc.stallSoftCap.Store(softCap)
+	qc.stallHardCap = softCap * quicStalledSendHardFactor
+	qc.maxRunningReqs = min(server.h2MaxRunningHandlers(), quicMaxConcurrentReqStreams)
 
 	qc.workShard = uint8(connShardCounter.Add(1) % reqStreamShards)
 	qc.pktBudget = quicCoalesceBudget
@@ -452,6 +469,12 @@ func (qc *QUICConn) processPacket(data []byte, from netip.AddrPort) {
 	if len(data) == 0 {
 		return
 	}
+	qc.rxDatagramLen = len(data)
+	qc.inDatagram, qc.flightInDatagram = true, false
+	defer func() {
+		qc.inDatagram = false
+		qc.flushHandshakeAcks(qc.rxDatagramLen)
+	}()
 	if debugFlag.Load() {
 		Dbg("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
 	}
@@ -496,6 +519,9 @@ func (qc *QUICConn) handleLongHeaderPacket(data []byte) int {
 
 	switch hdr.pktType {
 	case quicPktInitial:
+		if qc.rxDatagramLen < quicMinInitialDatagram {
+			return total
+		}
 		qc.handleInitialPacket(packet, &hdr)
 	case quicPktHandshake:
 		qc.handleHandshakePacket(packet, &hdr)
@@ -658,21 +684,17 @@ func (qc *QUICConn) discardKeys(space int) {
 
 func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	qc.rxNonProbing = false
+	qc.pathResponses = qc.pathResponses[:0]
 	if int64(pn) > qc.recvLargest[space] {
 		qc.recvLargest[space] = int64(pn)
 	}
 	if !qc.recordRecvPN(space, pn) {
-		if space != quicSpaceInitial || qc.handshakeDone.Load() {
-			if space == quicSpaceAppData {
-				qc.stashAck(space)
-			} else {
-				qc.sendACK(space)
-			}
-		}
+		qc.acknowledge(space)
 		return
 	}
 	needsAck := false
 	lossCheck := false
+	acked := false
 
 	visitor := &quicFrameVisitor{
 		onACK: func(f quicAckFrame) {
@@ -690,6 +712,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 				return
 			}
 			lossCheck = lossCheck || lossPossible
+			acked = true
 		},
 		onCrypto: func(f quicCryptoFrame) {
 			needsAck = true
@@ -789,17 +812,79 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	if qc.closed.Load() {
 		return
 	}
+	qc.flushPathResponses()
 	if lossCheck {
 		qc.recoverLostPackets(space)
 	}
-
-	if needsAck && (space != quicSpaceInitial || qc.handshakeDone.Load()) {
-		if space == quicSpaceAppData {
-			qc.stashAck(space)
-		} else {
-			qc.sendACK(space)
-		}
+	if acked {
+		qc.resumeCongestionBlocked()
+		qc.admitWaiting()
 	}
+
+	if needsAck {
+		qc.acknowledge(space)
+	}
+}
+
+func (qc *QUICConn) acknowledge(space int) {
+	if space == quicSpaceAppData {
+		qc.stashAck(space)
+		return
+	}
+	qc.handshakeAckDue[space] = true
+	if !qc.inDatagram {
+		qc.flushHandshakeAcks(qc.rxLen)
+	}
+}
+
+func (qc *QUICConn) flushHandshakeAcks(datagramLen int) {
+	if qc.flightInDatagram {
+		qc.handshakeAckDue[quicSpaceInitial] = false
+	}
+	qc.writeMu.Lock()
+	defer qc.writeMu.Unlock()
+	var datagram []byte
+	for space := quicSpaceInitial; space <= quicSpaceHandshake; space++ {
+		if !qc.handshakeAckDue[space] {
+			continue
+		}
+		qc.handshakeAckDue[space] = false
+		datagram = qc.appendAckOnlyPacketLocked(datagram, space)
+	}
+	if len(datagram) == 0 || len(datagram) > quicAmplificationFactor*datagramLen {
+		return
+	}
+	validated := qc.addressValidated.Load()
+	if !validated && qc.bytesSent.Load()+uint64(len(datagram)) > quicAmplificationFactor*qc.bytesReceived.Load() {
+		return
+	}
+	switch {
+	case qc.uringUDP != nil && qc.udpAddr != nil:
+		qc.uringUDP.sendTo(datagram, qc.udpAddr)
+	case qc.udpConn != nil:
+		_, _ = writeQUICDatagram(qc.udpConn, datagram, qc.remoteAddr)
+	}
+	if !validated {
+		qc.bytesSent.Add(uint64(len(datagram)))
+	}
+}
+
+func (qc *QUICConn) appendAckOnlyPacketLocked(datagram []byte, space int) []byte {
+	keys := qc.sendKeys[space]
+	if keys == nil || !keys.valid {
+		keys = qc.keys[space]
+	}
+	if keys == nil || !keys.valid || len(qc.ackRanges[space]) == 0 {
+		return datagram
+	}
+	frames := quicAppendACKFrameRanges(nil, 0, qc.ackRanges[space])
+	pn := qc.sendPN[space]
+	qc.sendPN[space]++
+	largestAcked := qc.loss.largestAckedPN(space)
+	if space == quicSpaceInitial {
+		return quicBuildInitialPacket(datagram, qc.dstCID(), qc.srcCID(), nil, frames, pn, largestAcked, keys)
+	}
+	return quicBuildHandshakePacket(datagram, qc.dstCID(), qc.srcCID(), frames, pn, largestAcked, keys)
 }
 
 func (qc *QUICConn) stashAck(space int) {
@@ -834,6 +919,10 @@ func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 	}
 	end := f.offset + uint64(len(f.data))
 	if f.offset > maxBuf || end > maxBuf {
+		return
+	}
+	if space == quicSpaceInitial && len(f.data) > 0 && end <= uint64(qc.tlsState.messageStart(space)) {
+		qc.resendFirstFlightOnDuplicate()
 		return
 	}
 	if end > uint64(len(qc.cryptoBuf[space])) {
@@ -965,15 +1054,7 @@ func (qc *QUICConn) handleStreamFrameIncoming(f quicStreamFrame) {
 			qc.activeReqStreams.Add(-1)
 		} else {
 			s.refCount.Add(1)
-			if quicAsyncDispatch {
-				go qc.serveRequestStream(s)
-			} else {
-				select {
-				case reqStreamWorkChs[qc.workShard] <- s:
-				default:
-					go qc.serveRequestStream(s)
-				}
-			}
+			qc.admitRequestStream(s)
 		}
 	}
 	qc.releaseStream(s)
@@ -1118,6 +1199,7 @@ func (qc *QUICConn) handleResetStream(f quicResetStreamFrame) {
 			return
 		}
 	}
+	qc.cancelWaiting(s)
 	if s.dispatched.CompareAndSwap(false, true) {
 		if quicStreamIsBidi(f.streamID) {
 			qc.resetStreamSend(s, h3ErrRequestIncomplete)
@@ -1169,9 +1251,11 @@ func (qc *QUICConn) handleStopSending(f quicStopSendingFrame) {
 		return
 	}
 	defer qc.releaseStream(s)
+	qc.cancelWaiting(s)
 	qc.resetStreamSend(s, f.errorCode)
 	s.abortHandler(ErrClientGone)
 	qc.maybeFinishStream(s)
+	qc.admitWaiting()
 }
 
 func (qc *QUICConn) resetStreamSend(s *QUICStream, errorCode uint64) {
@@ -1200,11 +1284,100 @@ func (qc *QUICConn) closeWithError(errorCode uint64, reason string) {
 	qc.close()
 }
 
+func (qc *QUICConn) admitRequestStream(s *QUICStream) {
+	pending := qc.pendingWriteBytes()
+	qc.admitMu.Lock()
+	if qc.closed.Load() {
+		qc.admitMu.Unlock()
+		qc.dropWaiting(s)
+		return
+	}
+	if len(qc.waitingReqs) > 0 || !qc.admitsHandlerLocked(pending) {
+		qc.waitingReqs = append(qc.waitingReqs, s)
+		qc.admitMu.Unlock()
+		return
+	}
+	qc.runningReqs++
+	qc.admitMu.Unlock()
+	qc.startRequestStream(s)
+}
+
+func (qc *QUICConn) admitsHandlerLocked(pendingWrite int64) bool {
+	return qc.runningReqs < qc.maxRunningReqs && pendingWrite < qc.stallSoftCap.Load()
+}
+
+func (qc *QUICConn) pendingWriteBytes() int64 {
+	qc.writeMu.Lock()
+	queued := len(qc.coalesceBuf) - qc.coalesceStart
+	qc.writeMu.Unlock()
+	return int64(queued) + qc.stalledSendBytes.Load()
+}
+
+func (qc *QUICConn) admitWaiting() {
+	for {
+		qc.admitMu.Lock()
+		empty := len(qc.waitingReqs) == 0
+		qc.admitMu.Unlock()
+		if empty {
+			return
+		}
+		pending := qc.pendingWriteBytes()
+		qc.admitMu.Lock()
+		if qc.closed.Load() || len(qc.waitingReqs) == 0 || !qc.admitsHandlerLocked(pending) {
+			qc.admitMu.Unlock()
+			return
+		}
+		s := qc.waitingReqs[0]
+		n := copy(qc.waitingReqs, qc.waitingReqs[1:])
+		qc.waitingReqs[n] = nil
+		qc.waitingReqs = qc.waitingReqs[:n]
+		qc.runningReqs++
+		qc.admitMu.Unlock()
+		qc.startRequestStream(s)
+	}
+}
+
+func (qc *QUICConn) cancelWaiting(s *QUICStream) {
+	qc.admitMu.Lock()
+	idx := slices.Index(qc.waitingReqs, s)
+	if idx >= 0 {
+		qc.waitingReqs = slices.Delete(qc.waitingReqs, idx, idx+1)
+	}
+	qc.admitMu.Unlock()
+	if idx < 0 {
+		return
+	}
+	qc.resetStreamSend(s, h3ErrRequestRejected)
+	qc.activeReqStreams.Add(-1)
+	qc.retireStream(s, 2)
+}
+
+func (qc *QUICConn) dropWaiting(s *QUICStream) {
+	qc.activeReqStreams.Add(-1)
+	qc.releaseStream(s)
+}
+
+func (qc *QUICConn) startRequestStream(s *QUICStream) {
+	if quicAsyncDispatch {
+		go qc.serveRequestStream(s)
+		return
+	}
+	select {
+	case reqStreamWorkChs[qc.workShard] <- s:
+	default:
+		go qc.serveRequestStream(s)
+	}
+}
+
 func (qc *QUICConn) serveRequestStream(s *QUICStream) {
 	s.refCount.Add(1)
 	defer qc.activeReqStreams.Add(-1)
 	defer qc.releaseStream(s)
 	qc.h3.handleRequestStream(s)
+	qc.admitMu.Lock()
+	qc.runningReqs--
+	qc.admitMu.Unlock()
+	qc.admitWaiting()
 	s.mu.Lock()
 	s.handlerFinishedLocked()
 	s.awaitingCleanup = true
@@ -1292,15 +1465,6 @@ func (qc *QUICConn) openLocalUniStream() *QUICStream {
 	return s
 }
 
-func (qc *QUICConn) sendACK(space int) {
-	if len(qc.ackRanges[space]) == 0 {
-		return
-	}
-	var frames []byte
-	frames = quicAppendACKFrameRanges(frames, 0, qc.ackRanges[space])
-	qc.sendFrames(space, frames, false)
-}
-
 func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 	qc.writeMu.Lock()
 	qc.sendFramesLocked(space, frames, ackEliciting)
@@ -1311,7 +1475,7 @@ func (qc *QUICConn) sendFramesLocked(space int, frames []byte, ackEliciting bool
 	qc.sendFramesToLocked(space, frames, ackEliciting, nil)
 }
 
-func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bool, probeAddr *net.UDPAddr) {
+func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bool, offPath *quicOffPathBudget) {
 	keys := qc.sendKeys[space]
 	if keys == nil || !keys.valid {
 		keys = qc.keys[space]
@@ -1320,7 +1484,7 @@ func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bo
 		return
 	}
 
-	if len(qc.pendingAck[space]) > 0 && probeAddr == nil {
+	if len(qc.pendingAck[space]) > 0 && offPath == nil {
 		qc.combineScratch = append(qc.combineScratch[:0], qc.pendingAck[space]...)
 		qc.combineScratch = append(qc.combineScratch, frames...)
 		frames = qc.combineScratch
@@ -1358,9 +1522,11 @@ func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bo
 
 	if len(packet) > 0 {
 		dst, dstAddr := qc.udpAddr, qc.remoteAddr
-		blocked := false
-		if probeAddr != nil {
+		var blocked bool
+		if offPath != nil {
+			probeAddr := net.UDPAddrFromAddrPort(offPath.addr)
 			dst, dstAddr = probeAddr, probeAddr
+			blocked = !offPath.allows(len(packet))
 		} else {
 			blocked = !qc.addressValidated.Load() && qc.bytesSent.Load()+uint64(len(packet)) > quicAmplificationFactor*qc.bytesReceived.Load()
 		}
@@ -1380,7 +1546,11 @@ func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bo
 		case pbuf != nil:
 			quicPktBufPool.Put(pbuf)
 		}
-		if !blocked && probeAddr == nil && !qc.addressValidated.Load() {
+		switch {
+		case blocked:
+		case offPath != nil:
+			offPath.sent += uint64(len(packet))
+		case !qc.addressValidated.Load():
 			qc.bytesSent.Add(uint64(len(packet)))
 		}
 		if debugFlag.Load() {
@@ -1440,6 +1610,13 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 			return
 		}
 
+		if !qc.hasCongestionRoomLocked() {
+			if !s.sendBufDrained() {
+				qc.congestionBlocked.Store(true)
+			}
+			return
+		}
+
 		data, offset, fin := s.drainSendBuf(int(allowed))
 		if len(data) == 0 && !fin {
 			return
@@ -1454,6 +1631,24 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 			return
 		}
 	}
+}
+
+func (qc *QUICConn) hasCongestionRoomLocked() bool {
+	return qc.loss.sendRoom() > len(qc.coalesceBuf)-qc.coalesceStart
+}
+
+func (qc *QUICConn) resumeCongestionBlocked() {
+	if !qc.congestionBlocked.Load() {
+		return
+	}
+	qc.writeMu.Lock()
+	room := qc.hasCongestionRoomLocked()
+	qc.writeMu.Unlock()
+	if !room {
+		return
+	}
+	qc.congestionBlocked.Store(false)
+	qc.resumeBlockedStreams()
 }
 
 func (qc *QUICConn) queueStreamFrameLocked(frame []byte) {
@@ -1605,6 +1800,24 @@ func (qc *QUICConn) grantStreams(limit *uint64, maxStreams uint64, bidi bool) {
 	qc.writeMu.Unlock()
 }
 
+func (qc *QUICConn) resendFirstFlightOnDuplicate() {
+	if qc.tlsState.stage != quicTLSStageWaitFinished {
+		return
+	}
+	now := turbo.Now()
+	if now-qc.firstFlight.lastSent < int64(qc.loss.handshakeResendWindow(qc.firstFlight.resends)) {
+		return
+	}
+	qc.firstFlight.lastSent = now
+	qc.firstFlight.resends++
+	if debugFlag.Load() {
+		Dbg("[QUIC-DBG] retransmitting handshake flight (client repeated its Initial)")
+	}
+	qc.loss.discardSpace(quicSpaceInitial)
+	qc.loss.discardSpace(quicSpaceHandshake)
+	qc.sendFirstFlight(qc.firstFlight.serverHello, qc.firstFlight.ee, qc.firstFlight.cert, qc.firstFlight.cv, qc.firstFlight.fin)
+}
+
 func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	if !qc.firstFlight.sent {
 		qc.firstFlight.serverHello = make([]byte, len(serverHello))
@@ -1620,6 +1833,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		qc.firstFlight.sent = true
 	}
 
+	qc.flightInDatagram = true
 	qc.writeMu.Lock()
 	defer qc.writeMu.Unlock()
 
@@ -1669,7 +1883,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		chunk := serverHello[shOff:min(len(serverHello), shOff+maxCryptoPerPacket)]
 		var initialFrames []byte
 		if shOff == 0 && largest >= 0 {
-			initialFrames = quicAppendACKFrame(initialFrames, uint64(largest), 0, 0)
+			initialFrames = quicAppendACKFrameRanges(initialFrames, 0, qc.ackRanges[quicSpaceInitial])
 		}
 		initialFrames = quicAppendCryptoFrame(initialFrames, qc.firstFlight.initialOffset+uint64(shOff), chunk)
 		shOff += len(chunk)
@@ -1735,6 +1949,26 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	}
 }
 
+func (qc *QUICConn) probeHandshakeSpaces() bool {
+	var expired [quicSpaceAppData][][]byte
+	for space := quicSpaceInitial; space <= quicSpaceHandshake; space++ {
+		qc.writeMu.Lock()
+		allowed := qc.addressValidated.Load() || qc.ampBudgetLocked() >= quicMaxPacketSize
+		qc.writeMu.Unlock()
+		if allowed {
+			expired[space] = qc.loss.ptoExpiredFrames(space, quicPTOProbePackets)
+		}
+	}
+	probed := false
+	for space, frames := range expired {
+		for _, f := range frames {
+			qc.retransmitFrames(space, f)
+			probed = true
+		}
+	}
+	return probed
+}
+
 func (qc *QUICConn) retransmitFrames(space int, frames []byte) {
 	qc.sendFrames(space, frames, true)
 }
@@ -1783,6 +2017,13 @@ func (qc *QUICConn) close() {
 			qc.finishRequestStream(s)
 		}
 		qc.releaseStream(s)
+	}
+	qc.admitMu.Lock()
+	waiting := qc.waitingReqs
+	qc.waitingReqs = nil
+	qc.admitMu.Unlock()
+	for _, s := range waiting {
+		qc.dropWaiting(s)
 	}
 }
 
