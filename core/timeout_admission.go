@@ -19,8 +19,8 @@ func (s *Server) admitTimeoutHandler(req *Request) (*timeoutAdmission, int) {
 		return nil, http.StatusServiceUnavailable
 	}
 	admission := &timeoutAdmission{srv: s}
-	if limits.MaxConnsPerIP > 0 {
-		slot, ok := s.timeoutIPLimiter().hold(extractIP(req.RemoteAddr), limits.MaxConnsPerIP)
+	if perIP := s.timeoutPerIPLimit(limits); perIP > 0 {
+		slot, ok := s.timeoutIPLimiter().hold(extractIP(req.RemoteAddr), perIP)
 		if !ok {
 			s.timeoutHandlers.Add(-1)
 			return nil, http.StatusTooManyRequests
@@ -28,6 +28,13 @@ func (s *Server) admitTimeoutHandler(req *Request) (*timeoutAdmission, int) {
 		admission.ipSlot = slot
 	}
 	return admission, 0
+}
+
+func (s *Server) timeoutPerIPLimit(limits *Limits) int64 {
+	if s.trustedProxies.active {
+		return s.perIPRequestLimit()
+	}
+	return limits.MaxConnsPerIP
 }
 
 func (a *timeoutAdmission) release() {

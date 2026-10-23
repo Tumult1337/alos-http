@@ -587,8 +587,9 @@ func cloneDetachedStrings(r *Request) {
 }
 
 // Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
-// The handler runs on its own goroutine with a copy of the request body. At most MaxConns such handlers run at once, and at
-// most MaxConnsPerIP for one client IP, counting handlers that outlived their deadline; the body copy counts against
+// The handler runs on its own goroutine with a copy of the request body. At most MaxConns such handlers run at once, counting
+// handlers that outlived their deadline. For one client IP at most MaxConnsPerIP run, or behind a trusted proxy at most
+// MaxRequestsPerIP when it is set and MaxConnsPerIP otherwise; the body copy counts against
 // MaxInFlightBodyBytes until the handler returns, in addition to the request's own body. A handler that outlives its
 // deadline also keeps its MaxConcurrentReqs slot and, behind a trusted proxy, its per-IP request slot until it returns.
 // A request over one of these limits gets 503 Service Unavailable or 429 Too Many Requests.

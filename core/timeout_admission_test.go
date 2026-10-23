@@ -91,6 +91,7 @@ func TestTimeoutDetachedHandlerHoldsAdmission(t *testing.T) {
 		extra  string
 		limit  int32
 		refuse int
+		pingIP string
 	}{
 		{name: "max-conns", limit: 3, refuse: http.StatusServiceUnavailable, method: "GET",
 			cfg: func(cfg *Config) { cfg.MaxConns = 3 }},
@@ -101,6 +102,19 @@ func TestTimeoutDetachedHandlerHoldsAdmission(t *testing.T) {
 		{name: "per-ip-trusted-proxy", limit: 3, refuse: http.StatusTooManyRequests, method: "GET", extra: "X-Forwarded-For: 203.0.113.5\r\n",
 			cfg: func(cfg *Config) {
 				cfg.MaxConnsPerIP = 3
+				cfg.TrustedProxies = []string{"127.0.0.1"}
+			}},
+		{name: "max-requests-per-ip-trusted-proxy", limit: 3, refuse: http.StatusTooManyRequests, method: "GET", extra: "X-Forwarded-For: 203.0.113.6\r\n",
+			pingIP: "203.0.113.6",
+			cfg: func(cfg *Config) {
+				cfg.MaxRequestsPerIP = 3
+				cfg.MaxConnsPerIP = -1
+				cfg.TrustedProxies = []string{"127.0.0.1"}
+			}},
+		{name: "max-requests-per-ip-wins-trusted-proxy", limit: 5, refuse: http.StatusTooManyRequests, method: "GET", extra: "X-Forwarded-For: 203.0.113.7\r\n",
+			cfg: func(cfg *Config) {
+				cfg.MaxRequestsPerIP = 5
+				cfg.MaxConnsPerIP = 2
 				cfg.TrustedProxies = []string{"127.0.0.1"}
 			}},
 		{name: "body-bytes", limit: 1, method: "POST", body: timeoutAdmissionBody,
@@ -126,6 +140,11 @@ func TestTimeoutDetachedHandlerHoldsAdmission(t *testing.T) {
 			}
 			if running := probe.running.Load(); running != tc.limit || int(running) != timedOut {
 				t.Fatalf("statuses %v: %d detached handlers run, %d timed out, limit %d", statuses, running, timedOut, tc.limit)
+			}
+			if tc.pingIP != "" {
+				if status := timeoutAdmissionPing(t, ts, tc.pingIP); status != http.StatusTooManyRequests {
+					t.Fatalf("plain request from %s while its detached handlers fill MaxRequestsPerIP: status %d, want 429", tc.pingIP, status)
+				}
 			}
 			probe.unblock()
 			waitFor(t, harnessIOTimeout, func() bool {
@@ -204,4 +223,18 @@ func TestTimeoutConcurrentH2StreamsRespectAdmission(t *testing.T) {
 			}
 		})
 	}
+}
+
+func timeoutAdmissionPing(t *testing.T, ts *testServer, ip string) int {
+	t.Helper()
+	c := ts.dial(t)
+	defer c.Close()
+	if _, err := io.WriteString(c, "GET /ping HTTP/1.1\r\nHost: "+ts.domain+"\r\nX-Forwarded-For: "+ip+"\r\nConnection: close\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	return resp.StatusCode
 }
