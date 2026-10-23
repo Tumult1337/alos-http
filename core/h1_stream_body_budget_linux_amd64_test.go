@@ -249,3 +249,19 @@ func TestH1StreamedBodyLargerThanBudgetStreams(t *testing.T) {
 		t.Fatalf("body budget after the request = %d, want 0", got)
 	}
 }
+
+func TestBodyLimitZeroRejectsStreamedBody(t *testing.T) {
+	var read atomic.Int64
+	addr, _ := startH2FixServerWith(t, func(c *Config) { c.StreamBodyAbove = 1 }, func(s *Server) {
+		s.Router.Use(BodyLimit(0))
+		s.Router.POST("/limited", func(req *Request, resp *Response) {
+			n, _ := io.Copy(io.Discard, req.BodyStream())
+			read.Store(n)
+			resp.Status(200).String("handler-ok")
+		})
+	})
+	resp, body, _ := h1StreamPost(t, addr, "/limited", "x")
+	if resp.StatusCode != 413 || read.Load() != 0 {
+		t.Fatalf("status=%d body=%q read=%d; BodyLimit(0) must reject a non-empty streamed body as the buffered path does", resp.StatusCode, body, read.Load())
+	}
+}

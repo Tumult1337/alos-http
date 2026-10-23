@@ -237,7 +237,7 @@ func (sw *epollH1StreamWriter) claimPumpLocked() bool {
 
 func (sw *epollH1StreamWriter) completed() bool {
 	sw.mu.Lock()
-	ok := sw.err == nil && !sw.mustClose && sw.framingComplete()
+	ok := !sw.mustClose && sw.framingComplete()
 	sw.mu.Unlock()
 	return ok
 }
