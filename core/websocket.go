@@ -327,6 +327,9 @@ func upgradeH2WebSocket(req *Request, resp *Response, opts WSUpgradeOptions) *WS
 	resp.SetStreamer(sw)
 	conn := newH2StreamConn(body, sw, req.RemoteAddr)
 	req.h2Tunnel = conn
+	if stream := req.h2Stream; stream != nil {
+		stream.req.h2Tunnel = conn
+	}
 	ws.attachConn(conn)
 	return ws
 }
@@ -376,6 +379,7 @@ func (ws *WSConn) appendNegotiatedHeaders(b []byte) []byte {
 func (ws *WSConn) Subprotocol() string { return ws.subprotocol }
 
 // ServeWebSocket upgrades the request and runs fn on a new goroutine, returning immediately so the dispatching worker is released; the connection is closed when fn returns. It reports false if the upgrade failed (an error response has already been written). This is the safe way to host a WebSocket — see the UpgradeWebSocket note about handlers that block on the socket.
+// An HTTP/2 (RFC 8441) session counts against MaxConns and keeps its per-IP slot until fn returns; when MaxConns is reached the request gets 503.
 //
 // Example: ServeWebSocket(req, resp, func(ws *WSConn) { for { _, msg, err := ws.ReadMessage(); if err != nil { return }; ws.WriteText(string(msg)) } })
 // Example: if !ServeWebSocket(req, resp, handleWS) { return }
@@ -384,20 +388,38 @@ func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
 }
 
 func ServeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions, fn func(*WSConn)) bool {
+	srv := req.server
+	tracked := req.h2WebSocket && srv != nil
+	if tracked && !srv.tryTrackConn() {
+		resp.Status(503).String("Service Unavailable")
+		return false
+	}
+	handedOff := false
+	defer func() {
+		if tracked && !handedOff {
+			srv.releaseTrackedConn()
+		}
+	}()
 	ws := UpgradeWebSocketWith(req, resp, opts)
 	if ws == nil {
 		return false
 	}
-	srv := req.server
+	tunnel, _ := ws.conn.(*h2StreamConn)
+	tunnel.retainSlots()
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				srv.reportPanic(nil, r)
 			}
 			ws.Close()
+			tunnel.releaseSlots()
+			if tracked {
+				srv.releaseTrackedConn()
+			}
 		}()
 		fn(ws)
 	}()
+	handedOff = true
 	return true
 }
 
@@ -446,6 +468,9 @@ func wsDeliverClose(srv *Server, ws *WSConn, h *WSEventHandler) {
 }
 
 func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
+	if tracked := trackedConnOf(ws.conn); tracked != nil && tracked.retainSlots() {
+		defer tracked.releaseHold()
+	}
 	var buf []byte
 	for {
 		op, msg, err := ws.readMessageReserved(buf[:0])

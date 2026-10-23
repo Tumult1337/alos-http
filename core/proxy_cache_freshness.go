@@ -100,12 +100,15 @@ func (f *cacheFreshnessFields) add(name, value string) {
 	}
 }
 
-func (f *cacheFreshnessFields) expiresLifetime(received time.Time) time.Duration {
-	expires, _ := parseCacheHTTPDate(trimASCIISpace(f.expires))
-	base := received
-	if date, ok := parseCacheHTTPDate(trimASCIISpace(f.date)); f.hasDate && ok {
-		base = date
+func (f *cacheFreshnessFields) parsedDate() (time.Time, bool) {
+	if !f.hasDate {
+		return time.Time{}, false
 	}
+	return parseCacheHTTPDate(trimASCIISpace(f.date))
+}
+
+func (f *cacheFreshnessFields) expiresLifetime(base time.Time) time.Duration {
+	expires, _ := parseCacheHTTPDate(trimASCIISpace(f.expires))
 	return expires.Sub(base)
 }
 
@@ -114,25 +117,35 @@ func parseCacheFreshness(headers [][2]string, received time.Time) cacheFreshness
 	for i := range headers {
 		f.add(headers[i][0], headers[i][1])
 	}
-	out := cacheFreshness{age: f.age, noStale: f.revalidate || f.sMaxAge.present}
+	base := received
+	age := f.age
+	if date, ok := f.parsedDate(); ok {
+		base = date
+		age = max(age, received.Sub(date))
+	}
+	out := cacheFreshness{age: clampCacheAge(age), noStale: f.revalidate || f.sMaxAge.present}
 	switch {
 	case f.sMaxAge.present:
 		out.explicit, out.lifetime = true, f.sMaxAge.lifetime
 	case f.maxAge.present:
 		out.explicit, out.lifetime = true, f.maxAge.lifetime
 	case f.hasExpires:
-		out.explicit, out.lifetime = true, f.expiresLifetime(received)
+		out.explicit, out.lifetime = true, f.expiresLifetime(base)
 	}
+	out.lifetime = clampCacheAge(out.lifetime)
 	return out
+}
+
+func clampCacheAge(age time.Duration) time.Duration {
+	return min(max(age, 0), cacheDeltaSecondsMax*time.Second)
 }
 
 func (f cacheFreshness) storeTTL(configured time.Duration) (time.Duration, bool) {
 	if !f.explicit {
 		return configured, true
 	}
-	remaining := f.lifetime - f.age
-	if remaining <= 0 {
+	if f.lifetime <= f.age {
 		return 0, false
 	}
-	return min(configured, remaining), true
+	return min(configured, f.lifetime-f.age), true
 }

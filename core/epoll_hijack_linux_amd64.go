@@ -205,6 +205,7 @@ func (w *epollWorker) handoffH1Conn(c *epollConn, req *Request) {
 	c.ipHeld = false
 	c.ipKey = ""
 	c.takeoverPinned = true
+	c.req.connTakenOver = true
 	req.connTakenOver = true
 	req.attachConn = nil
 	req.conn = tracked

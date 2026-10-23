@@ -169,11 +169,15 @@ var timeNow = time.Now
 //	Example: WorkerCount: 8.
 //	Example: WorkerCount: 0 auto-sizes.
 //
-// ConnBandwidth rate-limits each connection.
+// ConnBandwidth rate-limits each connection. It throttles only streamed request bodies read
+// through BodyStream (upload), and HTTP/1.1 responses written through a stream writer or sendfile
+// (download). Buffered request bodies, buffered responses, HTTP/2 and HTTP/3 responses, WebSocket
+// frames and proxied traffic are not throttled.
 //
 //	Example: ConnBandwidth: BandwidthConfig{MaxUploadRate: 100, MaxDownloadRate: 200} (Mbps).
 //
-// GlobalBandwidth rate-limits all connections in aggregate.
+// GlobalBandwidth rate-limits all connections in aggregate. It throttles the same traffic as
+// ConnBandwidth and nothing else.
 //
 //	Example: GlobalBandwidth: BandwidthConfig{MaxDownloadRate: 1000} (Mbps).
 //
@@ -674,6 +678,8 @@ type Server struct {
 	inlineBatch       time.Duration
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
+	timeoutHandlers   atomic.Int64
+	timeoutPerIP      *perIPLimiter
 	_                 [CacheLineSize]byte
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
@@ -706,6 +712,9 @@ type trackedHandoffConn struct {
 	ipFromInFlig bool
 	closeOnce    sync.Once
 	onClose      func()
+	holdMu       sync.Mutex
+	holds        int
+	closed       bool
 }
 
 type ipReqCounter struct {
@@ -828,6 +837,8 @@ func New(configs ...Config) *Server {
 			s.perIPConnLimiter.Store(newPerIPConnLimiter())
 		}
 	}
+
+	s.timeoutPerIP = newPerIPRequestLimiter()
 
 	s.debug.Store(cfg.Debug)
 	s.logRequests.Store(cfg.LogRequests)
@@ -1129,12 +1140,7 @@ func (c *trackedHandoffConn) Close() error {
 	var err error
 	c.closeOnce.Do(func() {
 		err = c.Conn.Close()
-		if c.server != nil {
-			c.server.untrackHandoffConn(c)
-		}
-		if c.onClose != nil {
-			c.onClose()
-		}
+		c.finishClose()
 	})
 	return err
 }
@@ -1318,6 +1324,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			s.perIPLimiter.Stop()
 		}
 		s.perIPConnLimiter.Load().Stop()
+		s.timeoutPerIP.Stop()
 		for _, ln := range s.listeners {
 			ln.Close()
 		}
@@ -1863,6 +1870,10 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		}
 		if slot != nil {
 			defer func() {
+				if req.h2Tunnel != nil {
+					req.h2Tunnel.adoptIPSlot(slot)
+					return
+				}
 				if req.connTakenOver && s.trustedProxies.active {
 					return
 				}

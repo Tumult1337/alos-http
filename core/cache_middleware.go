@@ -3,8 +3,6 @@
 package core
 
 import (
-	"cmp"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +16,11 @@ import (
 // NewResponseCache. The zero value is valid; each field below falls back to a
 // default when left zero.
 //
-// TTL is how long a cached response stays fresh; 0 defaults to 60s.
+// TTL is how long a cached response stays fresh; 0 defaults to 60s. A response
+// with an explicit freshness lifetime (s-maxage, then max-age, then Expires minus
+// Date, per RFC 9111 section 4.2.1) stays fresh for that lifetime minus its Age
+// header when this is shorter than TTL, and is not stored when nothing remains.
+// A cache hit carries an Age header with the response's current age in seconds.
 //
 //	Example: TTL: 30 * time.Second.
 //	Example: TTL: 5 * time.Minute.
@@ -35,7 +37,7 @@ import (
 //	Example: IgnoreQuery: false.
 //
 // MaxEntries caps the number of stored responses; 0 defaults to 10000. When the
-// cache is full the oldest entries are evicted first.
+// cache is full, each new response evicts the entry stored longest ago.
 //
 //	Example: MaxEntries: 50000.
 //
@@ -59,7 +61,7 @@ import (
 //
 //	Example: GzipLevel: 9.
 //
-// SweepInterval is how often expired and overflow entries are reaped; 0 defaults
+// SweepInterval is how often expired entries are reaped; 0 defaults
 // to 15s.
 //
 //	Example: SweepInterval: 30 * time.Second.
@@ -94,6 +96,12 @@ type cachedResponse struct {
 	addVary     bool
 	expiresAtNs int64
 	storedAtNs  int64
+	initialAge  time.Duration
+}
+
+type cacheOrderRef struct {
+	key string
+	ent *cachedResponse
 }
 
 // ResponseCache is a concurrent in-memory HTTP response cache. Create one with
@@ -105,7 +113,9 @@ type ResponseCache struct {
 	filling  *alosmap.TypedMap[string, struct{}]
 	builds   atomic.Int64
 	methods  map[string]struct{}
-	ttlNs    int64
+	orderMu  sync.Mutex
+	order    []cacheOrderRef
+	entries  atomic.Int64
 	stop     chan struct{}
 	stopOnce sync.Once
 	raceSeam func()
@@ -164,7 +174,6 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 		store:   alosmap.NewTyped[string, *cachedResponse]().Prealloc(128),
 		filling: alosmap.NewTyped[string, struct{}](),
 		methods: methods,
-		ttlNs:   int64(cfg.TTL),
 		stop:    make(chan struct{}),
 	}
 	go rc.sweepLoop()
@@ -183,7 +192,15 @@ func (rc *ResponseCache) Stop() {
 func (rc *ResponseCache) Len() int { return rc.store.Len() }
 
 // Purge removes every cached entry.
-func (rc *ResponseCache) Purge() { rc.store.Clear() }
+func (rc *ResponseCache) Purge() {
+	rc.orderMu.Lock()
+	defer rc.orderMu.Unlock()
+	rc.store.Range(func(key string, ent *cachedResponse) bool {
+		rc.evictEntry(key, ent)
+		return true
+	})
+	rc.order = nil
+}
 
 func (rc *ResponseCache) handle(next HandlerFunc, req *Request, resp *Response) {
 	if _, ok := rc.methods[req.Method]; !ok {
@@ -207,8 +224,9 @@ func (rc *ResponseCache) handle(next HandlerFunc, req *Request, resp *Response) 
 		key = UnsafeString(rc.appendKey(keyBuf[:0], req))
 	}
 	if ent, ok := rc.store.Load(key); ok {
-		if turbo.UnixNano() <= ent.expiresAtNs {
+		if now := turbo.UnixNano(); now <= ent.expiresAtNs {
 			serveCached(resp, ent, ent.negotiate(req))
+			ent.setAge(resp, now)
 			return
 		}
 		rc.crossRaceSeam()
@@ -246,11 +264,11 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 	if len(body) > rc.cfg.MaxBodyBytes {
 		return nil
 	}
-	if rc.store.Len() >= rc.cfg.MaxEntries {
-		rc.evictExpired()
-		if rc.store.Len() >= rc.cfg.MaxEntries {
-			return nil
-		}
+	now := turbo.UnixNano()
+	fresh := parseCacheFreshness(resp.Headers, time.Unix(0, now))
+	ttl, fresher := fresh.storeTTL(rc.cfg.TTL)
+	if !fresher {
+		return nil
 	}
 	ownedKey := strings.Clone(key)
 	compress := (rc.cfg.Gzip || rc.cfg.Brotli) && len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType)
@@ -260,15 +278,14 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 				return liveEntry(cur)
 			}
 			rc.crossRaceSeam()
-			stored, _ := rc.store.LoadOrStore(ownedKey, rc.newEntry(status, resp, body))
-			return liveEntry(stored)
+			return liveEntry(rc.storeBoundedIfAbsent(ownedKey, rc.newEntry(status, resp, body, now, ttl, fresh.age)))
 		}
 		defer rc.filling.Delete(ownedKey)
 		if cur, ok := rc.store.Load(ownedKey); ok && cur.encodings != 0 && turbo.UnixNano() <= cur.expiresAtNs {
 			return cur
 		}
 	}
-	ent := rc.newEntry(status, resp, body)
+	ent := rc.newEntry(status, resp, body, now, ttl, fresh.age)
 	if compress {
 		rc.builds.Add(1)
 		if rc.cfg.Gzip {
@@ -285,20 +302,73 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 		ent.encodings |= offerBrotli
 	}
 	ent.addVary = ent.encodings != 0 && !varyCoversAcceptEncoding(ent.headers)
-	rc.store.Store(ownedKey, ent)
+	rc.storeBounded(ownedKey, ent)
 	return ent
 }
 
-func (rc *ResponseCache) newEntry(status int, resp *Response, body []byte) *cachedResponse {
-	now := turbo.UnixNano()
+func (rc *ResponseCache) newEntry(status int, resp *Response, body []byte, now int64, ttl, initialAge time.Duration) *cachedResponse {
 	return &cachedResponse{
 		status:      status,
-		headers:     cloneHeaders(resp.Headers),
+		headers:     cloneHeadersWithoutAge(resp.Headers),
 		contentType: strings.Clone(resp.ContentType),
 		body:        cloneBytes(body),
-		expiresAtNs: now + rc.ttlNs,
+		expiresAtNs: now + int64(ttl),
 		storedAtNs:  now,
+		initialAge:  initialAge,
 	}
+}
+
+func (ent *cachedResponse) setAge(resp *Response, now int64) {
+	age := ent.initialAge + time.Duration(max(0, now-ent.storedAtNs))
+	var buf [20]byte
+	resp.SetHeaderUnsafe("Age", string(appendUint(buf[:0], int64(clampCacheAge(age)/time.Second))))
+}
+
+func (rc *ResponseCache) storeBounded(key string, ent *cachedResponse) {
+	rc.orderMu.Lock()
+	defer rc.orderMu.Unlock()
+	if _, replaced := rc.store.Swap(key, ent); !replaced {
+		rc.entries.Add(1)
+	}
+	rc.admitLocked(key, ent)
+}
+
+func (rc *ResponseCache) storeBoundedIfAbsent(key string, ent *cachedResponse) *cachedResponse {
+	rc.orderMu.Lock()
+	defer rc.orderMu.Unlock()
+	stored, loaded := rc.store.LoadOrStore(key, ent)
+	if !loaded {
+		rc.entries.Add(1)
+		rc.admitLocked(key, ent)
+	}
+	return stored
+}
+
+func (rc *ResponseCache) admitLocked(key string, ent *cachedResponse) {
+	rc.order = append(rc.order, cacheOrderRef{key: key, ent: ent})
+	evicted := 0
+	for rc.entries.Load() > int64(rc.cfg.MaxEntries) && evicted < len(rc.order)-1 {
+		victim := rc.order[evicted]
+		rc.order[evicted] = cacheOrderRef{}
+		evicted++
+		rc.evictEntry(victim.key, victim.ent)
+	}
+	if evicted > 0 {
+		rc.order = rc.order[evicted:]
+	}
+	if int64(len(rc.order)) > int64(rc.cfg.MaxEntries)+rc.entries.Load() {
+		rc.compactOrderLocked()
+	}
+}
+
+func (rc *ResponseCache) compactOrderLocked() {
+	live := make([]cacheOrderRef, 0, max(rc.entries.Load(), 0))
+	for _, ref := range rc.order {
+		if cur, ok := rc.store.Load(ref.key); ok && cur == ref.ent {
+			live = append(live, ref)
+		}
+	}
+	rc.order = live
 }
 
 func liveEntry(ent *cachedResponse) *cachedResponse {
@@ -381,10 +451,18 @@ func (rc *ResponseCache) sweepLoop() {
 		case <-rc.stop:
 			return
 		case <-ticker.C:
-			rc.evictExpired()
-			rc.evictOverflow()
+			rc.sweep()
 		}
 	}
+}
+
+func (rc *ResponseCache) sweep() {
+	rc.evictExpired()
+	rc.orderMu.Lock()
+	if int64(len(rc.order)) > 2*rc.entries.Load() {
+		rc.compactOrderLocked()
+	}
+	rc.orderMu.Unlock()
 }
 
 func (rc *ResponseCache) crossRaceSeam() {
@@ -394,7 +472,9 @@ func (rc *ResponseCache) crossRaceSeam() {
 }
 
 func (rc *ResponseCache) evictEntry(key string, ent *cachedResponse) {
-	rc.store.CompareAndDelete(key, ent)
+	if rc.store.CompareAndDelete(key, ent) {
+		rc.entries.Add(-1)
+	}
 }
 
 func (rc *ResponseCache) evictExpired() {
@@ -406,28 +486,6 @@ func (rc *ResponseCache) evictExpired() {
 		}
 		return true
 	})
-}
-
-func (rc *ResponseCache) evictOverflow() {
-	over := rc.store.Len() - rc.cfg.MaxEntries
-	if over <= 0 {
-		return
-	}
-	type aged struct {
-		key string
-		ent *cachedResponse
-		ts  int64
-	}
-	victims := make([]aged, 0, over*2)
-	rc.store.Range(func(key string, ent *cachedResponse) bool {
-		victims = append(victims, aged{key, ent, ent.storedAtNs})
-		return true
-	})
-	slices.SortFunc(victims, func(a, b aged) int { return cmp.Compare(a.ts, b.ts) })
-	rc.crossRaceSeam()
-	for i := 0; i < over && i < len(victims); i++ {
-		rc.evictEntry(victims[i].key, victims[i].ent)
-	}
 }
 
 func cacheableHeaders(headers [][2]string) bool {
@@ -473,6 +531,22 @@ func compressibleType(ct string) bool {
 		strings.Contains(lc, "svg") ||
 		strings.Contains(lc, "html") ||
 		strings.Contains(lc, "css")
+}
+
+func cloneHeadersWithoutAge(h [][2]string) [][2]string {
+	out := cloneHeaders(h)
+	n := 0
+	for i := range out {
+		if EqualFoldASCII(out[i][0], "age") {
+			continue
+		}
+		out[n] = out[i]
+		n++
+	}
+	if n == 0 {
+		return nil
+	}
+	return out[:n]
 }
 
 func cloneHeaders(h [][2]string) [][2]string {

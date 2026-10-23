@@ -556,11 +556,6 @@ func (w *bytesWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
-//
-// Example: app.Use(Timeout(5 * time.Second))
-// Example: app.Use(Timeout(100 * time.Millisecond))
-// Example: app.Use(Timeout(time.Minute))
 func cloneDetachedStrings(r *Request) {
 	r.Method = strings.Clone(r.Method)
 	r.Path = strings.Clone(r.Path)
@@ -591,9 +586,34 @@ func cloneDetachedStrings(r *Request) {
 	}
 }
 
+// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
+// The handler runs on its own goroutine with a copy of the request body. At most MaxConns such handlers run at once, counting
+// handlers that outlived their deadline. For one client IP at most MaxConnsPerIP run, or behind a trusted proxy at most
+// MaxRequestsPerIP when it is set and MaxConnsPerIP otherwise; the body copy counts against
+// MaxInFlightBodyBytes until the handler returns, in addition to the request's own body. A handler that outlives its
+// deadline also keeps its MaxConcurrentReqs slot and, behind a trusted proxy, its per-IP request slot until it returns.
+// A request over one of these limits gets 503 Service Unavailable or 429 Too Many Requests.
+//
+// Example: app.Use(Timeout(5 * time.Second))
+// Example: app.Use(Timeout(100 * time.Millisecond))
+// Example: app.Use(Timeout(time.Minute))
 func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
+			srv := req.server
+			admission, status := srv.admitTimeoutHandler(req)
+			if status != 0 {
+				statsBlocked()
+				resp.Status(status).String(http.StatusText(status))
+				return
+			}
+			if !srv.tryReserveBodyBytes(len(req.Body)) {
+				admission.release()
+				statsBlocked()
+				resp.Status(http.StatusServiceUnavailable).String(http.StatusText(http.StatusServiceUnavailable))
+				return
+			}
+			bodyHeld := int64(len(req.Body))
 			done := make(chan struct{}, 1)
 			tmpReq := *req
 			tmpReq.Params = req.Params
@@ -642,6 +662,8 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					if r := recover(); r != nil {
 						tmpReq.server.reportPanic(&tmpReq, r)
 					}
+					srv.releaseBodyBytes(bodyHeld)
+					admission.release()
 					done <- struct{}{}
 				}()
 				next(&tmpReq, tmpResp)
@@ -660,8 +682,10 @@ func Timeout(d time.Duration) MiddlewareFunc {
 				}
 			case <-ctx.Done():
 				timedOut.Store(true)
+				hold := srv.holdDetachedWork(req)
 				go func() {
 					<-done
+					hold.release()
 					tmpResp.Reset()
 					releaseResponseToPool(tmpResp)
 				}()
