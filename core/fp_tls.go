@@ -26,6 +26,18 @@ var tlsHelloRetryRequestRandom = [32]byte{
 }
 
 const (
+	tlsMaxHandshakeMessage            = 65536
+	tlsMaxCertificateHandshakeMessage = 262144
+)
+
+func tlsHandshakeMessageLimit(msgType byte) int {
+	if msgType == tlsHSCertificate {
+		return tlsMaxCertificateHandshakeMessage
+	}
+	return tlsMaxHandshakeMessage
+}
+
+const (
 	tlsDowngradeSentinelPrefix = "DOWNGRD"
 	tlsServerHelloMinLen       = 2 + 32 + 1
 	tlsLegacyVersion12         = 0x0303
@@ -368,6 +380,9 @@ func (t *tlsTransport) handleEncryptedHandshake(c *backendConn, data []byte) err
 			return nil
 		}
 		mlen := int(t.inHS[1])<<16 | int(t.inHS[2])<<8 | int(t.inHS[3])
+		if mlen > tlsHandshakeMessageLimit(t.inHS[0]) {
+			return errTLS
+		}
 		if len(t.inHS) < 4+mlen {
 			return nil
 		}

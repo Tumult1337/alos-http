@@ -82,3 +82,40 @@ func TestFPTLS13CertificateRejectsMalformedChain(t *testing.T) {
 		t.Fatalf("stored chain = %q", tr.certs)
 	}
 }
+
+func fpG2HandshakeHeader(msgType byte, length int) []byte {
+	return []byte{msgType, byte(length >> 16), byte(length >> 8), byte(length)}
+}
+
+func TestFPTLSHandshakeMessageLengthIsCapped(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		msgType byte
+		length  int
+		reject  bool
+	}{
+		{"certificate at the cap", tlsHSCertificate, 262144, false},
+		{"certificate above the cap", tlsHSCertificate, 262145, true},
+		{"certificate at the length field maximum", tlsHSCertificate, 1<<24 - 1, true},
+		{"other message at the cap", tlsHSEncryptedExts, 65536, false},
+		{"other message above the cap", tlsHSEncryptedExts, 65537, true},
+		{"server key exchange above the cap", tlsHSServerKeyExchange, 65537, true},
+	} {
+		header := fpG2HandshakeHeader(tc.msgType, tc.length)
+		tr13 := &tlsTransport{skipVerify: true, version: 0x0304, state: tlsExpectEncrypted}
+		err13 := tr13.handleEncryptedHandshake(nil, header)
+		tr12 := &tlsTransport{skipVerify: true, version: 0x0303, state: tls12ExpectHandshake}
+		err12 := tr12.handle12Handshake(nil, header)
+		for _, got := range []struct {
+			version string
+			err     error
+		}{{"1.3", err13}, {"1.2", err12}} {
+			if tc.reject && got.err == nil {
+				t.Errorf("TLS %s %s: declared %d bytes and the client kept buffering", got.version, tc.name, tc.length)
+			}
+			if !tc.reject && got.err != nil {
+				t.Errorf("TLS %s %s: rejected a legal length: %v", got.version, tc.name, got.err)
+			}
+		}
+	}
+}
