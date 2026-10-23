@@ -442,7 +442,7 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 		return false, -1, errFPBadResponse
 	}
 	d0, d1, d2 := statusLine[9], statusLine[10], statusLine[11]
-	if d0 < '0' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9' {
+	if d0 < '1' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9' {
 		return false, -1, errFPBadResponse
 	}
 	p.status = int(d0-'0')*100 + int(d1-'0')*10 + int(d2-'0')

@@ -7,7 +7,7 @@ import "testing"
 func TestFPH2PaddedDataCreditsWholeFramePayload(t *testing.T) {
 	c := &backendConn{state: connClosed, be: &beLoop{cfg: &fpConfig{MaxResponseBody: 1 << 20}}, transport: &plainTransport{h2: true}}
 	c.h2init()
-	st := &h2Stream{id: 1}
+	st := &h2Stream{id: 1, gotHeaders: true}
 	c.h2.streams[1] = st
 	payload := []byte{5, 'a', 'b', 'c', 0, 0, 0, 0, 0}
 	if err := c.be.h2proto.onDataFrame(c, h2FlagPadded, 1, payload); err != nil {
