@@ -3,6 +3,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hmac"
@@ -386,7 +387,9 @@ func (t *tlsTransport) handleEncryptedHandshake(c *backendConn, data []byte) err
 			return nil
 		}
 		if mtype == tlsHSCertificate {
-			t.parseCertificate(msg[4:])
+			if err := t.parseCertificate(msg[4:]); err != nil {
+				return err
+			}
 		}
 		if mtype == tlsHSCertVerify {
 			if !t.skipVerify {
@@ -517,37 +520,56 @@ func (t *tlsTransport) certVerifyContent() []byte {
 	return signed
 }
 
-func (t *tlsTransport) parseCertificate(body []byte) {
-	tls13 := t.version != 0x0303
+func (t *tlsTransport) parseCertificate(body []byte) error {
 	p := 0
-	if tls13 {
+	if t.version != tlsLegacyVersion12 {
 		if len(body) < 1 {
-			return
+			return errTLS
 		}
 		p = 1 + int(body[0])
 	}
 	if p+3 > len(body) {
-		return
+		return errTLS
 	}
 	listLen := int(body[p])<<16 | int(body[p+1])<<8 | int(body[p+2])
 	p += 3
-	end := p + listLen
-	if end > len(body) {
-		end = len(body)
+	if p+listLen != len(body) || listLen == 0 {
+		return errTLS
 	}
-	for p+3 <= end {
-		clen := int(body[p])<<16 | int(body[p+1])<<8 | int(body[p+2])
-		p += 3
-		if p+clen > end {
-			return
+	list := bytes.Clone(body[p:])
+	var certs [][]byte
+	for q := 0; q < len(list); {
+		der, next, err := t.nextCertificateEntry(list, q)
+		if err != nil {
+			return err
 		}
-		der := make([]byte, clen)
-		copy(der, body[p:p+clen])
-		t.certs = append(t.certs, der)
-		p += clen
-		if tls13 && p+2 <= end {
-			extLen := int(body[p])<<8 | int(body[p+1])
-			p += 2 + extLen
-		}
+		certs = append(certs, der)
+		q = next
 	}
+	t.certs = certs
+	return nil
+}
+
+func (t *tlsTransport) nextCertificateEntry(list []byte, p int) ([]byte, int, error) {
+	if p+3 > len(list) {
+		return nil, 0, errTLS
+	}
+	clen := int(list[p])<<16 | int(list[p+1])<<8 | int(list[p+2])
+	p += 3
+	if clen == 0 || p+clen > len(list) {
+		return nil, 0, errTLS
+	}
+	der := list[p : p+clen : p+clen]
+	p += clen
+	if t.version == tlsLegacyVersion12 {
+		return der, p, nil
+	}
+	if p+2 > len(list) {
+		return nil, 0, errTLS
+	}
+	p += 2 + (int(list[p])<<8 | int(list[p+1]))
+	if p > len(list) {
+		return nil, 0, errTLS
+	}
+	return der, p, nil
 }

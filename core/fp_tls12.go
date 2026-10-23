@@ -119,7 +119,9 @@ func (t *tlsTransport) handle12Handshake(c *backendConn, data []byte) error {
 		t.transcript = append(t.transcript, msg...)
 		switch mtype {
 		case tlsHSCertificate:
-			t.parseCertificate(msg[4:])
+			if err := t.parseCertificate(msg[4:]); err != nil {
+				return err
+			}
 		case tlsHSCertificateRequest:
 			if err := t.parseCertificateRequest12(msg[4:]); err != nil {
 				return err
