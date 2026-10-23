@@ -35,6 +35,7 @@ func newQUICFixStalledPeer(t *testing.T) *quicTestPeer {
 
 func newQUICTestPeerFor(t *testing.T, srv *Server) *quicTestPeer {
 	t.Helper()
+	startReqStreamWorkers()
 	pc := &capturePacketConn{}
 	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	qc := newQUICConn(srv, pc, &quicFixLoopback, dcid, []byte{9, 10, 11, 12, 13, 14, 15, 16})
