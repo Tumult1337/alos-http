@@ -193,3 +193,36 @@ func TestQUICFixDuplicateFirstHelloDuringRetryKeepsTheLaterFlight(t *testing.T) 
 		t.Fatalf("a repeated second ClientHello after one PTO drew %d datagrams, want one %d-datagram flight", resent, flight)
 	}
 }
+
+const quicFixServerProcessing = 10 * time.Millisecond
+
+func TestQUICFixDuplicateClientHelloAtTheClientsFirstPTOResendsTheFlight(t *testing.T) {
+	f := newQUICFixFlightConn(t)
+	flight := f.datagrams()
+	clientPTO := quicInitialRTT + 4*(quicInitialRTT/2)
+	f.qc.firstFlight.lastSent -= int64(clientPTO - quicFixServerProcessing)
+	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
+	if resent := f.datagrams() - flight; resent != flight {
+		t.Fatalf("a duplicate ClientHello one client PTO (%v) after the ClientHello drew %d datagrams, want one %d-datagram flight", clientPTO, resent, flight)
+	}
+}
+
+func TestQUICFixResendWindowDoublesAfterEachResend(t *testing.T) {
+	f := newQUICFixFlightConn(t)
+	flight := f.datagrams()
+	f.qc.firstFlight.lastSent -= int64(quicInitialRTT)
+	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
+	if resent := f.datagrams() - flight; resent != flight {
+		t.Fatalf("a duplicate ClientHello one RTT after the flight drew %d datagrams, want %d", resent, flight)
+	}
+	f.qc.firstFlight.lastSent -= int64(quicInitialRTT)
+	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
+	if resent := f.datagrams() - flight; resent != flight {
+		t.Fatalf("a duplicate ClientHello one RTT after the first resend drew %d datagrams in total, want %d", resent, flight)
+	}
+	f.qc.firstFlight.lastSent -= int64(quicInitialRTT)
+	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
+	if resent := f.datagrams() - flight; resent != 2*flight {
+		t.Fatalf("a duplicate ClientHello two RTTs after the first resend drew %d datagrams in total, want %d", resent, 2*flight)
+	}
+}

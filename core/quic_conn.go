@@ -1461,7 +1461,7 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 			return
 		}
 
-		if qc.loss.sendRoom() <= len(qc.coalesceBuf)-qc.coalesceStart {
+		if !qc.hasCongestionRoomLocked() {
 			if !s.sendBufDrained() {
 				qc.congestionBlocked.Store(true)
 			}
@@ -1484,8 +1484,18 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 	}
 }
 
+func (qc *QUICConn) hasCongestionRoomLocked() bool {
+	return qc.loss.sendRoom() > len(qc.coalesceBuf)-qc.coalesceStart
+}
+
 func (qc *QUICConn) resumeCongestionBlocked() {
-	if !qc.congestionBlocked.Load() || qc.loss.sendRoom() == 0 {
+	if !qc.congestionBlocked.Load() {
+		return
+	}
+	qc.writeMu.Lock()
+	room := qc.hasCongestionRoomLocked()
+	qc.writeMu.Unlock()
+	if !room {
 		return
 	}
 	qc.congestionBlocked.Store(false)

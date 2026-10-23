@@ -89,7 +89,7 @@ func TestQUICFixManySingleAckFramesCostLessThanFramesTimesTracked(t *testing.T) 
 func quicFixLivePNs(ls *quicLossState, space int) []uint64 {
 	var pns []uint64
 	for _, sp := range ls.sent[space] {
-		if !sp.acked {
+		if !sp.removed {
 			pns = append(pns, sp.pn)
 		}
 	}
@@ -228,5 +228,64 @@ func TestQUICFixAckOfTheOldestPacketsReportsNoPossibleLoss(t *testing.T) {
 	}
 	if lossPossible {
 		t.Fatal("an ACK of the five oldest packets reported possible loss with no live packet below the largest acked")
+	}
+}
+
+const (
+	quicFixHoleAcks   = 2000
+	quicFixHoleRTT    = time.Second
+	quicFixHoleBudget = 8 * time.Millisecond
+)
+
+func TestQUICFixLossDetectionWithAnOpenHoleSkipsPacketsAboveTheLargestAcked(t *testing.T) {
+	nextPN := uint64(quicFixAckTracked)
+	var ls *quicLossState
+	total := quicFixFastest(quicFixAckTrials, func() time.Duration {
+		ls = newQuicLossState()
+		for pn := uint64(0); pn < quicFixAckTracked; pn++ {
+			ls.onPacketSent(quicSpaceAppData, pn, quicFixAckPacketSize, true, nil)
+		}
+		ls.mu.Lock()
+		ls.smoothedRTT, ls.minRTT, ls.firstRTTDone = quicFixHoleRTT, quicFixHoleRTT, true
+		ls.mu.Unlock()
+		start := time.Now()
+		for i := 0; i < quicFixHoleAcks; i++ {
+			lossPossible, err := ls.onAckReceived(quicSpaceAppData, quicAckFrame{largestAck: 1}, 0, nextPN)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !lossPossible {
+				t.Fatal("fixture hole at packet 0 does not keep loss detection running")
+			}
+			if lost := ls.detectLostPackets(quicSpaceAppData); len(lost) != 0 {
+				t.Fatalf("packet 0 declared lost %d times inside the packet and time thresholds", len(lost))
+			}
+		}
+		return time.Since(start)
+	})
+	if live := ls.liveSent(quicSpaceAppData); live != quicFixAckTracked-1 {
+		t.Fatalf("%d live packets, want %d", live, quicFixAckTracked-1)
+	}
+	if total > quicFixHoleBudget {
+		t.Fatalf("%d ACKs with loss detection over %d tracked packets took %v, want at most %v", quicFixHoleAcks, quicFixAckTracked, total, quicFixHoleBudget)
+	}
+}
+
+func TestQUICFixOldPacketInsideThePacketThresholdIsLostByTime(t *testing.T) {
+	ls := newQuicLossState()
+	for pn := uint64(0); pn < 3; pn++ {
+		ls.onPacketSent(quicSpaceAppData, pn, 100, true, []byte{quicFramePing})
+	}
+	ls.mu.Lock()
+	ls.sent[quicSpaceAppData][0].sent -= int64(10 * time.Second)
+	ls.mu.Unlock()
+	if _, err := ls.onAckReceived(quicSpaceAppData, quicAckFrame{largestAck: 2}, 0, 3); err != nil {
+		t.Fatal(err)
+	}
+	if lost := ls.detectLostPackets(quicSpaceAppData); len(lost) != 1 {
+		t.Fatalf("%d packets declared lost, want only the old packet 0", len(lost))
+	}
+	if got := quicFixLivePNs(ls, quicSpaceAppData); !slices.Equal(got, []uint64{1}) {
+		t.Fatalf("tracked packets %v, want [1]", got)
 	}
 }
