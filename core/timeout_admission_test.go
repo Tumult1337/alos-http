@@ -135,3 +135,28 @@ func TestTimeoutDetachedHandlerHoldsAdmission(t *testing.T) {
 		})
 	}
 }
+
+func TestPerIPLimiterHoldAliveSkipsFreeAndDeadCounters(t *testing.T) {
+	l := newPerIPLimiter(1)
+	defer l.Stop()
+	if slot := l.holdAlive("198.51.100.1"); slot != nil {
+		t.Fatal("holdAlive created a slot for an IP with no holder")
+	}
+	held, ok := l.hold("198.51.100.1", 1)
+	if !ok || held == nil {
+		t.Fatal("hold below the limit failed")
+	}
+	extra := l.holdAlive("198.51.100.1")
+	if extra == nil || l.count("198.51.100.1") != 2 {
+		t.Fatalf("holdAlive on a held IP: slot %v count %d, want count 2", extra, l.count("198.51.100.1"))
+	}
+	extra.release()
+	held.release()
+	if slot := l.holdAlive("198.51.100.1"); slot != nil || l.count("198.51.100.1") != 0 {
+		t.Fatalf("holdAlive revived a free counter: count %d", l.count("198.51.100.1"))
+	}
+	l.sweep()
+	if slot := l.holdAlive("198.51.100.1"); slot != nil {
+		t.Fatal("holdAlive revived a swept counter")
+	}
+}

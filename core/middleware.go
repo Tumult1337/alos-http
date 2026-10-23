@@ -556,11 +556,6 @@ func (w *bytesWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
-//
-// Example: app.Use(Timeout(5 * time.Second))
-// Example: app.Use(Timeout(100 * time.Millisecond))
-// Example: app.Use(Timeout(time.Minute))
 func cloneDetachedStrings(r *Request) {
 	r.Method = strings.Clone(r.Method)
 	r.Path = strings.Clone(r.Path)
@@ -591,6 +586,14 @@ func cloneDetachedStrings(r *Request) {
 	}
 }
 
+// Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
+// A handler that outlives its deadline keeps its request slot, its per-IP slot and its copy of the body counted against
+// MaxConcurrentReqs, MaxConnsPerIP or MaxRequestsPerIP, and MaxInFlightBodyBytes until it returns, and at most MaxConns such
+// handlers run at once. A request over one of these limits gets 503 Service Unavailable or 429 Too Many Requests.
+//
+// Example: app.Use(Timeout(5 * time.Second))
+// Example: app.Use(Timeout(100 * time.Millisecond))
+// Example: app.Use(Timeout(time.Minute))
 func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
