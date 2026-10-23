@@ -292,6 +292,7 @@ type QUICConn struct {
 	rxNonProbing     bool
 	pathResponses    []byte
 	inDatagram       bool
+	rxDatagramLen    int
 	flightInDatagram bool
 	handshakeAckDue  [quicSpaceAppData]bool
 	offPath          quicOffPathBudget
@@ -460,11 +461,11 @@ func (qc *QUICConn) processPacket(data []byte, from netip.AddrPort) {
 	if len(data) == 0 {
 		return
 	}
-	datagramLen := len(data)
+	qc.rxDatagramLen = len(data)
 	qc.inDatagram, qc.flightInDatagram = true, false
 	defer func() {
 		qc.inDatagram = false
-		qc.flushHandshakeAcks(datagramLen)
+		qc.flushHandshakeAcks(qc.rxDatagramLen)
 	}()
 	if debugFlag.Load() {
 		Dbg("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
@@ -510,6 +511,9 @@ func (qc *QUICConn) handleLongHeaderPacket(data []byte) int {
 
 	switch hdr.pktType {
 	case quicPktInitial:
+		if qc.rxDatagramLen < quicMinInitialDatagram {
+			return total
+		}
 		qc.handleInitialPacket(packet, &hdr)
 	case quicPktHandshake:
 		qc.handleHandshakePacket(packet, &hdr)

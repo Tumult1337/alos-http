@@ -16,10 +16,12 @@ const (
 )
 
 type quicFixFlightConn struct {
-	qc     *QUICConn
-	pc     *capturePacketConn
-	hello  []byte
-	nextPN uint64
+	qc                *QUICConn
+	pc                *capturePacketConn
+	hello             []byte
+	nextPN            uint64
+	initialSendKeys   *quicKeys
+	handshakeSendKeys *quicKeys
 }
 
 func newQUICFixFlightConn(t *testing.T) *quicFixFlightConn {
@@ -46,7 +48,7 @@ func newQUICFixFlightConn(t *testing.T) *quicFixFlightConn {
 	if qc.tlsState.stage != quicTLSStageWaitFinished || !qc.firstFlight.sent {
 		t.Fatalf("ClientHello did not produce the first flight (stage %d, closed %v)", qc.tlsState.stage, qc.closed.Load())
 	}
-	return &quicFixFlightConn{qc: qc, pc: pc, hello: hello, nextPN: quicFixClientRetryFirstPN}
+	return &quicFixFlightConn{qc: qc, pc: pc, hello: hello, nextPN: quicFixClientRetryFirstPN, initialSendKeys: qc.sendKeys[quicSpaceInitial], handshakeSendKeys: qc.sendKeys[quicSpaceHandshake]}
 }
 
 func (f *quicFixFlightConn) feedInitial(frames []byte) {

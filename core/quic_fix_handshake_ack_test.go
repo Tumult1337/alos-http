@@ -12,9 +12,10 @@ const (
 )
 
 type quicFixServerDatagram struct {
-	size         int
-	initialAcks  []quicAckFrame
-	ackEliciting bool
+	size          int
+	initialAcks   []quicAckFrame
+	handshakeAcks []quicAckFrame
+	ackEliciting  bool
 }
 
 func (f *quicFixFlightConn) clientInitial(pn uint64, frames []byte, padded bool) []byte {
@@ -43,8 +44,17 @@ func (f *quicFixFlightConn) serverDatagrams(t *testing.T, from int) []quicFixSer
 			if err != nil {
 				t.Fatalf("server sent an unparseable long header: %v", err)
 			}
+			if hdr.pktType == quicPktHandshake {
+				plain, err := quicDecryptPacket(pkt[:total], &hdr, f.handshakeSendKeys, -1)
+				if err != nil {
+					t.Fatalf("server sent an undecryptable Handshake packet: %v", err)
+				}
+				if err := quicParseFrames(plain, &quicFrameVisitor{onACK: func(a quicAckFrame) { d.handshakeAcks = append(d.handshakeAcks, a) }}); err != nil {
+					t.Fatalf("server sent malformed Handshake frames: %v", err)
+				}
+			}
 			if hdr.pktType == quicPktInitial {
-				plain, err := quicDecryptPacket(pkt[:total], &hdr, f.qc.sendKeys[quicSpaceInitial], -1)
+				plain, err := quicDecryptPacket(pkt[:total], &hdr, f.initialSendKeys, -1)
 				if err != nil {
 					t.Fatalf("server sent an undecryptable Initial: %v", err)
 				}
@@ -106,33 +116,6 @@ func TestQUICFixDuplicateInitialInsideTheResendWindowIsAcked(t *testing.T) {
 	}
 }
 
-func TestQUICFixInitialFloodGetsAcksWithinTheAmplificationLimit(t *testing.T) {
-	for _, validated := range []bool{true, false} {
-		f := newQUICFixFlightConn(t)
-		f.qc.addressValidated.Store(validated)
-		f.qc.bytesSent.Store(0)
-		f.qc.bytesReceived.Store(0)
-		base := f.datagrams()
-		in := 0
-		for i := 1; i <= quicFixFloodDatagrams; i++ {
-			datagram := f.clientInitial(uint64(i*quicFixFloodPNStride), []byte{quicFramePing}, false)
-			in += len(datagram)
-			f.feedDatagram(datagram)
-		}
-		out, acks := 0, 0
-		for _, d := range f.serverDatagrams(t, base) {
-			out += d.size
-			acks += len(d.initialAcks)
-		}
-		if acks == 0 {
-			t.Fatalf("validated=%v: %d ack-eliciting Initial packets drew no ACK", validated, quicFixFloodDatagrams)
-		}
-		if out > quicAmplificationFactor*in {
-			t.Fatalf("validated=%v: %d small Initial datagrams (%d bytes) drew %d bytes of ACKs", validated, quicFixFloodDatagrams, in, out)
-		}
-	}
-}
-
 func TestQUICFixResentFlightCarriesTheAckWithoutAnExtraDatagram(t *testing.T) {
 	f := newQUICFixFlightConn(t)
 	flight := f.datagrams()
@@ -148,44 +131,98 @@ func TestQUICFixResentFlightCarriesTheAckWithoutAnExtraDatagram(t *testing.T) {
 	}
 }
 
-const quicFixAcksBeforeResend = 10
+func (f *quicFixFlightConn) clientHandshake(pn uint64, frames []byte) []byte {
+	return quicBuildHandshakePacket(nil, f.qc.srcCID(), quicFixClientSCID, frames, pn, -1, f.qc.keys[quicSpaceHandshake])
+}
+
+func TestQUICFixPaddedInitialFloodGetsAcksWithinTheAmplificationLimit(t *testing.T) {
+	for _, validated := range []bool{true, false} {
+		f := newQUICFixFlightConn(t)
+		f.qc.addressValidated.Store(validated)
+		f.qc.bytesSent.Store(0)
+		f.qc.bytesReceived.Store(0)
+		base := f.datagrams()
+		in := 0
+		for i := 1; i <= quicFixFloodDatagrams; i++ {
+			datagram := f.clientInitialOfSize(t, uint64(i*quicFixFloodPNStride), []byte{quicFramePing}, quicMinInitialDatagram)
+			in += len(datagram)
+			f.feedDatagram(datagram)
+		}
+		out, acks := 0, 0
+		for _, d := range f.serverDatagrams(t, base) {
+			out += d.size
+			acks += len(d.initialAcks)
+		}
+		if acks != quicFixFloodDatagrams {
+			t.Fatalf("validated=%v: %d ack-eliciting Initial packets drew %d ACKs", validated, quicFixFloodDatagrams, acks)
+		}
+		if out > quicAmplificationFactor*in {
+			t.Fatalf("validated=%v: %d Initial datagrams (%d bytes) drew %d bytes of ACKs", validated, quicFixFloodDatagrams, in, out)
+		}
+	}
+}
+
+func TestQUICFixSmallHandshakeFloodGetsAcksWithinTheAmplificationLimit(t *testing.T) {
+	for _, validated := range []bool{true, false} {
+		f := newQUICFixFlightConn(t)
+		f.qc.addressValidated.Store(validated)
+		f.qc.bytesSent.Store(0)
+		f.qc.bytesReceived.Store(0)
+		base := f.datagrams()
+		in := 0
+		for i := 1; i <= quicFixFloodDatagrams; i++ {
+			datagram := f.clientHandshake(uint64(i*quicFixFloodPNStride), []byte{quicFramePing})
+			in += len(datagram)
+			f.feedDatagram(datagram)
+		}
+		out, acks := 0, 0
+		for _, d := range f.serverDatagrams(t, base) {
+			out += d.size
+			acks += len(d.handshakeAcks)
+		}
+		if acks == 0 {
+			t.Fatalf("validated=%v: %d ack-eliciting Handshake packets drew no ACK", validated, quicFixFloodDatagrams)
+		}
+		if out > quicAmplificationFactor*in {
+			t.Fatalf("validated=%v: %d small Handshake datagrams (%d bytes) drew %d bytes of ACKs", validated, quicFixFloodDatagrams, in, out)
+		}
+	}
+}
 
 func TestQUICFixAckBytesCountAgainstTheAmplificationBudgetOfLaterFlights(t *testing.T) {
 	f := newQUICFixFlightConn(t)
+	if f.datagrams() != 1 {
+		t.Fatalf("fixture flight is %d datagrams; the budget arithmetic needs one", f.datagrams())
+	}
+	flight := len(f.pc.snapshot()[0])
 	f.qc.addressValidated.Store(false)
 	f.qc.bytesSent.Store(0)
 	f.qc.bytesReceived.Store(0)
 	base := f.datagrams()
-	in := 0
-	for i := 1; i <= quicFixAcksBeforeResend; i++ {
-		datagram := f.clientInitial(uint64(i*quicFixFloodPNStride), []byte{quicFramePing}, false)
-		in += len(datagram)
-		f.feedDatagram(datagram)
+	f.feedDatagram(f.clientInitialOfSize(t, 3, []byte{quicFramePing}, quicMinInitialDatagram))
+	acked := f.serverDatagrams(t, base)
+	if len(acked) != 1 || len(acked[0].initialAcks) != 1 {
+		t.Fatalf("fixture PING drew %+v, want one ACK", acked)
 	}
-	acks := 0
-	for _, d := range f.serverDatagrams(t, base) {
-		acks += d.size
-	}
-	if acks == 0 {
-		t.Fatal("fixture PING packets drew no ACK")
-	}
+	ack := acked[0].size
+	in := 2 * quicMinInitialDatagram
+	preset := quicAmplificationFactor*in - flight - ack + 1
+	f.qc.bytesSent.Add(uint64(preset))
 	f.qc.firstFlight.lastSent -= int64(f.resendWindow())
-	fragment := f.clientInitial(uint64((quicFixAcksBeforeResend+1)*quicFixFloodPNStride), quicAppendCryptoFrame(nil, 0, f.hello[:16]), false)
-	in += len(fragment)
-	f.feedDatagram(fragment)
-	out := 0
+	f.feedDatagram(f.clientInitialOfSize(t, 4, quicAppendCryptoFrame(nil, 0, f.hello[:16]), quicMinInitialDatagram))
+	out := preset
 	for _, d := range f.serverDatagrams(t, base) {
 		out += d.size
 	}
 	if out > quicAmplificationFactor*in {
-		t.Fatalf("server sent %d bytes (%d of them ACKs) to an unvalidated address that sent %d", out, acks, in)
+		t.Fatalf("server sent %d bytes (an ACK of %d, a flight of %d) to an unvalidated address that sent %d", out, ack, flight, in)
 	}
 }
 
 func TestQUICFixReplayedInitialPacketNumberIsAcked(t *testing.T) {
 	f := newQUICFixFlightConn(t)
 	const pn = 3
-	datagram := f.clientInitial(pn, []byte{quicFramePing}, false)
+	datagram := f.clientInitialOfSize(t, pn, []byte{quicFramePing}, quicMinInitialDatagram)
 	f.feedDatagram(datagram)
 	base := f.datagrams()
 	f.feedDatagram(datagram)
