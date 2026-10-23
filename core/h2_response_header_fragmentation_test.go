@@ -90,7 +90,8 @@ func TestH2ResponseHeaderFragmentationBuffered(t *testing.T) {
 				copy(output, prefix)
 			}
 			originalAddress := &output[0]
-			wire := appendH2ResponseHeadersFrame(output, 7, &Response{StatusCode: 200, Headers: headers}, true, H2DefaultMaxFrameSize)
+			response := &Response{StatusCode: 200, Headers: headers}
+			wire := appendH2ResponseHeadersFrameIndexed(output, 7, response, true, nil, respServerName(response), H2DefaultMaxFrameSize)
 			if !bytes.Equal(wire[:len(prefix)], prefix) {
 				t.Fatal("existing output prefix changed")
 			}
@@ -126,7 +127,7 @@ func TestH2ResponseHeaderFragmentationBuffered(t *testing.T) {
 
 func TestH2ResponseHeaderFragmentationStatusOnly(t *testing.T) {
 	serverName := strings.Repeat("\xff", 16385)
-	wire := appendH2StatusOnlyResponse(nil, 9, 431, serverName, H2DefaultMaxFrameSize)
+	wire := appendH2StatusOnlyResponseIndexed(nil, 9, 431, serverName, nil, H2DefaultMaxFrameSize)
 	got, body, _ := responseHeaderFlight(t, wire, 9, H2DefaultMaxFrameSize, true)
 	fields, err := newHpackDecoder(4096).Decode(got)
 	if err != nil {

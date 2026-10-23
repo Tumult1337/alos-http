@@ -597,14 +597,6 @@ func (s *Server) epollScavenger() {
 	}
 }
 
-func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, error) {
-	listenerFD, err := epollListen(addr)
-	if err != nil {
-		return nil, fmt.Errorf("epoll listen %s: %w", addr, err)
-	}
-	return newEpollWorkerFromFD(s, listenerFD, minPrealloc)
-}
-
 func newEpollWorkerFromFD(s *Server, lfd int, minPrealloc int) (*epollWorker, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -812,18 +804,6 @@ func epollBind(addr string) (int, error) {
 		copy(sa.Addr[:], ip4)
 	}
 	if err := unix.Bind(fd, sa); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	return fd, nil
-}
-
-func epollListen(addr string) (int, error) {
-	fd, err := epollBind(addr)
-	if err != nil {
-		return -1, err
-	}
-	if err := unix.Listen(fd, epollListenBacklog); err != nil {
 		_ = unix.Close(fd)
 		return -1, err
 	}

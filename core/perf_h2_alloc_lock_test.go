@@ -86,9 +86,9 @@ func TestPerfH2AllocLockResponseHeadersFrame(t *testing.T) {
 		for _, h := range s.headers {
 			resp.SetHeader(h[0], h[1])
 		}
-		dst := appendH2ResponseHeadersFrame(make([]byte, 0, perfH2HpackHeaderSpare), perfH2HpackStreamID, &resp, false, 0)
+		dst := appendH2ResponseHeadersFrameIndexed(make([]byte, 0, perfH2HpackHeaderSpare), perfH2HpackStreamID, &resp, false, nil, respServerName(&resp), 0)
 		perfH2AssertZeroAllocs(t, s.name, func() {
-			dst = appendH2ResponseHeadersFrame(dst[:0], perfH2HpackStreamID, &resp, false, 0)
+			dst = appendH2ResponseHeadersFrameIndexed(dst[:0], perfH2HpackStreamID, &resp, false, nil, respServerName(&resp), 0)
 		})
 	}
 }
@@ -111,7 +111,9 @@ func TestPerfH2AllocLockFrameBuilders(t *testing.T) {
 		{"appendH2PingFrame", func() { dst = appendH2PingFrame(dst[:0], true, ping) }},
 		{"appendH2SettingsAckFrame", func() { dst = appendH2SettingsAckFrame(dst[:0]) }},
 		{"appendH2ServerSettingsFlight", func() { dst = appendH2ServerSettingsFlight(dst[:0], srv) }},
-		{"appendH2StatusOnlyResponse", func() { dst = appendH2StatusOnlyResponse(dst[:0], 1, h2StatusHeaderListTooLarge, "ALOS", 0) }},
+		{"appendH2StatusOnlyResponse", func() {
+			dst = appendH2StatusOnlyResponseIndexed(dst[:0], 1, h2StatusHeaderListTooLarge, "ALOS", nil, 0)
+		}},
 		{"appendFastH2RootResponse/framed", func() { dst = appendFastH2RootResponse(dst[:0], small, 3, H2DefaultMaxFrameSize) }},
 		{"appendFastH2RootResponse/split64k", func() { dst = appendFastH2RootResponse(dst[:0], large, 3, H2DefaultMaxFrameSize) }},
 	}

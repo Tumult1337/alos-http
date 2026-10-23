@@ -212,10 +212,6 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 	return dst
 }
 
-func appendH2StatusOnlyResponse(dst []byte, streamID uint32, status int, serverName string, maxFrame int) []byte {
-	return appendH2StatusOnlyResponseIndexed(dst, streamID, status, serverName, nil, maxFrame)
-}
-
 func appendH2StatusOnlyResponseIndexed(dst []byte, streamID uint32, status int, serverName string, tbl *hpackEncTable, maxFrame int) []byte {
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, nil)}
@@ -232,10 +228,6 @@ func appendH2HeaderBlockFrame(dst []byte, streamID uint32, flags byte, tbl *hpac
 	tbl.beginBlock(&enc)
 	enc.Buf = append(enc.Buf, block...)
 	return finishH2ResponseHeaderBlock(enc.Buf, off, maxFrame)
-}
-
-func appendH2ResponseHeadersFrame(dst []byte, streamID uint32, resp *Response, endStream bool, maxFrame int) []byte {
-	return appendH2ResponseHeadersFrameIndexed(dst, streamID, resp, endStream, nil, respServerName(resp), maxFrame)
 }
 
 func appendH2ResponseHeadersFrameIndexed(dst []byte, streamID uint32, resp *Response, endStream bool, tbl *hpackEncTable, serverName string, maxFrame int) []byte {
