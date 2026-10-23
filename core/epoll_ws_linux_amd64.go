@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"net"
 	"sync"
+	"unsafe"
 
+	"github.com/guno1928/turbo"
 	"golang.org/x/sys/unix"
 )
 
@@ -16,6 +18,13 @@ const (
 	wsRetainedMsgLimit = 64 << 10
 	wsTLSReadBufCap    = MaxRecordSize + tlsRecordHeaderLen + plainReadMinFree
 	wsDirectSendMin    = 4 << 10
+)
+
+type wsCallbackKind uint8
+
+const (
+	wsCallbackMessage wsCallbackKind = iota
+	wsCallbackClose
 )
 
 type wsLoopConn struct {
@@ -43,7 +52,16 @@ type wsLoopConn struct {
 	ctrlN         int
 	ctrl          [wsMaxControlPayload]byte
 
-	wakeNext *wsLoopConn
+	cbPending bool
+	closeDue  bool
+	cbKind    wsCallbackKind
+	cbOp      byte
+	cbMsg     []byte
+	cbRoute   *inlineRoute
+	inlineSeq uint64
+	cbAsyncFn func()
+	doneNext  *wsLoopConn
+	wakeNext  *wsLoopConn
 
 	mu          sync.Mutex
 	outbox      []byte
@@ -76,6 +94,7 @@ func (c *epollConn) prepareWSEvents(req *Request, ws *WSConn, h WSEventHandler, 
 }
 
 func (w *epollWorker) finishWSUpgrade(c *epollConn, gen uint32, ev *wsLoopConn) {
+	ev.w = w
 	c.wsPending = nil
 	c.releaseH1BodyBudget()
 	if c.inFlight > 0 {
@@ -98,11 +117,11 @@ func (w *epollWorker) finishWSUpgrade(c *epollConn, gen uint32, ev *wsLoopConn) 
 	c.dispatching = false
 	c.resp.resetFastH1()
 	ev.c = c
-	ev.w = w
 	ev.outLimit = w.maxPendingWrite
 	ev.readDeadline = deadlineFrom(int64(ev.ws.readTimeout))
 	c.ws = ev
 	w.wsLive++
+	w.watchInline()
 	var head [256]byte
 	if c.writeBuf == nil {
 		c.writeBuf = acquireIOBuf()
@@ -143,7 +162,13 @@ func (w *epollWorker) wsAbandon(ev *wsLoopConn) {
 		w.server.perIPLimiter.release(ev.ipKey)
 		ev.ipKey = ""
 	}
-	wsDeliverClose(w.server, ev.ws, &ev.h)
+	if ev.cbPending {
+		ev.closeDue = true
+		return
+	}
+	ev.ws.releaseMessageBytes()
+	ev.msg = nil
+	w.queueWSClose(ev)
 }
 
 func (w *epollWorker) wsTeardown(c *epollConn) {
@@ -151,7 +176,6 @@ func (w *epollWorker) wsTeardown(c *epollConn) {
 	c.ws = nil
 	c.tunnelPaused = false
 	w.wsLive--
-	ev.msg = nil
 	if ev.ws.closed.CompareAndSwap(false, true) {
 		ev.ws.noteCloseCode(wsStatusAbnormal)
 		w.wsSendFinalClose(c)
@@ -180,7 +204,7 @@ func (w *epollWorker) wsGoingAway(c *epollConn) {
 
 func (w *epollWorker) wsQuietDeadline(c *epollConn) int64 {
 	if c.ws != nil {
-		return c.ws.readDeadline
+		return c.ws.deadline(false)
 	}
 	return deadlineFrom(w.idleTO)
 }
@@ -199,6 +223,9 @@ func (w *epollWorker) wsOutDeadline(c *epollConn) int64 {
 
 func (ev *wsLoopConn) deadline(outPending bool) int64 {
 	r, wd := ev.readDeadline, ev.writeDeadline
+	if ev.cbPending {
+		r = 0
+	}
 	if !outPending || wd == 0 || (r != 0 && r <= wd) {
 		return r
 	}
@@ -400,11 +427,18 @@ func (ev *wsLoopConn) takeOutbox(c *epollConn, out []byte, release bool) []byte 
 	return out
 }
 
+func (c *epollConn) wsCallbackPending() bool {
+	return c.ws != nil && c.ws.cbPending
+}
+
 func (c *epollConn) wsServe(out []byte) ([]byte, int) {
 	ev := c.ws
+	if ev.cbPending {
+		return out, h1StepDispatched
+	}
 	ev.holdWakes(c, out)
 	completed := false
-	for !ev.closing {
+	for !ev.closing && !ev.cbPending {
 		if c.h1PendingWrite(out) > wsOutHighWater {
 			c.tunnelPaused = true
 			break
@@ -439,7 +473,7 @@ func (c *epollConn) wsServe(out []byte) ([]byte, int) {
 	switch {
 	case ev.closing:
 		return out, h1StepClose
-	case c.tunnelPaused:
+	case c.tunnelPaused, ev.cbPending:
 		return out, h1StepDispatched
 	}
 	return out, h1StepNeedInput
@@ -504,11 +538,9 @@ func (ev *wsLoopConn) startFrame(c *epollConn, data []byte) (done, ok bool) {
 			ev.controlFrame(opcode, payload)
 			return true, true
 		}
-		if fin && len(ev.msg) == 0 && !ev.msgCompressed {
-			ev.finishMessage(payload)
+		if !ev.appendMessage(payload) {
 			return true, true
 		}
-		ev.msg = append(ev.msg, payload...)
 		if fin {
 			ev.finishMessage(ev.msg)
 		}
@@ -537,6 +569,10 @@ func (ev *wsLoopConn) continueFrame(c *epollConn, data []byte) bool {
 		take = int(ev.remaining)
 	}
 	chunk := data[:take]
+	if ev.frameOp < wsOpClose && !ev.ws.reserveMessageBytes(take) {
+		ev.closing = true
+		return true
+	}
 	wsMaskAt(chunk, ev.mask, ev.maskOff)
 	ev.maskOff += take
 	if ev.frameOp >= wsOpClose {
@@ -575,18 +611,165 @@ func (ev *wsLoopConn) controlFrame(opcode byte, payload []byte) {
 	}
 }
 
+func (ev *wsLoopConn) appendMessage(payload []byte) bool {
+	if !ev.ws.reserveMessageBytes(len(payload)) {
+		ev.closing = true
+		return false
+	}
+	ev.msg = append(ev.msg, payload...)
+	return true
+}
+
 func (ev *wsLoopConn) finishMessage(assembled []byte) {
 	ws := ev.ws
 	op, compressed := ev.msgOp, ev.msgCompressed
 	ev.inMessage = false
 	ev.msgCompressed = false
 	msg, err := ws.completeMessage(op, compressed, assembled)
-	if err == nil && ev.h.OnMessage != nil {
-		wsDeliverMessage(ev.w.server, ws, &ev.h, op, msg)
+	if err != nil || ev.h.OnMessage == nil {
+		ev.releaseMessage()
+		return
 	}
+	ev.cbOp = op
+	ev.cbMsg = msg
+	ev.w.queueWSCallback(ev, wsCallbackMessage)
+}
+
+func (ev *wsLoopConn) releaseMessage() {
+	ev.ws.releaseMessageBytes()
 	if cap(ev.msg) > wsRetainedMsgLimit {
 		ev.msg = nil
 	} else {
 		ev.msg = ev.msg[:0]
 	}
+}
+
+func funcCodeIdentity[F any](fn F) uintptr {
+	closure := *(*unsafe.Pointer)(unsafe.Pointer(&fn))
+	if closure == nil {
+		return 0
+	}
+	return *(*uintptr)(closure)
+}
+
+func (ev *wsLoopConn) callbackIdentity(kind wsCallbackKind) uintptr {
+	if kind == wsCallbackClose {
+		return funcCodeIdentity(ev.h.OnClose)
+	}
+	return funcCodeIdentity(ev.h.OnMessage)
+}
+
+func (w *epollWorker) watchInline() {
+	if w.inlineWatched {
+		return
+	}
+	w.inlineWatched = true
+	w.server.inlineWatch.add(w)
+}
+
+func (w *epollWorker) queueWSClose(ev *wsLoopConn) {
+	if ev.h.OnClose == nil {
+		return
+	}
+	w.queueWSCallback(ev, wsCallbackClose)
+}
+
+func (w *epollWorker) queueWSCallback(ev *wsLoopConn, kind wsCallbackKind) {
+	ev.cbKind = kind
+	ev.cbPending = true
+	w.wsCallbacks++
+	id := ev.callbackIdentity(kind)
+	if route, demoted := w.server.Router.demotedInline(id); demoted {
+		ev.cbRoute = route
+		w.spawned++
+		w.handlers.run(ev.callbackRunner())
+		return
+	}
+	w.inlineQ = append(w.inlineQ, inlineTask{ws: ev, route: id})
+}
+
+func (ev *wsLoopConn) callbackRunner() func() {
+	if ev.cbAsyncFn == nil {
+		ev.cbAsyncFn = ev.runCallbackAsync
+	}
+	return ev.cbAsyncFn
+}
+
+func (ev *wsLoopConn) runCallbackAsync() { ev.runCallback(false) }
+
+func (ev *wsLoopConn) runCallback(inline bool) {
+	w := ev.w
+	route := ev.cbRoute
+	var start int64
+	if route != nil {
+		start = turbo.Now()
+	}
+	returned := false
+	defer func() {
+		if route != nil {
+			w.server.Router.observeDemoted(route, turbo.Since(start))
+		}
+		if inline {
+			w.endInlineHandler(&ev.inlineSeq, !returned)
+		}
+		w.pushWSDone(ev)
+	}()
+	if ev.cbKind == wsCallbackClose {
+		wsDeliverClose(w.server, ev.ws, &ev.h)
+	} else {
+		wsDeliverMessage(w.server, ev.ws, &ev.h, ev.cbOp, ev.cbMsg)
+	}
+	returned = true
+}
+
+func (w *epollWorker) pushWSDone(ev *wsLoopConn) {
+	for {
+		head := w.wsDone.Load()
+		ev.doneNext = head
+		if w.wsDone.CompareAndSwap(head, ev) {
+			break
+		}
+	}
+	w.taskPending.Store(true)
+	if w.parked.Load() {
+		w.wakeForShutdown()
+	}
+}
+
+func (w *epollWorker) runWSDone() {
+	for ev := w.wsDone.Swap(nil); ev != nil; {
+		next := ev.doneNext
+		ev.doneNext = nil
+		w.finishWSCallback(ev)
+		ev = next
+	}
+}
+
+func (w *epollWorker) finishWSCallback(ev *wsLoopConn) {
+	ev.cbPending = false
+	ev.cbMsg = nil
+	ev.cbRoute = nil
+	w.wsCallbacks--
+	if ev.cbKind == wsCallbackClose {
+		return
+	}
+	ev.releaseMessage()
+	if ev.closeDue {
+		ev.closeDue = false
+		ev.msg = nil
+		w.queueWSClose(ev)
+		return
+	}
+	c := ev.c
+	if c == nil || c.ws != ev || c.fd < 0 {
+		return
+	}
+	ev.readDeadline = deadlineFrom(int64(ev.ws.readTimeout))
+	c.deadline = ev.deadline(c.outArmed)
+	if c.peerHup {
+		c.readPending = true
+	}
+	c.compactH1ReadBuffer()
+	c.h1ResumeDue = true
+	w.markFlush(c)
 }
