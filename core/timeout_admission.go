@@ -54,6 +54,8 @@ func (s *Server) timeoutIPLimiter() *perIPLimiter {
 	fresh := newPerIPRequestLimiter()
 	if !s.timeoutPerIP.CompareAndSwap(nil, fresh) {
 		fresh.Stop()
+	} else if s.shuttingDown.Load() {
+		fresh.Stop()
 	}
 	return s.timeoutPerIP.Load()
 }

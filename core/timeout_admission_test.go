@@ -238,3 +238,35 @@ func timeoutAdmissionPing(t *testing.T, ts *testServer, ip string) int {
 	}
 	return resp.StatusCode
 }
+
+func TestTimeoutAfterShutdownLeavesNoSweeper(t *testing.T) {
+	srv := New(Config{MaxConnsPerIP: 3})
+	stopServer(srv)
+	h := Timeout(timeoutAdmissionDeadline)(func(req *Request, resp *Response) { resp.String("ok") })
+	h(&Request{server: srv, RemoteAddr: "198.51.100.9:1234"}, cResp())
+	l := srv.timeoutPerIP.Load()
+	if l == nil {
+		t.Fatal("the Timeout per-IP limiter was not created")
+	}
+	select {
+	case <-l.done:
+	default:
+		t.Fatal("a Timeout request after Shutdown left the per-IP sweeper running")
+	}
+}
+
+func TestShutdownStopsTimeoutSweeper(t *testing.T) {
+	srv := New(Config{MaxConnsPerIP: 3})
+	h := Timeout(timeoutAdmissionDeadline)(func(req *Request, resp *Response) { resp.String("ok") })
+	h(&Request{server: srv, RemoteAddr: "198.51.100.10:1234"}, cResp())
+	l := srv.timeoutPerIP.Load()
+	if l == nil {
+		t.Fatal("the Timeout per-IP limiter was not created")
+	}
+	stopServer(srv)
+	select {
+	case <-l.done:
+	default:
+		t.Fatal("Shutdown left the Timeout per-IP sweeper running")
+	}
+}
