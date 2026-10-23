@@ -244,10 +244,7 @@ func TestTimeoutAfterShutdownLeavesNoSweeper(t *testing.T) {
 	stopServer(srv)
 	h := Timeout(timeoutAdmissionDeadline)(func(req *Request, resp *Response) { resp.String("ok") })
 	h(&Request{server: srv, RemoteAddr: "198.51.100.9:1234"}, cResp())
-	l := srv.timeoutPerIP.Load()
-	if l == nil {
-		t.Fatal("the Timeout per-IP limiter was not created")
-	}
+	l := srv.timeoutPerIP
 	select {
 	case <-l.done:
 	default:
@@ -259,14 +256,51 @@ func TestShutdownStopsTimeoutSweeper(t *testing.T) {
 	srv := New(Config{MaxConnsPerIP: 3})
 	h := Timeout(timeoutAdmissionDeadline)(func(req *Request, resp *Response) { resp.String("ok") })
 	h(&Request{server: srv, RemoteAddr: "198.51.100.10:1234"}, cResp())
-	l := srv.timeoutPerIP.Load()
-	if l == nil {
-		t.Fatal("the Timeout per-IP limiter was not created")
-	}
+	l := srv.timeoutPerIP
 	stopServer(srv)
 	select {
 	case <-l.done:
 	default:
 		t.Fatal("Shutdown left the Timeout per-IP sweeper running")
+	}
+}
+
+const timeoutShutdownRaceRounds = 20
+
+func TestTimeoutRequestsRacingShutdownStopTheSweeper(t *testing.T) {
+	h := Timeout(timeoutAdmissionDeadline)(func(req *Request, resp *Response) { resp.String("ok") })
+	for range timeoutShutdownRaceRounds {
+		srv := New(Config{MaxConnsPerIP: 3})
+		var callers sync.WaitGroup
+		start := make(chan struct{})
+		for i := range 8 {
+			callers.Go(func() {
+				<-start
+				for j := range 20 {
+					h(&Request{server: srv, RemoteAddr: "198.51.100." + strconv.Itoa(i*20+j) + ":1"}, cResp())
+				}
+			})
+		}
+		close(start)
+		stopServer(srv)
+		callers.Wait()
+		select {
+		case <-srv.timeoutPerIP.done:
+		default:
+			t.Fatal("the Timeout per-IP sweeper still runs after Shutdown returned")
+		}
+	}
+}
+
+func TestTimeoutWithoutPerIPLimiterFailsClosed(t *testing.T) {
+	srv := New(Config{MaxConnsPerIP: 3})
+	defer stopServer(srv)
+	limiter := srv.timeoutPerIP
+	srv.timeoutPerIP = nil
+	defer func() { srv.timeoutPerIP = limiter }()
+	resp := cResp()
+	Timeout(timeoutAdmissionDeadline)(func(req *Request, resp *Response) { resp.String("ok") })(&Request{server: srv, RemoteAddr: "198.51.100.20:1"}, resp)
+	if resp.StatusCode != http.StatusServiceUnavailable || srv.timeoutHandlers.Load() != 0 {
+		t.Fatalf("status %d, %d handlers counted; want 503 and 0", resp.StatusCode, srv.timeoutHandlers.Load())
 	}
 }

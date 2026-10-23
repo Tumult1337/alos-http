@@ -678,7 +678,7 @@ type Server struct {
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
 	timeoutHandlers   atomic.Int64
-	timeoutPerIP      atomic.Pointer[perIPLimiter]
+	timeoutPerIP      *perIPLimiter
 	_                 [CacheLineSize]byte
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
@@ -836,6 +836,8 @@ func New(configs ...Config) *Server {
 			s.perIPConnLimiter.Store(newPerIPConnLimiter())
 		}
 	}
+
+	s.timeoutPerIP = newPerIPRequestLimiter()
 
 	s.debug.Store(cfg.Debug)
 	s.logRequests.Store(cfg.LogRequests)
@@ -1321,7 +1323,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			s.perIPLimiter.Stop()
 		}
 		s.perIPConnLimiter.Load().Stop()
-		s.timeoutPerIP.Load().Stop()
+		s.timeoutPerIP.Stop()
 		for _, ln := range s.listeners {
 			ln.Close()
 		}

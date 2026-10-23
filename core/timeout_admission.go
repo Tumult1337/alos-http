@@ -20,7 +20,12 @@ func (s *Server) admitTimeoutHandler(req *Request) (*timeoutAdmission, int) {
 	}
 	admission := &timeoutAdmission{srv: s}
 	if perIP := s.timeoutPerIPLimit(limits); perIP > 0 {
-		slot, ok := s.timeoutIPLimiter().hold(extractIP(req.RemoteAddr), perIP)
+		limiter := s.timeoutPerIP
+		if limiter == nil {
+			s.timeoutHandlers.Add(-1)
+			return nil, http.StatusServiceUnavailable
+		}
+		slot, ok := limiter.hold(extractIP(req.RemoteAddr), perIP)
 		if !ok {
 			s.timeoutHandlers.Add(-1)
 			return nil, http.StatusTooManyRequests
@@ -45,19 +50,6 @@ func (a *timeoutAdmission) release() {
 		a.ipSlot.release()
 	}
 	a.srv.timeoutHandlers.Add(-1)
-}
-
-func (s *Server) timeoutIPLimiter() *perIPLimiter {
-	if l := s.timeoutPerIP.Load(); l != nil {
-		return l
-	}
-	fresh := newPerIPRequestLimiter()
-	if !s.timeoutPerIP.CompareAndSwap(nil, fresh) {
-		fresh.Stop()
-	} else if s.shuttingDown.Load() {
-		fresh.Stop()
-	}
-	return s.timeoutPerIP.Load()
 }
 
 type detachedWorkHold struct {
