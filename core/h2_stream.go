@@ -109,5 +109,8 @@ func (s *H2Stream) Reset() {
 	s.conn = nil
 	s.handler = nil
 	s.route = nil
-	s.waitBody = nil
+	if s.waitBody != nil {
+		s.waitBody.reader.abort(ErrBodyStreamAborted)
+		s.waitBody = nil
+	}
 }

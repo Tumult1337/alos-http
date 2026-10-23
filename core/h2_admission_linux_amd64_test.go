@@ -29,6 +29,8 @@ type h2AdmissionState struct {
 	waiting int
 	running int
 	body    int64
+	held    int
+	orphans int
 }
 
 func h2AdmissionProbe(t *testing.T, srv *Server) h2AdmissionState {
@@ -56,6 +58,15 @@ func h2AdmissionProbe(t *testing.T, srv *Server) h2AdmissionState {
 				s.waiting += len(c.h2.waiting)
 				s.running += c.inFlight
 				s.body += c.h2.bodyReserved.Load()
+				for _, in := range c.h2BodyIn {
+					s.held += in.reader.buffered()
+				}
+				for _, stream := range c.h2.waiting {
+					if in := stream.waitBody; in != nil && c.h2BodyIn[in.streamID] != in {
+						s.held += in.reader.buffered()
+						s.orphans++
+					}
+				}
 			}
 			got <- s
 		})
@@ -67,6 +78,8 @@ func h2AdmissionProbe(t *testing.T, srv *Server) h2AdmissionState {
 			total.waiting += s.waiting
 			total.running += s.running
 			total.body += s.body
+			total.held += s.held
+			total.orphans += s.orphans
 		case <-turbo.After(h2FixCeiling):
 			t.Fatal("epoll worker did not answer the admission probe")
 		}
@@ -246,8 +259,19 @@ func TestH2AdmissionCapsRunningHandlers(t *testing.T) {
 }
 
 func TestH2AdmissionResetWaitingStreamReleasesIt(t *testing.T) {
+	for _, streamAbove := range []int64{0, 1} {
+		t.Run("StreamBodyAbove="+strconv.FormatInt(streamAbove, 10), func(t *testing.T) {
+			h2AdmissionResetWaitingStream(t, streamAbove)
+		})
+	}
+}
+
+func h2AdmissionResetWaitingStream(t *testing.T, streamAbove int64) {
 	b := newH2AdmitBlocker(t)
-	addr, srv := startH2FixServerWith(t, func(c *Config) { c.H2MaxRunningHandlers = 1 }, b.routes)
+	addr, srv := startH2FixServerWith(t, func(c *Config) {
+		c.H2MaxRunningHandlers = 1
+		c.StreamBodyAbove = streamAbove
+	}, b.routes)
 	rc := h2RawDial(t, addr, h2FixSettings())
 	h2FixGet(rc, 1, "/block")
 	if !h2FixPollUntil(func() bool { return b.running.Load() == 1 }) {
@@ -392,5 +416,50 @@ func TestH2AdmissionCloseReleasesWaitingStreams(t *testing.T) {
 	}
 	if got := b.started.Load(); got != 1 {
 		t.Fatalf("%d handlers started, want only the blocking one", got)
+	}
+}
+
+func TestH2AdmissionNewStreamQueuesBehindWaiting(t *testing.T) {
+	w, c, _ := h2DeadlineFixture(t)
+	c.protocol = plainConnProtoH2
+	c.h2.init(w.server.h2HeaderTableSize(), w.server.h2HeaderListLimit())
+	w.h2MaxRunning = 1
+	queued := StreamPool.Get().(*H2Stream)
+	queued.Reset()
+	queued.ID = 1
+	c.h2.waiting = append(c.h2.waiting, queued)
+	next := StreamPool.Get().(*H2Stream)
+	next.Reset()
+	next.ID, next.Method, next.Path = 3, "GET", "/"
+	t.Cleanup(c.h2.releaseWaiting)
+	if !c.h2AdmitsHandler() {
+		t.Fatal("fixture gates are closed; the test needs open gates")
+	}
+	c.epollH2DispatchStream(w.server, next.ID, next, false, false)
+	if c.inFlight != 0 || len(c.h2.waiting) != 2 || c.h2.waiting[1] != next {
+		t.Fatalf("new stream passed a waiting stream: inFlight=%d waiting=%d", c.inFlight, len(c.h2.waiting))
+	}
+}
+
+func TestH2IdleCountsWaitingStreams(t *testing.T) {
+	c := &epollConn{fd: 1, protocol: plainConnProtoH2}
+	if !c.idle() {
+		t.Fatal("fixture connection is not idle")
+	}
+	c.h2.waiting = []*H2Stream{{}}
+	if c.idle() {
+		t.Fatal("a connection with a waiting stream reports idle")
+	}
+}
+
+func TestH2InitReleasesWaitingStreams(t *testing.T) {
+	var st tlsWorkerH2State
+	stream := StreamPool.Get().(*H2Stream)
+	stream.Reset()
+	stream.ID = 7
+	st.waiting = append(st.waiting, stream)
+	st.init(H2HeaderTableSize, H2MaxHeaderListSize)
+	if len(st.waiting) != 0 || stream.ID != 0 {
+		t.Fatalf("init kept %d waiting streams; released stream ID %d", len(st.waiting), stream.ID)
 	}
 }

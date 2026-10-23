@@ -1126,6 +1126,16 @@ func deadlineFrom(to int64) int64 {
 	return turbo.UnixNano() + to
 }
 
+func (c *epollConn) inputDeadline(read int64) int64 {
+	if !c.outArmed || c.deadline == 0 {
+		return read
+	}
+	if read == 0 {
+		return c.deadline
+	}
+	return min(c.deadline, read)
+}
+
 func (w *epollWorker) nextReadTimeout(c *epollConn) int64 {
 	if c.tls && c.phase != tlsConnPhaseApplication && c.phase != tlsConnPhaseH2Native {
 		return w.handshakeTO
@@ -1484,7 +1494,7 @@ func (w *epollWorker) readOnce(c *epollConn, peerClosed bool) (readAgain bool) {
 	if prevReadN == 0 && c.readN > 0 {
 		keepDeadline := c.tls && c.deadline != 0 && (c.phase != tlsConnPhaseApplication && c.phase != tlsConnPhaseH2Native || len(c.appBuf) > 0)
 		if !keepDeadline {
-			c.deadline = deadlineFrom(w.nextReadTimeout(c))
+			c.deadline = c.inputDeadline(deadlineFrom(w.nextReadTimeout(c)))
 		}
 	}
 	if c.readScratch && c.protocol == plainConnProtoUnknown && c.readN > 0 && couldBeH2Preface(c.readBuf[:c.readN]) {

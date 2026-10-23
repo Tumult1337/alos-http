@@ -34,6 +34,7 @@ func (c *epollConn) openH2BodyIn(w *epollWorker, stream *H2Stream) *h2BodyIn {
 		w.postTask(func(w *epollWorker) { c.h2BodyAcked(w, in, gen) })
 	})
 	in.reader.uploadConn, in.reader.uploadGlobal = c.connLimiter, w.server.globalLimiter
+	in.reader.chargeBudget(w.server, &c.h2.bodyReserved)
 	if c.h2BodyIn == nil {
 		c.h2BodyIn = make(map[uint32]*h2BodyIn)
 	}
@@ -54,8 +55,7 @@ func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
 func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed int, payload []byte) bool {
 	in.recvWindow -= int64(frameConsumed)
 	if in.recvWindow < 0 {
-		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, in.streamID, H2ErrFlowControl)
-		c.h2EndBodyIn(in, ErrBodyStreamAborted)
+		c.h2ResetBodyIn(in, H2ErrFlowControl)
 		return false
 	}
 	if !in.tooLarge && len(payload) > 0 {
@@ -66,8 +66,9 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 		if !in.tunnel && c.worker.bodyTooLarge(in.received) {
 			in.tooLarge = true
 			in.reader.finish(ErrBodyTooLarge)
-		} else {
-			in.reader.push(payload)
+		} else if !in.reader.reservePush(payload) {
+			c.h2ResetBodyIn(in, H2ErrEnhanceYourCalm)
+			return false
 		}
 	}
 	if endStream {
@@ -86,7 +87,20 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 
 func (c *epollConn) h2EndBodyIn(in *h2BodyIn, err error) {
 	delete(c.h2BodyIn, in.streamID)
-	in.reader.finish(err)
+	if err != nil {
+		in.reader.abort(err)
+		return
+	}
+	in.reader.finish(nil)
+}
+
+func (c *epollConn) h2ResetBodyIn(in *h2BodyIn, errCode uint32) {
+	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, in.streamID, errCode)
+	if _, waiting := c.h2.findWaiting(in.streamID); waiting != nil {
+		c.abandonH2Stream(in.streamID, ErrStreamClosed)
+		return
+	}
+	c.h2EndBodyIn(in, ErrBodyStreamAborted)
 }
 
 func (c *epollConn) h2BodyAcked(w *epollWorker, in *h2BodyIn, gen uint32) {
@@ -112,7 +126,7 @@ func (c *epollConn) h2AbortBodyIn(streamID uint32) (wasOpen bool) {
 
 func (c *epollConn) h2AbortAllBodyIn() {
 	for _, in := range c.h2BodyIn {
-		in.reader.finish(ErrBodyStreamAborted)
+		in.reader.abort(ErrBodyStreamAborted)
 	}
 	clear(c.h2BodyIn)
 }

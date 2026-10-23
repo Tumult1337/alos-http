@@ -536,6 +536,9 @@ func (c *epollConn) rejectH2Body(streamID uint32) bool {
 	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrProtocol)
 	epollReleaseH2Stream(st, streamID)
 	c.h2AbortBodyIn(streamID)
+	if _, waiting := st.findWaiting(streamID); waiting != nil {
+		c.abandonH2Stream(streamID, ErrStreamClosed)
+	}
 	if st.countReset() {
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
 		return true
@@ -563,8 +566,7 @@ func (c *epollConn) epollH2Data(srv *Server, streamID uint32, frameFlags byte, p
 	if stream == nil {
 		if in := c.h2BodyIn[streamID]; in != nil {
 			if !padOK {
-				c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrProtocol)
-				c.h2EndBodyIn(in, ErrBodyStreamAborted)
+				c.h2ResetBodyIn(in, H2ErrProtocol)
 				return false
 			}
 			return c.h2StreamBodyData(in, frameFlags&H2FlagEndStream != 0, frameConsumed, payload)
@@ -1006,6 +1008,9 @@ func (w *epollWorker) runH2Finish(s *H2Stream) {
 }
 
 func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32, stream *H2Stream) {
+	if body := stream.req.bodyStream; body != nil {
+		body.abort(ErrBodyStreamAborted)
+	}
 	c.h2.unlinkBusy(stream)
 	stream.req.finishContext()
 	if c.inFlight > 0 {

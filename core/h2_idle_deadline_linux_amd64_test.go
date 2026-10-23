@@ -194,6 +194,7 @@ func TestH2IdleDeadlineStatePolicy(t *testing.T) {
 		{name: "write-armed-closed", setup: func(c *epollConn, _ *epollWorker) { c.outArmed = true; c.fd = -1 }},
 		{name: "write-armed-write-disabled", setup: func(c *epollConn, w *epollWorker) { c.outArmed = true; w.writeTO = 0 }},
 		{name: "buffered-flow-blocked", setup: func(c *epollConn, _ *epollWorker) { c.h2.sending = map[uint32]*H2Stream{1: {}} }, timeout: func(w *epollWorker) int64 { return w.readTO }},
+		{name: "waiting-stream", setup: func(c *epollConn, _ *epollWorker) { c.h2.waiting = []*H2Stream{{}} }, timeout: func(w *epollWorker) int64 { return w.readTO }},
 		{name: "streamed-flow-blocked", setup: func(c *epollConn, _ *epollWorker) { c.h2Streaming = map[uint32]*epollH2StreamWriter{1: {}} }, timeout: func(w *epollWorker) int64 { return w.readTO }},
 		{name: "existing-read", setup: func(c *epollConn, _ *epollWorker) { c.readN = 1; c.deadline = 17 }, unchanged: 17},
 		{name: "existing-write", setup: func(c *epollConn, _ *epollWorker) { c.deadline = 29 }, unchanged: 29},
@@ -542,6 +543,31 @@ func TestH2DisarmOutDeadlinePolicy(t *testing.T) {
 			}
 			if c.deadline != test.want {
 				t.Fatalf("deadline = %d, want %d", c.deadline, test.want)
+			}
+		})
+	}
+}
+
+func TestInputDeadlineKeepsArmedWriteDeadline(t *testing.T) {
+	const write, later, earlier = int64(1000), int64(5000), int64(500)
+	tests := []struct {
+		name     string
+		armed    bool
+		deadline int64
+		read     int64
+		want     int64
+	}{
+		{name: "not armed", deadline: write, read: later, want: later},
+		{name: "armed write first", armed: true, deadline: write, read: later, want: write},
+		{name: "armed read first", armed: true, deadline: write, read: earlier, want: earlier},
+		{name: "armed without deadline", armed: true, read: later, want: later},
+		{name: "armed read disabled", armed: true, deadline: write, want: write},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := &epollConn{outArmed: test.armed, deadline: test.deadline}
+			if got := c.inputDeadline(test.read); got != test.want {
+				t.Fatalf("inputDeadline(%d) with armed=%v deadline=%d = %d, want %d", test.read, test.armed, test.deadline, got, test.want)
 			}
 		})
 	}
