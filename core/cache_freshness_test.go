@@ -172,17 +172,43 @@ func TestCache_FullCacheMissCostDoesNotScaleWithSize(t *testing.T) {
 func TestCache_OrderQueueStaysBounded(t *testing.T) {
 	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 4})
 	defer rc.Stop()
-	for i := range 1000 {
-		rc.handle(cacheFreshHandler(), cReq("GET", "x", "/k", strconv.Itoa(i%2)), cResp())
-		rc.Purge()
-	}
-	for i := range 1000 {
-		rc.handle(cacheFreshHandler(), cReq("GET", "x", "/n", strconv.Itoa(i)), cResp())
+	for range 1000 {
+		rc.handle(cacheFreshHandler(), cReq("GET", "x", "/k", ""), cResp())
+		ent, ok := cacheFreshStored(t, rc, "/k")
+		if !ok {
+			t.Fatal("entry not stored")
+		}
+		rc.evictEntry(rc.key(cReq("GET", "x", "/k", "")), ent)
 	}
 	rc.orderMu.Lock()
 	queued := len(rc.order)
 	rc.orderMu.Unlock()
 	if limit := 2*rc.cfg.MaxEntries + 1; queued > limit {
-		t.Fatalf("order queue holds %d refs, want at most %d", queued, limit)
+		t.Fatalf("order queue holds %d refs after evictions outside the queue, want at most %d", queued, limit)
+	}
+	rc.handle(cacheFreshHandler(), cReq("GET", "x", "/p", ""), cResp())
+	rc.Purge()
+	rc.orderMu.Lock()
+	queued = len(rc.order)
+	rc.orderMu.Unlock()
+	if queued != 0 || rc.entries.Load() != 0 || rc.Len() != 0 {
+		t.Fatalf("after Purge: %d refs, %d counted, %d stored", queued, rc.entries.Load(), rc.Len())
+	}
+}
+
+func TestCache_ReplacedEntryCountsOnce(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 2})
+	defer rc.Stop()
+	now := turbo.UnixNano()
+	entry := func() *cachedResponse {
+		return &cachedResponse{status: 200, expiresAtNs: now + int64(time.Hour), storedAtNs: now}
+	}
+	rc.storeBounded("a", entry())
+	rc.storeBounded("b", entry())
+	for range 5 {
+		rc.storeBounded("a", entry())
+	}
+	if _, ok := rc.store.Load("b"); !ok || rc.entries.Load() != 2 {
+		t.Fatalf("replacing a: b present %v, counted %d, want true and 2", ok, rc.entries.Load())
 	}
 }
