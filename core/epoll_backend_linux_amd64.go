@@ -1656,6 +1656,9 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		}
 		c.closeAfter = true
 	}
+	if c.speaksH2() && c.ws == nil && c.h2Idle() {
+		c.resetH2Deadline(w)
+	}
 	if c.readN == 0 && !c.outArmed && c.writeSent == len(c.writeBuf) {
 		w.releaseIdleBuffers(c)
 		if c.speaksH2() && c.ws == nil {
@@ -1894,7 +1897,7 @@ func (w *epollWorker) disarmOut(c *epollConn) {
 	} else if c.ws != nil {
 		c.deadline = c.ws.deadline(false)
 	} else if c.speaksH2() {
-		c.restoreH2Deadline(w)
+		c.replaceH2WriteDeadline(w)
 	} else if w.idleTO > 0 {
 		c.deadline = deadlineFrom(w.idleTO)
 	}
