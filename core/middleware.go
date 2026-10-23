@@ -594,6 +594,18 @@ func cloneDetachedStrings(r *Request) {
 func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
+			srv := req.server
+			if status := srv.detachedWorkRefusal(req); status != 0 {
+				statsBlocked()
+				resp.Status(status).String(http.StatusText(status))
+				return
+			}
+			if !srv.tryReserveBodyBytes(len(req.Body)) {
+				statsBlocked()
+				resp.Status(http.StatusServiceUnavailable).String(http.StatusText(http.StatusServiceUnavailable))
+				return
+			}
+			bodyHeld := int64(len(req.Body))
 			done := make(chan struct{}, 1)
 			tmpReq := *req
 			tmpReq.Params = req.Params
@@ -642,6 +654,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 					if r := recover(); r != nil {
 						tmpReq.server.reportPanic(&tmpReq, r)
 					}
+					srv.releaseBodyBytes(bodyHeld)
 					done <- struct{}{}
 				}()
 				next(&tmpReq, tmpResp)
@@ -660,8 +673,10 @@ func Timeout(d time.Duration) MiddlewareFunc {
 				}
 			case <-ctx.Done():
 				timedOut.Store(true)
+				hold := srv.holdDetachedWork(req)
 				go func() {
 					<-done
+					hold.release()
 					tmpResp.Reset()
 					releaseResponseToPool(tmpResp)
 				}()

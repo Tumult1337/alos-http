@@ -673,6 +673,7 @@ type Server struct {
 	inlineBatch       time.Duration
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
+	detachedWork      atomic.Int64
 	_                 [CacheLineSize]byte
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
