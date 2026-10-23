@@ -357,6 +357,7 @@ type epollWorker struct {
 	limitsGen       uint64
 	discardBuf      []byte
 	maxPendingWrite int
+	h2MaxRunning    int
 	lastSweep       int64
 	acceptResumeAt  int64
 	acceptBackoff   time.Duration
@@ -643,6 +644,7 @@ func newEpollWorkerFromFD(s *Server, lfd int, minPrealloc int) (*epollWorker, er
 	if s.config.MaxPendingWriteBytes > 0 {
 		w.maxPendingWrite = int(s.config.MaxPendingWriteBytes)
 	}
+	w.h2MaxRunning = s.h2MaxRunningHandlers()
 	w.pool.prewarm(minPrealloc)
 	w.initBackendLoop()
 	s.addShutdownWaker(w)
@@ -975,7 +977,7 @@ func (c *epollConn) bufferedInput() int {
 func (c *epollConn) idle() bool {
 	return c.fd >= 0 && c.inFlight == 0 && !c.dispatching && c.proxyEx == nil && c.tunnelBE == nil &&
 		!c.unparsedInput() && !c.outArmed && c.writeSent == len(c.writeBuf) && len(c.bodyOut) == 0 &&
-		len(c.h2.streams) == 0 && len(c.h2.sending) == 0
+		len(c.h2.streams) == 0 && len(c.h2.sending) == 0 && len(c.h2.waiting) == 0
 }
 
 func (w *epollWorker) drainForShutdown() {
@@ -1914,6 +1916,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 		StreamPool.Put(stream)
 		delete(c.h2.sending, id)
 	}
+	c.h2.releaseWaiting()
 	c.readN = 0
 	c.writeSent = 0
 	c.h1Off = 0

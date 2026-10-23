@@ -397,6 +397,9 @@ func (c *epollConn) answerH2HeaderListTooLarge(srv *Server, streamID uint32, end
 
 func (c *epollConn) h2StreamAwaitingResponse(streamID uint32) bool {
 	st := &c.h2
+	if _, waiting := st.findWaiting(streamID); waiting != nil {
+		return true
+	}
 	return st.sending[streamID] != nil || c.h2Streaming[streamID] != nil || st.findBusy(streamID) != nil
 }
 
@@ -422,12 +425,18 @@ func (c *epollConn) abandonH2Stream(streamID uint32, cause error) {
 	if stream := st.sending[streamID]; stream != nil {
 		st.releaseSending(streamID, stream)
 	}
+	if i, waiting := st.findWaiting(streamID); waiting != nil {
+		st.removeWaiting(i)
+		waiting.Reset()
+		StreamPool.Put(waiting)
+	}
 	abandoned := st.cancelBusyStream(streamID, cause)
 	if !c.h2CancelStreaming(streamID) && abandoned != nil {
 		abandoned.abandonCounted = true
 		c.h2EndedInFlight++
 	}
 	c.h2AbortBodyIn(streamID)
+	c.h2AdmitWaiting()
 }
 
 func (c *epollConn) h2UncountAbandoned(stream *H2Stream) {
@@ -439,16 +448,20 @@ func (c *epollConn) h2UncountAbandoned(stream *H2Stream) {
 
 func (c *epollConn) h2PeerStreamsAtLimit(limit int) bool {
 	st := &c.h2
-	return len(st.streams)+len(st.sending)+c.inFlight-c.h2EndedInFlight+c.h2Draining >= limit
+	return len(st.streams)+len(st.sending)+len(st.waiting)+c.inFlight-c.h2EndedInFlight+c.h2Draining >= limit
 }
 
 func (c *epollConn) h2Quiescent() bool {
 	st := &c.h2
-	return c.inFlight == 0 && len(st.streams) == 0 && len(st.sending) == 0 && len(c.h2Streaming) == 0 && len(c.h2BodyIn) == 0
+	return c.inFlight == 0 && len(st.streams) == 0 && len(st.sending) == 0 && len(st.waiting) == 0 && len(c.h2Streaming) == 0 && len(c.h2BodyIn) == 0
 }
 
 func (c *epollConn) restoreH2Deadline(w *epollWorker) {
 	if c.deadline != 0 {
+		return
+	}
+	if c.outArmed && c.fd >= 0 && c.inFlight == 0 && !c.dispatching {
+		c.deadline = deadlineFrom(w.writeTO)
 		return
 	}
 	c.resetH2Deadline(w)
@@ -655,7 +668,11 @@ func (c *epollConn) epollH2WindowUpdate(streamID uint32, payload []byte) bool {
 	if streamID > st.highestStreamID {
 		return false
 	}
-	if stream := st.findBusy(streamID); stream != nil && !h2CreditWindow(stream, increment) {
+	stream := st.findBusy(streamID)
+	if stream == nil {
+		_, stream = st.findWaiting(streamID)
+	}
+	if stream != nil && !h2CreditWindow(stream, increment) {
 		return c.resetH2Stream(streamID, H2ErrFlowControl)
 	}
 	return false
@@ -686,6 +703,9 @@ func (c *epollConn) h2ShiftStreamWindows(delta int64) bool {
 	for stream := st.busy; stream != nil; stream = stream.busyNext {
 		ok = h2ShiftWindow(stream, delta) && ok
 	}
+	for _, stream := range st.waiting {
+		ok = h2ShiftWindow(stream, delta) && ok
+	}
 	for _, sw := range c.h2Streaming {
 		if sw.handlerDone {
 			ok = h2ShiftWindow(sw.stream, delta) && ok
@@ -703,6 +723,43 @@ func (c *epollConn) epollH2Dispatch(srv *Server, streamID uint32, streamBody boo
 }
 
 func (c *epollConn) epollH2DispatchStream(srv *Server, streamID uint32, stream *H2Stream, streamBody, mapped bool) bool {
+	if mapped {
+		delete(c.h2.streams, streamID)
+	}
+	if len(c.h2.waiting) == 0 && c.h2AdmitsHandler() {
+		return c.startH2Stream(srv, streamID, stream, streamBody)
+	}
+	if streamBody {
+		stream.waitBody = c.openH2BodyIn(c.worker, stream)
+	}
+	c.h2.waiting = append(c.h2.waiting, stream)
+	return false
+}
+
+func (c *epollConn) h2AdmitsHandler() bool {
+	st := &c.h2
+	w := c.worker
+	return c.inFlight < w.h2MaxRunning && st.parkedBytes+st.sendingBytes < int64(w.maxPendingWrite)
+}
+
+func (c *epollConn) h2AdmitWaiting() {
+	st := &c.h2
+	if len(st.waiting) == 0 || st.admitting || c.fd < 0 {
+		return
+	}
+	st.admitting = true
+	srv := c.worker.server
+	for len(st.waiting) > 0 && !c.closeAfter && c.h2AdmitsHandler() {
+		stream := st.removeWaiting(0)
+		if c.startH2Stream(srv, stream.ID, stream, stream.waitBody != nil) {
+			c.closeAfter = true
+			c.worker.markFlush(c)
+		}
+	}
+	st.admitting = false
+}
+
+func (c *epollConn) startH2Stream(srv *Server, streamID uint32, stream *H2Stream, streamBody bool) bool {
 	st := &c.h2
 	c.worker.reqs++
 	if srv.logRequests.Load() {
@@ -738,11 +795,9 @@ func (c *epollConn) epollH2DispatchStream(srv *Server, streamID uint32, stream *
 
 	if !c.acquireIPConn(srv, &stream.req) {
 		statsBlocked()
+		c.h2AbortBodyIn(streamID)
 		stream.Reset()
 		StreamPool.Put(stream)
-		if mapped {
-			delete(st.streams, streamID)
-		}
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
 		return true
 	}
@@ -751,9 +806,6 @@ func (c *epollConn) epollH2DispatchStream(srv *Server, streamID uint32, stream *
 	stream.resp.SetSW(nil)
 	stream.resp.lazyReq = &stream.req
 
-	if mapped {
-		delete(st.streams, streamID)
-	}
 	stream.asyncBusy = true
 	st.linkBusy(stream)
 	stream.cancel.attach(&stream.req)
@@ -975,6 +1027,7 @@ func (c *epollConn) finishH2Dispatch(w *epollWorker, gen uint32, streamID uint32
 		return
 	}
 	defer c.restoreH2Deadline(w)
+	defer c.h2AdmitWaiting()
 	stream.asyncBusy = false
 	c.h2UncountAbandoned(stream)
 	bodyOpen := c.h2AbortBodyIn(streamID)
@@ -1176,11 +1229,12 @@ func (c *epollConn) h2ResumeSending(streamID uint32) {
 		if stream := st.sending[streamID]; stream != nil {
 			c.h2ResumeStream(streamID, stream)
 		}
-		return
+	} else {
+		for id, stream := range st.sending {
+			c.h2ResumeStream(id, stream)
+		}
 	}
-	for id, stream := range st.sending {
-		c.h2ResumeStream(id, stream)
-	}
+	c.h2AdmitWaiting()
 }
 
 func (c *epollConn) h2ResumeStream(streamID uint32, stream *H2Stream) {

@@ -27,7 +27,7 @@ func (w *epollWorker) streamsH2Body(stream *H2Stream) bool {
 	return true
 }
 
-func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
+func (c *epollConn) openH2BodyIn(w *epollWorker, stream *H2Stream) *h2BodyIn {
 	in := &h2BodyIn{streamID: stream.ID, recvWindow: stream.RecvWindow, declared: stream.declaredLen, tunnel: stream.wsTunnel}
 	gen := c.generation
 	in.reader = newBodyReader(func() {
@@ -38,6 +38,15 @@ func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
 		c.h2BodyIn = make(map[uint32]*h2BodyIn)
 	}
 	c.h2BodyIn[stream.ID] = in
+	return in
+}
+
+func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
+	in := stream.waitBody
+	if in == nil {
+		in = c.openH2BodyIn(w, stream)
+	}
+	stream.waitBody = nil
 	stream.req.Body = nil
 	stream.req.bodyStream = in.reader
 }

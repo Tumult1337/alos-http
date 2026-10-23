@@ -25,6 +25,12 @@ const (
 
 func startH2FixServer(t *testing.T, tune func(*Config), routes func(*Server)) string {
 	t.Helper()
+	addr, _ := startH2FixServerWith(t, tune, routes)
+	return addr
+}
+
+func startH2FixServerWith(t *testing.T, tune func(*Config), routes func(*Server)) (string, *Server) {
+	t.Helper()
 	addr := reserveLocalAddr(t)
 	cfg := Config{
 		Addr:          addr,
@@ -50,7 +56,7 @@ func startH2FixServer(t *testing.T, tune func(*Config), routes func(*Server)) st
 		_ = srv.Shutdown(ctx)
 	})
 	waitForPort(t, addr)
-	return addr
+	return addr, srv
 }
 
 func h2FixRequestBlock(method, path string) []byte {
