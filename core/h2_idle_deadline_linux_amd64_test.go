@@ -388,7 +388,7 @@ func TestH2IdleDeadlineWaitsForActiveSibling(t *testing.T) {
 }
 
 func TestH2IdleDeadlineBufferedService(t *testing.T) {
-	for _, mode := range []string{"idle", "continuation", "receiving-stream", "existing-read"} {
+	for _, mode := range []string{"idle", "continuation", "receiving-stream", "existing-read", "partial-existing-read", "continuation-existing-read", "websocket"} {
 		t.Run(mode, func(t *testing.T) {
 			w := &epollWorker{readTO: int64(h2FixCeiling), writeTO: int64(h2FixShutdownGrace), idleTO: int64(h2FixShutdownGrace / 10)}
 			c := &epollConn{fd: 1, protocol: plainConnProtoH2}
@@ -399,15 +399,22 @@ func TestH2IdleDeadlineBufferedService(t *testing.T) {
 				c.h2.streams = map[uint32]*H2Stream{3: {}}
 			case "existing-read":
 				c.deadline = 43
+			case "partial-existing-read":
+				c.readN, c.h2.appBufOff, c.deadline = 2, 1, 43
+			case "continuation-existing-read":
+				c.h2.expectContinuation, c.deadline = 3, 43
+			case "websocket":
+				c.ws = &wsLoopConn{readDeadline: 43}
+				c.readN, c.h2.appBufOff, c.deadline = 2, 2, 43
 			}
 			before := turbo.UnixNano()
 			w.serviceBuffered(c, false, false)
 			switch mode {
-			case "existing-read":
+			case "partial-existing-read", "continuation-existing-read", "websocket":
 				if c.deadline != 43 {
 					t.Fatalf("extended existing read deadline to %d", c.deadline)
 				}
-			case "idle":
+			case "idle", "existing-read":
 				h2DeadlineWant(t, c, before, turbo.UnixNano(), w.idleTO)
 			default:
 				h2DeadlineWant(t, c, before, turbo.UnixNano(), w.readTO)
@@ -518,6 +525,8 @@ func TestH2DisarmOutDeadlinePolicy(t *testing.T) {
 		{name: "read-disabled", setup: func(c *epollConn, w *epollWorker) { c.readN = 2; c.h2.appBufOff = 1; w.readTO = 0 }},
 		{name: "write-disabled-existing", setup: func(_ *epollConn, w *epollWorker) { w.writeTO = 0 }, want: writeDeadline},
 		{name: "write-disabled", setup: func(c *epollConn, w *epollWorker) { w.writeTO = 0; c.deadline = 0 }, timeout: func(w *epollWorker) int64 { return w.idleTO }},
+		{name: "http1", setup: func(c *epollConn, _ *epollWorker) { c.protocol = plainConnProtoH1 }, timeout: func(w *epollWorker) int64 { return w.idleTO }},
+		{name: "http1-idle-disabled", setup: func(c *epollConn, w *epollWorker) { c.protocol = plainConnProtoH1; w.idleTO = 0 }, want: writeDeadline},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -541,4 +550,44 @@ func TestH2DisarmOutDeadlinePolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestH2IdleDeadlineAfterPing(t *testing.T) {
+	w, c, peer := h2DeadlineFixture(t)
+	if w.readTO == w.idleTO {
+		t.Fatal("fixture cannot separate the read timeout")
+	}
+	request := append([]byte(nil), H2ClientPreface[:]...)
+	request = appendH2Frame(request, H2FrameSettings, 0, 0, nil)
+	request = appendH2Frame(request, H2FramePing, 0, 0, []byte("pingdata"))
+	if _, err := unix.Write(peer, request); err != nil {
+		t.Fatal(err)
+	}
+	before := turbo.UnixNano()
+	w.readable(c, false)
+	after := turbo.UnixNano()
+	if c.fd < 0 || !c.speaksH2() || !c.h2Quiescent() || c.unparsedInput() || c.outArmed {
+		t.Fatalf("connection is not a quiescent H2 connection: fd=%d h2=%v outArmed=%v", c.fd, c.speaksH2(), c.outArmed)
+	}
+	output := make([]byte, 4096)
+	length, err := unix.Read(peer, output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	output = output[:length]
+	pingAcked := false
+	for len(output) >= 9 {
+		size := int(output[0])<<16 | int(output[1])<<8 | int(output[2])
+		if size+9 > len(output) {
+			t.Fatal("partial response frame")
+		}
+		if output[3] == H2FramePing && output[4]&H2FlagAck != 0 && bytes.Equal(output[9:9+size], []byte("pingdata")) {
+			pingAcked = true
+		}
+		output = output[9+size:]
+	}
+	if !pingAcked {
+		t.Fatal("PING was not acknowledged")
+	}
+	h2DeadlineWant(t, c, before, after, w.idleTO)
 }

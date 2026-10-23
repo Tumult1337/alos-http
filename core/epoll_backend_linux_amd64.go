@@ -1655,6 +1655,9 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		}
 		c.closeAfter = true
 	}
+	if c.speaksH2() && c.ws == nil && c.h2Idle() {
+		c.resetH2Deadline(w)
+	}
 	if c.readN == 0 && !c.outArmed && c.writeSent == len(c.writeBuf) {
 		w.releaseIdleBuffers(c)
 		if c.speaksH2() && c.ws == nil {

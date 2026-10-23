@@ -466,11 +466,15 @@ func (c *epollConn) resetH2Deadline(w *epollWorker) {
 	if c.fd < 0 || !c.speaksH2() || c.lingering || c.closeAfter || c.inFlight > 0 || c.dispatching || c.outArmed || c.writeSent != len(c.writeBuf) {
 		return
 	}
-	if c.h2Quiescent() && c.h2.expectContinuation == 0 && !c.unparsedInput() {
+	if c.h2Idle() {
 		c.deadline = deadlineFrom(w.idleTO)
 		return
 	}
 	c.deadline = deadlineFrom(w.readTO)
+}
+
+func (c *epollConn) h2Idle() bool {
+	return c.h2Quiescent() && c.h2.expectContinuation == 0 && !c.unparsedInput()
 }
 
 func (c *epollConn) h2PeerLeft() bool {
