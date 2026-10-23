@@ -87,6 +87,9 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 			}
 		}
 		if len(data) < quicMinInitialDatagram {
+			if qc != nil {
+				qc.creditDiscardedDatagram(quicAddrPort(remoteAddr), len(data))
+			}
 			if pbuf != nil {
 				quicRecvBufPool.Put(pbuf)
 			}

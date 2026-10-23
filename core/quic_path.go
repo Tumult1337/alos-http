@@ -110,6 +110,18 @@ func (qc *QUICConn) notePacketSource(from netip.AddrPort, size int) {
 	qc.writeMu.Unlock()
 }
 
+func (qc *QUICConn) creditDiscardedDatagram(from netip.AddrPort, size int) {
+	if from == qc.currentPath() {
+		if !qc.addressValidated.Load() {
+			qc.bytesReceived.Add(uint64(size))
+		}
+		return
+	}
+	qc.writeMu.Lock()
+	qc.offPath.credit(from, size)
+	qc.writeMu.Unlock()
+}
+
 func (qc *QUICConn) receivePath() netip.AddrPort {
 	if gen := qc.pathGen.Load(); gen != qc.rxPathGen {
 		qc.rxPath = qc.currentPath()

@@ -82,3 +82,29 @@ func TestQUICFixSmallInitialDatagramIsNotForwardedToAValidatedConnection(t *test
 		t.Fatalf("the dispatcher answered %d times", replies)
 	}
 }
+
+func TestQUICFixDroppedSmallInitialStillCountsForTheAmplificationLimit(t *testing.T) {
+	f := newQUICFixFlightConn(t)
+	f.qc.addressValidated.Store(false)
+	f.qc.bytesReceived.Store(0)
+	connMap := alosmap.NewTyped[[20]byte, *QUICConn]()
+	connMap.Store(quicCIDKey(f.qc.srcCID()), f.qc)
+	uc := &captureUDPSender{}
+	from := udpAddrToSockaddr4(&net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: quicFixLoopback.Port})
+	datagram := f.clientInitialOfSize(t, 11, []byte{quicFramePing}, quicMinInitialDatagram-1)
+	f.qc.server.handleQUICPacketIOUring(uc, &from, datagram, nil, connMap)
+	if queued := len(f.qc.inbound); queued != 0 {
+		t.Fatalf("the small Initial datagram was forwarded (%d queued)", queued)
+	}
+	if got := f.qc.bytesReceived.Load(); got != uint64(len(datagram)) {
+		t.Fatalf("bytes received %d after a dropped %d-byte datagram, want it counted (RFC 9000 8.1)", got, len(datagram))
+	}
+	offPath := udpAddrToSockaddr4(net.UDPAddrFromAddrPort(pathC))
+	f.qc.server.handleQUICPacketIOUring(uc, &offPath, datagram, nil, connMap)
+	f.qc.writeMu.Lock()
+	credit := f.qc.offPath
+	f.qc.writeMu.Unlock()
+	if credit.addr != pathC || credit.received != uint64(len(datagram)) || f.qc.bytesReceived.Load() != uint64(len(datagram)) {
+		t.Fatalf("a dropped datagram from %v credited the wrong budget: off-path %+v, main %d", pathC, credit, f.qc.bytesReceived.Load())
+	}
+}
