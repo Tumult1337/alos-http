@@ -184,7 +184,7 @@ func proxyG2BurstOrigin(t *testing.T, size, stallAfter int) string {
 
 func TestFPProxySlowSteadyClientIsNotCutByBackendReadTimeout(t *testing.T) {
 	w := &proxyG2SlowWriter{}
-	req := &Request{Method: "GET", Host: "origin.test", Path: "/big", StreamWriter: w}
+	req := &Request{Method: "GET", Host: "origin.test", Path: "/big", StreamWriter: w, server: New(Config{})}
 	err := (&ProxyEngine{}).forwardRequestFP(req, &Response{}, &backend{Addr: proxyG2BurstOrigin(t, proxyG2SlowBody, 0)}, &DomainConfig{
 		ConnectTimeout: time.Second, ReadTimeout: proxyG2SlowReadTimeout,
 	}, proxyCacheTarget{path: "/big", storable: true})
@@ -241,5 +241,102 @@ func TestProxyInLoopSlowSteadyClientIsNotCutByBackendReadTimeout(t *testing.T) {
 	}
 	if want := proxyG2InLoopSlowBody; total < want {
 		t.Fatalf("slow but steady in-loop client got %d bytes, want the head plus %d body bytes", total, want)
+	}
+}
+
+func proxyG2ReleaseOrigin(t *testing.T, released chan<- struct{}) string {
+	t.Helper()
+	return rawOrigin(t, func(conn net.Conn) {
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", 64<<20)
+		chunk := bytes.Repeat([]byte("s"), 64<<10)
+		for {
+			if _, err := conn.Write(chunk); err != nil {
+				close(released)
+				return
+			}
+		}
+	})
+}
+
+type proxyG2StuckWriter struct{ unblock chan struct{} }
+
+func (w *proxyG2StuckWriter) WriteHeader(int, [][2]string, string) error { return nil }
+func (w *proxyG2StuckWriter) WriteChunk([]byte) error {
+	<-w.unblock
+	return ErrStreamClosed
+}
+func (w *proxyG2StuckWriter) Flush() error { return nil }
+func (w *proxyG2StuckWriter) Close() error { return nil }
+
+func TestFPProxyPausedBackendIsReleasedWithoutClientWriteTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		server *Server
+	}{{"write timeout disabled", New(Config{WriteTimeout: -1})}, {"no server", nil}} {
+		t.Run(tc.name, func(t *testing.T) {
+			released := make(chan struct{})
+			origin := proxyG2ReleaseOrigin(t, released)
+			w := &proxyG2StuckWriter{unblock: make(chan struct{})}
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				req := &Request{Method: "GET", Host: "origin.test", Path: "/big", StreamWriter: w, server: tc.server}
+				_ = (&ProxyEngine{}).forwardRequestFP(req, &Response{}, &backend{Addr: origin}, &DomainConfig{
+					ConnectTimeout: time.Second, ReadTimeout: proxyG2SlowReadTimeout,
+				}, proxyCacheTarget{path: "/big", storable: true})
+			}()
+			defer func() {
+				close(w.unblock)
+				<-done
+			}()
+			select {
+			case <-released:
+			case <-time.After(10 * proxyG2SlowReadTimeout):
+				t.Fatalf("a backend paused for a consumer with no write timeout was held past %v", 10*proxyG2SlowReadTimeout)
+			}
+		})
+	}
+}
+
+func TestProxyInLoopPausedBackendIsReleasedWithoutClientWriteTimeout(t *testing.T) {
+	released := make(chan struct{})
+	origin := proxyG2ReleaseOrigin(t, released)
+	_, addr := proxyFixStart(t, Config{WriteTimeout: -1}, []DomainConfig{{Domain: proxyFixDomain, ReadTimeout: proxyG2SlowReadTimeout, Backends: []BackendConfig{{Addr: origin}}}}, nil)
+	c := proxyFixDial(t, addr)
+	defer c.Close()
+	if _, err := c.Write([]byte(proxyFixGet(proxyFixDomain, "/big"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	select {
+	case <-released:
+	case <-time.After(10 * proxyG2SlowReadTimeout):
+		t.Fatalf("a backend paused for a client that never reads was held past %v with the write timeout disabled", 10*proxyG2SlowReadTimeout)
+	}
+}
+
+type proxyG2OnePauseWriter struct {
+	n      atomic.Int64
+	paused atomic.Bool
+}
+
+func (w *proxyG2OnePauseWriter) WriteHeader(int, [][2]string, string) error { return nil }
+func (w *proxyG2OnePauseWriter) WriteChunk(d []byte) error {
+	if !w.paused.Swap(true) {
+		time.Sleep(3 * proxyG2SlowReadTimeout)
+	}
+	w.n.Add(int64(len(d)))
+	return nil
+}
+func (w *proxyG2OnePauseWriter) Flush() error { return nil }
+func (w *proxyG2OnePauseWriter) Close() error { return nil }
+
+func TestFPProxyLongPauseWithClientWriteTimeoutKeepsBackend(t *testing.T) {
+	w := &proxyG2OnePauseWriter{}
+	req := &Request{Method: "GET", Host: "origin.test", Path: "/big", StreamWriter: w, server: New(Config{})}
+	err := (&ProxyEngine{}).forwardRequestFP(req, &Response{}, &backend{Addr: proxyG2BurstOrigin(t, proxyG2SlowBody, 0)}, &DomainConfig{
+		ConnectTimeout: time.Second, ReadTimeout: proxyG2SlowReadTimeout,
+	}, proxyCacheTarget{path: "/big", storable: true})
+	if err != nil || w.n.Load() != proxyG2SlowBody {
+		t.Fatalf("a pause bounded by the client write timeout cut the download: err=%v relayed %d of %d", err, w.n.Load(), proxyG2SlowBody)
 	}
 }

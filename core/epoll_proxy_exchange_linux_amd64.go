@@ -581,6 +581,7 @@ func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error)
 	// that from the method, so it has to travel with the exchange.
 	px.Exchange.req.Method = req.Method
 	px.Exchange.req.ensureResponseDate = true
+	px.Exchange.req.consumerBoundsPause = w.writeTO > 0
 	px.Exchange.resp = fpResponse{}
 	px.Exchange.err = nil
 	px.finished = false

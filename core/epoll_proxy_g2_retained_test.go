@@ -112,7 +112,7 @@ func TestUpstreamResumeReadRearmsTheReadDeadline(t *testing.T) {
 	l.conns[c.fd] = c
 	l.liveConns++
 	readTimeout := 500 * time.Millisecond
-	c.cur = &Exchange{req: &fpRequest{Method: "GET"}, readTimeoutNano: int64(readTimeout), deadline: l.nowNano() - int64(time.Second)}
+	c.cur = &Exchange{req: &fpRequest{Method: "GET", consumerBoundsPause: true}, readTimeoutNano: int64(readTimeout), deadline: l.nowNano() - int64(time.Second)}
 	c.readPaused = true
 	l.sweepConn(c, l.nowNano())
 	if c.state == connClosed {

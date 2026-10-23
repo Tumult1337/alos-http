@@ -281,7 +281,7 @@ func (l *beLoop) sweepConn(c *backendConn, now int64) {
 		l.sweepH2(c, now)
 		return
 	}
-	if c.cur != nil && !c.readPaused && now > c.cur.deadline {
+	if c.cur != nil && (!c.readPaused || !c.cur.req.consumerBoundsPause) && now > c.cur.deadline {
 		l.closeConn(c, errFPTimeout)
 		return
 	}

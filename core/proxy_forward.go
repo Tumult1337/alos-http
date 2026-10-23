@@ -445,6 +445,10 @@ func pipeUpgradeTunnel(clientConn, backendConn net.Conn, idle time.Duration) {
 	<-done
 }
 
+func (s *Server) writeTimeoutBounded() bool {
+	return s != nil && s.limits.Load().WriteTimeout > 0
+}
+
 func (s *Server) tunnelIdleTimeout() time.Duration {
 	if s == nil {
 		return limitDefaultIdleTimeout

@@ -132,7 +132,8 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 
 	pipe := newRespPipe()
 	ex, loop, err := client.start(&UpstreamRequest{
-		ensureResponseDate: true,
+		ensureResponseDate:  true,
+		consumerBoundsPause: req.server.writeTimeoutBounded(),
 
 		Scheme:      fpProxyScheme(b),
 		Authority:   fpProxyAuthority(b.Addr),
