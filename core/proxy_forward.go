@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/turbo"
@@ -257,7 +258,7 @@ func (pe *ProxyEngine) forwardUpgrade(req *Request, resp *Response, b *backend, 
 		resp.SetStreamer(req.StreamWriter)
 	}
 	_ = backendConn.SetReadDeadline(time.Time{})
-	go pipeUpgradeTunnel(clientConn, backendConn)
+	go pipeUpgradeTunnel(clientConn, backendConn, req.server.tunnelIdleTimeout())
 	return nil
 }
 
@@ -371,11 +372,16 @@ func relayDeclinedUpgrade(conn net.Conn, p *h1Parser, chunked bool, contentLen i
 	return sw.Close()
 }
 
-func pipeUpgradeTunnel(clientConn, backendConn net.Conn) {
+func pipeUpgradeTunnel(clientConn, backendConn net.Conn, idle time.Duration) {
 	done := make(chan struct{}, 2)
+	activity := tunnelActivity{start: time.Now()}
 	copyBuf := func(dst, src net.Conn) {
 		buf := LargeBufPool.Get().(*[]byte)
-		io.CopyBuffer(dst, src, (*buf)[:cap(*buf)])
+		if idle > 0 {
+			activity.copy(dst, src, (*buf)[:cap(*buf)], idle)
+		} else {
+			_, _ = io.CopyBuffer(dst, src, (*buf)[:cap(*buf)])
+		}
 		putBoxedBufCapped(&LargeBufPool, buf, largeBufPoolMaxCap)
 		done <- struct{}{}
 	}
@@ -386,6 +392,47 @@ func pipeUpgradeTunnel(clientConn, backendConn net.Conn) {
 	backendConn.Close()
 	clientConn.Close()
 	<-done
+}
+
+func (s *Server) tunnelIdleTimeout() time.Duration {
+	if s == nil {
+		return limitDefaultIdleTimeout
+	}
+	return s.limits.Load().IdleTimeout
+}
+
+type tunnelActivity struct {
+	start     time.Time
+	lastMoved atomic.Int64
+}
+
+func (a *tunnelActivity) idleFor() time.Duration {
+	return time.Since(a.start) - time.Duration(a.lastMoved.Load())
+}
+
+func (a *tunnelActivity) copy(dst, src net.Conn, buf []byte, idle time.Duration) {
+	for {
+		if src.SetReadDeadline(time.Now().Add(idle)) != nil {
+			return
+		}
+		n, err := src.Read(buf)
+		if n > 0 {
+			if dst.SetWriteDeadline(time.Now().Add(idle)) != nil {
+				return
+			}
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			a.lastMoved.Store(int64(time.Since(a.start)))
+		}
+		if err == nil {
+			continue
+		}
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() || a.idleFor() >= idle {
+			return
+		}
+	}
 }
 
 func extractIP(addr string) string {
