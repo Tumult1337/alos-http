@@ -28,6 +28,7 @@ const (
 	inlineSafetyCeiling  = 3 * time.Second
 	inlineSafetyProbes   = 20
 	inlineSafetyBodyLen  = 300
+	inlineSafetyBatch    = time.Minute
 )
 
 type inlineSafetyApp struct {
@@ -93,7 +94,7 @@ func (a *inlineSafetyApp) awaitEntered(t *testing.T) {
 
 func inlineSafetyServer(t *testing.T, useTLS bool, app *inlineSafetyApp, cfg func(*Config)) *testServer {
 	t.Helper()
-	return newTestServer(t, testServerOptions{TLS: useTLS, Routes: app.routes, Config: cfg})
+	return newTestServer(t, testServerOptions{TLS: useTLS, Routes: app.routes, Config: cfg, Setup: func(s *Server) { s.inlineBatch = inlineSafetyBatch }})
 }
 
 func inlineSafetyModes(t *testing.T, fn func(t *testing.T, useTLS bool)) {
