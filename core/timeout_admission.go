@@ -4,27 +4,57 @@ package core
 
 import "net/http"
 
-type detachedWorkHold struct {
-	srv        *Server
-	reqSlot    bool
-	ipSlot     *ipReqCounter
-	connIPSlot *ipReqCounter
+type timeoutAdmission struct {
+	srv    *Server
+	ipSlot *ipReqCounter
 }
 
-func (s *Server) detachedWorkRefusal(req *Request) int {
+func (s *Server) admitTimeoutHandler(req *Request) (*timeoutAdmission, int) {
 	if s == nil {
-		return 0
+		return nil, 0
 	}
 	limits := s.limits.Load()
-	if limits.MaxConns > 0 && s.detachedWork.Load() >= limits.MaxConns {
-		return http.StatusServiceUnavailable
+	if running := s.timeoutHandlers.Add(1); limits.MaxConns > 0 && running > limits.MaxConns {
+		s.timeoutHandlers.Add(-1)
+		return nil, http.StatusServiceUnavailable
 	}
-	if limiter := s.perIPConnLimiter.Load(); limiter != nil && limits.MaxConnsPerIP > 0 && !s.trustedProxies.active {
-		if limiter.count(extractIP(req.RemoteAddr)) > limits.MaxConnsPerIP {
-			return http.StatusTooManyRequests
+	admission := &timeoutAdmission{srv: s}
+	if limits.MaxConnsPerIP > 0 {
+		slot, ok := s.timeoutIPLimiter().hold(extractIP(req.RemoteAddr), limits.MaxConnsPerIP)
+		if !ok {
+			s.timeoutHandlers.Add(-1)
+			return nil, http.StatusTooManyRequests
 		}
+		admission.ipSlot = slot
 	}
-	return 0
+	return admission, 0
+}
+
+func (a *timeoutAdmission) release() {
+	if a == nil {
+		return
+	}
+	if a.ipSlot != nil {
+		a.ipSlot.release()
+	}
+	a.srv.timeoutHandlers.Add(-1)
+}
+
+func (s *Server) timeoutIPLimiter() *perIPLimiter {
+	if l := s.timeoutPerIP.Load(); l != nil {
+		return l
+	}
+	fresh := newPerIPRequestLimiter()
+	if !s.timeoutPerIP.CompareAndSwap(nil, fresh) {
+		fresh.Stop()
+	}
+	return s.timeoutPerIP.Load()
+}
+
+type detachedWorkHold struct {
+	srv     *Server
+	reqSlot bool
+	ipSlot  *ipReqCounter
 }
 
 func (s *Server) holdDetachedWork(req *Request) *detachedWorkHold {
@@ -32,16 +62,11 @@ func (s *Server) holdDetachedWork(req *Request) *detachedWorkHold {
 		return nil
 	}
 	hold := &detachedWorkHold{srv: s}
-	s.detachedWork.Add(1)
 	if s.config.MaxConcurrentReqs > 0 {
 		s.activeReqs.Add(1)
 		hold.reqSlot = true
 	}
-	ip := extractIP(req.RemoteAddr)
-	hold.ipSlot = s.perIPLimiter.holdAlive(ip)
-	if !s.trustedProxies.active {
-		hold.connIPSlot = s.perIPConnLimiter.Load().holdAlive(ip)
-	}
+	hold.ipSlot = s.perIPLimiter.holdAlive(extractIP(req.RemoteAddr))
 	return hold
 }
 
@@ -49,16 +74,12 @@ func (h *detachedWorkHold) release() {
 	if h == nil {
 		return
 	}
-	if h.connIPSlot != nil {
-		h.connIPSlot.release()
-	}
 	if h.ipSlot != nil {
 		h.ipSlot.release()
 	}
 	if h.reqSlot {
 		h.srv.releaseRequestSlot()
 	}
-	h.srv.detachedWork.Add(-1)
 }
 
 func (l *perIPLimiter) count(ip string) int64 {

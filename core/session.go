@@ -153,8 +153,9 @@ type sessionEntry struct {
 }
 
 type sessionEvictionCandidate struct {
-	id    string
-	entry *sessionEntry
+	id       string
+	entry    *sessionEntry
+	returned bool
 }
 
 // MemorySessionStore is an in-memory SessionStore suitable for single-process use.
@@ -224,8 +225,8 @@ func (s *MemorySessionStore) makeRoom() {
 }
 
 func compareSessionEviction(a, b sessionEvictionCandidate) int {
-	if aReturned, bReturned := a.entry.returned.Load(), b.entry.returned.Load(); aReturned != bReturned {
-		if aReturned {
+	if a.returned != b.returned {
+		if a.returned {
 			return 1
 		}
 		return -1
@@ -236,7 +237,7 @@ func compareSessionEviction(a, b sessionEvictionCandidate) int {
 func (s *MemorySessionStore) evictionCandidates() []sessionEvictionCandidate {
 	live := make([]sessionEvictionCandidate, 0, min(s.maxEntries, int64(s.entries.Len())))
 	s.entries.Range(func(id string, entry *sessionEntry) bool {
-		live = append(live, sessionEvictionCandidate{id: id, entry: entry})
+		live = append(live, sessionEvictionCandidate{id: id, entry: entry, returned: entry.returned.Load()})
 		return true
 	})
 	return live

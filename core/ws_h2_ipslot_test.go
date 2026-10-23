@@ -5,6 +5,7 @@ package core
 import (
 	"io"
 	"testing"
+	"time"
 
 	"github.com/guno1928/turbo"
 )
@@ -63,4 +64,31 @@ func h2TunnelAwaitSlotFree(t *testing.T, srv *Server, ip string) {
 		}
 		return ok
 	})
+}
+
+func TestWebSocketH2BlockedCallbackHoldsSlotsAfterReset(t *testing.T) {
+	blocker := newWSBlockingClose()
+	ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) {
+		cfg.TrustedProxies = []string{"127.0.0.1"}
+		cfg.MaxConnsPerIP = 1
+	})
+	ip := "203.0.113.11"
+	rc, _ := h2DialCaptureSettings(t, ts.addr)
+	ws, hdrs := openH2WebSocket(t, rc, 1, "/ws-block-message", [2]string{"x-forwarded-for", ip})
+	if hdrs[":status"] != "200" {
+		t.Fatalf("tunnel status %q", hdrs[":status"])
+	}
+	ws.send(wsClientFrame(0x80|wsOpText, []byte("m")))
+	blocker.awaitEntered(t)
+	rc.write(H2FrameRSTStream, 0, 1, []byte{0, 0, 0, 8})
+	time.Sleep(wsCloseAdmissionSettle)
+	if _, ok := ts.srv.perIPLimiter.hold(ip, 1); ok {
+		t.Fatal("a reset tunnel released its per-IP slot while OnMessage still runs")
+	}
+	if got := ts.srv.activeConns.Load(); got != 2 {
+		t.Fatalf("activeConns with a blocked callback on a reset tunnel = %d, want 2", got)
+	}
+	blocker.unblock()
+	h2TunnelAwaitSlotFree(t, ts.srv, ip)
+	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 1 })
 }

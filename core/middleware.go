@@ -587,9 +587,11 @@ func cloneDetachedStrings(r *Request) {
 }
 
 // Timeout returns middleware that runs the handler with a deadline of d and responds 504 Gateway Timeout if it has not completed in time.
-// A handler that outlives its deadline keeps its request slot, its per-IP slot and its copy of the body counted against
-// MaxConcurrentReqs, MaxConnsPerIP or MaxRequestsPerIP, and MaxInFlightBodyBytes until it returns, and at most MaxConns such
-// handlers run at once. A request over one of these limits gets 503 Service Unavailable or 429 Too Many Requests.
+// The handler runs on its own goroutine with a copy of the request body. At most MaxConns such handlers run at once, and at
+// most MaxConnsPerIP for one client IP, counting handlers that outlived their deadline; the body copy counts against
+// MaxInFlightBodyBytes until the handler returns, in addition to the request's own body. A handler that outlives its
+// deadline also keeps its MaxConcurrentReqs slot and, behind a trusted proxy, its per-IP request slot until it returns.
+// A request over one of these limits gets 503 Service Unavailable or 429 Too Many Requests.
 //
 // Example: app.Use(Timeout(5 * time.Second))
 // Example: app.Use(Timeout(100 * time.Millisecond))
@@ -598,12 +600,14 @@ func Timeout(d time.Duration) MiddlewareFunc {
 	return func(next HandlerFunc) HandlerFunc {
 		return func(req *Request, resp *Response) {
 			srv := req.server
-			if status := srv.detachedWorkRefusal(req); status != 0 {
+			admission, status := srv.admitTimeoutHandler(req)
+			if status != 0 {
 				statsBlocked()
 				resp.Status(status).String(http.StatusText(status))
 				return
 			}
 			if !srv.tryReserveBodyBytes(len(req.Body)) {
+				admission.release()
 				statsBlocked()
 				resp.Status(http.StatusServiceUnavailable).String(http.StatusText(http.StatusServiceUnavailable))
 				return
@@ -658,6 +662,7 @@ func Timeout(d time.Duration) MiddlewareFunc {
 						tmpReq.server.reportPanic(&tmpReq, r)
 					}
 					srv.releaseBodyBytes(bodyHeld)
+					admission.release()
 					done <- struct{}{}
 				}()
 				next(&tmpReq, tmpResp)

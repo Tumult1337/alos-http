@@ -45,9 +45,11 @@ func timeoutAdmissionServer(t *testing.T, cfgFn func(*Config)) (*testServer, *ti
 			timeout := Timeout(timeoutAdmissionDeadline)
 			r.GET("/stuck", timeout(blocking))
 			r.POST("/stuck", timeout(blocking))
+			r.GET("/ping", func(req *Request, resp *Response) { resp.String("pong") })
 		},
 	})
 	t.Cleanup(probe.unblock)
+	awaitIdleAfterReadinessProbe(t, ts, "/ping")
 	return ts, probe
 }
 
@@ -127,7 +129,7 @@ func TestTimeoutDetachedHandlerHoldsAdmission(t *testing.T) {
 			}
 			probe.unblock()
 			waitFor(t, harnessIOTimeout, func() bool {
-				return probe.running.Load() == 0 && ts.srv.inFlightBodyBytes.Load() == 0 && ts.srv.activeReqs.Load() == 0
+				return probe.running.Load() == 0 && ts.srv.inFlightBodyBytes.Load() == 0 && ts.srv.activeReqs.Load() == 0 && ts.srv.timeoutHandlers.Load() == 0
 			})
 			if again := timeoutAdmissionStatuses(t, ts, tc.method, tc.body, tc.extra); again[0] != http.StatusOK {
 				t.Fatalf("after the detached handlers exit: statuses %v, want 200 first", again)
@@ -158,5 +160,48 @@ func TestPerIPLimiterHoldAliveSkipsFreeAndDeadCounters(t *testing.T) {
 	l.sweep()
 	if slot := l.holdAlive("198.51.100.1"); slot != nil {
 		t.Fatal("holdAlive revived a swept counter")
+	}
+}
+
+const timeoutAdmissionStreams = 20
+
+func TestTimeoutConcurrentH2StreamsRespectAdmission(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfg    func(*Config)
+		refuse int
+	}{
+		{name: "max-conns", refuse: http.StatusServiceUnavailable, cfg: func(cfg *Config) { cfg.MaxConns = 3 }},
+		{name: "per-ip-conns", refuse: http.StatusTooManyRequests, cfg: func(cfg *Config) { cfg.MaxConnsPerIP = 3 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, probe := timeoutAdmissionServer(t, tc.cfg)
+			rc, _ := h2DialCaptureSettings(t, ts.addr)
+			for i := range timeoutAdmissionStreams {
+				rc.write(H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, uint32(2*i+1), hpackBlock(
+					[2]string{":method", "GET"}, [2]string{":scheme", "http"}, [2]string{":path", "/stuck"}, [2]string{":authority", harnessDomain}))
+			}
+			statuses := map[int]int{}
+			for answered := 0; answered < timeoutAdmissionStreams; {
+				f, err := rc.tryRead()
+				if err != nil {
+					t.Fatalf("after %d answers %v: %v", answered, statuses, err)
+				}
+				if f.typ == H2FrameRSTStream || f.typ == H2FrameGoAway {
+					t.Fatalf("stream %d got frame type %d", f.streamID, f.typ)
+				}
+				if f.typ == H2FrameHeaders {
+					statuses[f.status(t)]++
+					answered++
+				}
+			}
+			if statuses[http.StatusGatewayTimeout] != 3 || statuses[tc.refuse] != timeoutAdmissionStreams-3 {
+				t.Fatalf("statuses %v, want 3 x 504 and %d x %d", statuses, timeoutAdmissionStreams-3, tc.refuse)
+			}
+			if running := probe.running.Load(); running != 3 {
+				t.Fatalf("%d Timeout handlers run, want 3", running)
+			}
+		})
 	}
 }

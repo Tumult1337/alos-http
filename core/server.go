@@ -677,7 +677,8 @@ type Server struct {
 	inlineBatch       time.Duration
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
-	detachedWork      atomic.Int64
+	timeoutHandlers   atomic.Int64
+	timeoutPerIP      atomic.Pointer[perIPLimiter]
 	_                 [CacheLineSize]byte
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
@@ -1322,6 +1323,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 			s.perIPLimiter.Stop()
 		}
 		s.perIPConnLimiter.Load().Stop()
+		s.timeoutPerIP.Load().Stop()
 		for _, ln := range s.listeners {
 			ln.Close()
 		}
@@ -1876,7 +1878,7 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		if slot != nil {
 			defer func() {
 				if req.h2Tunnel != nil {
-					req.h2Tunnel.ipSlot = slot
+					req.h2Tunnel.adoptIPSlot(slot)
 					return
 				}
 				if req.connTakenOver && s.trustedProxies.active {
