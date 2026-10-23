@@ -125,8 +125,6 @@ type epollConn struct {
 	h1BodyAccounted int64
 	h1BodyReserved  atomic.Int64
 	h1BodyDeadline  int64
-	h2BodyDeadline  int64
-	h2SendDeadline  int64
 	chunkScanPos    int
 	h2GoingAway     bool
 
@@ -1113,9 +1111,12 @@ func (w *epollWorker) sweepDeadlines() {
 		if c == nil || c.fd < 0 {
 			continue
 		}
-		if c.deadline != 0 && now > c.deadline || c.h2ProgressExpired(now) {
+		if c.deadline != 0 && now > c.deadline {
 			w.closeConn(c)
 			continue
+		}
+		if c.speaksH2() {
+			c.h2ResetStalledStreams(w, now)
 		}
 		if c.holdsIdleBuffers() && now-(c.deadline-w.idleTO) >= int64(epollSweepIntervalMs)*1_000_000 {
 			w.releaseIdleBuffers(c)
@@ -1242,7 +1243,6 @@ func (w *epollWorker) acceptLoop() {
 		c.h1Off = 0
 		c.chunkScanPos = 0
 		c.h1BodyDeadline = 0
-		c.h2BodyDeadline, c.h2SendDeadline = 0, 0
 		c.h2GoingAway = false
 		if w.tlsMode {
 			c.deadline = deadlineFrom(w.handshakeTO)
@@ -1632,6 +1632,9 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		c.peerHup = c.peerHup || closed || peerClosed
 		return
 	}
+	if (closed || peerClosed) && c.speaksH2() {
+		c.h2DropPeerInput(w)
+	}
 	if closed && !c.h2AnswersAfterEOF() {
 		w.closeConn(c)
 		return
@@ -1965,7 +1968,6 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.tlsUselessRecords = 0
 	c.cipherOff = 0
 	c.h2GoingAway = false
-	c.h2BodyDeadline, c.h2SendDeadline = 0, 0
 	c.appBufOff = 0
 	if c.appBuf != nil {
 		c.appBuf = c.appBuf[:0]

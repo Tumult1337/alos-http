@@ -50,21 +50,22 @@ type epollH2StreamWriter struct {
 	headerCalled bool
 	suppressBody bool
 
-	header      []byte
-	pending     []byte
-	pendingOff  int
-	headerReady bool
-	headersOut  bool
-	ended       bool
-	finished    bool
-	handlerDone bool
-	registered  bool
-	endedEarly  bool
-	pumpQueued  bool
-	tasksQueued int
-	sendRST     bool
-	err         error
-	file        h2FileSend
+	header       []byte
+	pending      []byte
+	pendingOff   int
+	headerReady  bool
+	headersOut   bool
+	ended        bool
+	finished     bool
+	handlerDone  bool
+	registered   bool
+	endedEarly   bool
+	pumpQueued   bool
+	tasksQueued  int
+	sendDeadline int64
+	sendRST      bool
+	err          error
+	file         h2FileSend
 
 	lease streamWriterLease
 }
@@ -252,6 +253,7 @@ func (sw *epollH2StreamWriter) recycle() {
 	sw.pendingOff = 0
 	sw.headerReady, sw.headersOut, sw.ended, sw.finished = false, false, false, false
 	sw.handlerDone, sw.registered, sw.pumpQueued, sw.sendRST = false, false, false, false
+	sw.sendDeadline = 0
 	sw.endedEarly = false
 	sw.err = nil
 	sw.file.clear()
@@ -313,9 +315,26 @@ func (c *epollConn) h2PumpSealed(w *epollWorker, sw *epollH2StreamWriter) {
 }
 
 func (c *epollConn) h2PumpFrames(dst []byte, sw *epollH2StreamWriter, backlog int) []byte {
-	st := &c.h2
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
+	before := len(dst)
+	dst = c.h2PumpFramesLocked(dst, sw, backlog)
+	c.h2NoteWriterStall(sw, len(dst) > before)
+	return dst
+}
+
+func (c *epollConn) h2NoteWriterStall(sw *epollH2StreamWriter, progressed bool) {
+	stalled := !sw.finished && sw.err == nil && (sw.bufferedLocked() > 0 || sw.file.left > 0) && (sw.stream.Window.Load() <= 0 || c.h2.connWindow <= 0)
+	if !stalled || progressed {
+		sw.sendDeadline = 0
+	}
+	if stalled && sw.sendDeadline == 0 {
+		sw.sendDeadline = deadlineFrom(c.worker.writeTO)
+	}
+}
+
+func (c *epollConn) h2PumpFramesLocked(dst []byte, sw *epollH2StreamWriter, backlog int) []byte {
+	st := &c.h2
 	sw.pumpQueued = false
 	if sw.finished {
 		return dst

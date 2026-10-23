@@ -152,7 +152,7 @@ func TestH2ResponseHeaderFragmentationStatusOnly(t *testing.T) {
 func TestH2ResponseHeaderFragmentationStreamAndBodyFlow(t *testing.T) {
 	headers, _ := responseHeaderBlockOfSize(t, 32769)
 	for _, onlyHeaders := range []bool{false, true} {
-		connection := &epollConn{}
+		connection := &epollConn{worker: &epollWorker{}}
 		connection.h2.maxFrameSize = H2DefaultMaxFrameSize
 		stream := &H2Stream{}
 		writer := newEpollH2StreamWriter().(*epollH2StreamWriter)

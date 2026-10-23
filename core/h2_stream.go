@@ -47,6 +47,8 @@ type H2Stream struct {
 	respHeadersSent bool
 	stallBytes      int
 	parkedBytes     int
+	bodyDeadline    int64
+	sendDeadline    int64
 	dispatchGen     uint32
 	wsTunnel        bool
 	abandoned       bool
@@ -102,6 +104,7 @@ func (s *H2Stream) Reset() {
 	s.respHeadersSent = false
 	s.stallBytes = 0
 	s.parkedBytes = 0
+	s.bodyDeadline, s.sendDeadline = 0, 0
 	s.dispatchGen = 0
 	s.wsTunnel = false
 	s.abandoned = false
