@@ -391,11 +391,14 @@ func ServeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions, fn 
 		resp.Status(503).String("Service Unavailable")
 		return false
 	}
-	ws := UpgradeWebSocketWith(req, resp, opts)
-	if ws == nil {
-		if tracked {
+	handedOff := false
+	defer func() {
+		if tracked && !handedOff {
 			srv.releaseTrackedConn()
 		}
+	}()
+	ws := UpgradeWebSocketWith(req, resp, opts)
+	if ws == nil {
 		return false
 	}
 	tunnel, _ := ws.conn.(*h2StreamConn)
@@ -413,6 +416,7 @@ func ServeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions, fn 
 		}()
 		fn(ws)
 	}()
+	handedOff = true
 	return true
 }
 

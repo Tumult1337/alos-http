@@ -92,3 +92,15 @@ func TestWebSocketH2BlockedCallbackHoldsSlotsAfterReset(t *testing.T) {
 	h2TunnelAwaitSlotFree(t, ts.srv, ip)
 	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 1 })
 }
+
+func TestServeWebSocketH2PanicReleasesConnSlot(t *testing.T) {
+	srv := New(Config{})
+	defer stopServer(srv)
+	func() {
+		defer func() { _ = recover() }()
+		ServeWebSocketWith(&Request{h2WebSocket: true, server: srv}, nil, WSUpgradeOptions{}, func(*WSConn) {})
+	}()
+	if got := srv.activeConns.Load(); got != 0 {
+		t.Fatalf("activeConns %d after a panic in the H2 upgrade, want 0", got)
+	}
+}
