@@ -538,11 +538,7 @@ func h2LengthMismatch(declared, received int64) bool {
 func (c *epollConn) rejectH2Body(streamID uint32) bool {
 	st := &c.h2
 	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrProtocol)
-	epollReleaseH2Stream(st, streamID)
-	c.h2AbortBodyIn(streamID)
-	if _, waiting := st.findWaiting(streamID); waiting != nil {
-		c.abandonH2Stream(streamID, ErrStreamClosed)
-	}
+	c.abandonH2Stream(streamID, ErrStreamClosed)
 	if st.countReset() {
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
 		return true
@@ -732,11 +728,11 @@ func (c *epollConn) epollH2DispatchStream(srv *Server, streamID uint32, stream *
 	if mapped {
 		delete(c.h2.streams, streamID)
 	}
-	if len(c.h2.waiting) == 0 && c.h2AdmitsHandler() {
-		return c.startH2Stream(srv, streamID, stream, streamBody)
-	}
 	if streamBody {
 		stream.waitBody = c.openH2BodyIn(c.worker, stream)
+	}
+	if len(c.h2.waiting) == 0 && c.h2AdmitsHandler() {
+		return c.startH2Stream(srv, streamID, stream, streamBody)
 	}
 	c.h2.waiting = append(c.h2.waiting, stream)
 	return false

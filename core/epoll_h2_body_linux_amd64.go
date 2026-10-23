@@ -66,8 +66,7 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 		if !in.tunnel && c.worker.bodyTooLarge(in.received) {
 			in.tooLarge = true
 			in.reader.finish(ErrBodyTooLarge)
-		} else if !in.reader.reservePush(payload) {
-			c.h2ResetBodyIn(in, H2ErrEnhanceYourCalm)
+		} else if !c.h2BufferBody(in, payload) {
 			return false
 		}
 	}
@@ -94,13 +93,21 @@ func (c *epollConn) h2EndBodyIn(in *h2BodyIn, err error) {
 	in.reader.finish(nil)
 }
 
+func (c *epollConn) h2BufferBody(in *h2BodyIn, payload []byte) bool {
+	if in.reader.reservePush(payload) {
+		return true
+	}
+	if _, waiting := c.h2.findWaiting(in.streamID); waiting != nil {
+		c.h2ResetBodyIn(in, H2ErrRefusedStream)
+		return false
+	}
+	c.h2ResetBodyIn(in, H2ErrEnhanceYourCalm)
+	return false
+}
+
 func (c *epollConn) h2ResetBodyIn(in *h2BodyIn, errCode uint32) {
 	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, in.streamID, errCode)
-	if _, waiting := c.h2.findWaiting(in.streamID); waiting != nil {
-		c.abandonH2Stream(in.streamID, ErrStreamClosed)
-		return
-	}
-	c.h2EndBodyIn(in, ErrBodyStreamAborted)
+	c.abandonH2Stream(in.streamID, ErrStreamClosed)
 }
 
 func (c *epollConn) h2BodyAcked(w *epollWorker, in *h2BodyIn, gen uint32) {

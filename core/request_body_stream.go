@@ -95,9 +95,10 @@ func (b *BodyReader) Close() error {
 		return nil
 	}
 	b.closed = true
-	b.unacked += len(b.buf) - b.off
+	dropped := len(b.buf) - b.off
+	b.unacked += dropped
 	b.buf, b.off = nil, 0
-	released := b.releaseHeldLocked(b.held)
+	released := b.releaseHeldLocked(int64(dropped))
 	b.stopDeadlineLocked()
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
