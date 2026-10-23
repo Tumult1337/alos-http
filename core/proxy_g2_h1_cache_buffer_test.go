@@ -80,3 +80,21 @@ func TestProxyH1CacheBufferOverBudgetStreams(t *testing.T) {
 		t.Fatalf("a streamed response kept %d bytes reserved", got)
 	}
 }
+
+func TestProxyBufferReservationReleasesChargedConnAfterDetach(t *testing.T) {
+	pe := &ProxyEngine{}
+	conn := &epollConn{}
+	px := &proxyExchange{c: conn, pe: pe}
+	if !px.reserveResponseBuffer(1 << 20) {
+		t.Fatalf("reservation refused")
+	}
+	px.c = nil
+	px.discardH2Buffer()
+	if conn.h2ProxyBuffered != 0 || pe.h2Buffered.Load() != 0 {
+		t.Fatalf("after detach the connection holds %d and the server %d reserved bytes", conn.h2ProxyBuffered, pe.h2Buffered.Load())
+	}
+	detached := &proxyExchange{pe: pe}
+	if detached.reserveResponseBuffer(1) {
+		t.Fatalf("an exchange without a client connection reserved budget")
+	}
+}

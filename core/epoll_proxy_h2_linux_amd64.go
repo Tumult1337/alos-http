@@ -219,7 +219,7 @@ func (w *epollWorker) refuseResponse(c *backendConn, px *proxyExchange, r proxyR
 
 func (px *proxyExchange) reserveResponseBuffer(n int64) bool {
 	c := px.c
-	if c.h2ProxyBuffered+n > proxyH2ConnBufferBudget {
+	if c == nil || c.h2ProxyBuffered+n > proxyH2ConnBufferBudget {
 		return false
 	}
 	if px.pe.h2Buffered.Add(n) > proxyH2ServerBufferBudget {
@@ -228,6 +228,7 @@ func (px *proxyExchange) reserveResponseBuffer(n int64) bool {
 	}
 	c.h2ProxyBuffered += n
 	px.h2Reserved += n
+	px.budgetConn = c
 	return true
 }
 
@@ -239,9 +240,8 @@ func (px *proxyExchange) discardH2Buffer() {
 	if px.h2Reserved == 0 {
 		return
 	}
-	if px.c != nil {
-		px.c.h2ProxyBuffered -= px.h2Reserved
-	}
+	px.budgetConn.h2ProxyBuffered -= px.h2Reserved
+	px.budgetConn = nil
 	px.pe.h2Buffered.Add(-px.h2Reserved)
 	px.h2Reserved = 0
 }

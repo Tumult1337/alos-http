@@ -69,6 +69,7 @@ type proxyExchange struct {
 
 	h2Body     []byte
 	h2Reserved int64
+	budgetConn *epollConn
 	h2Expected int64
 	refusal    proxyRefusal
 	h2Streamed bool
