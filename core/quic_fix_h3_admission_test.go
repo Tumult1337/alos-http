@@ -228,7 +228,7 @@ func TestQUICFixH3StopSendingOfAHeldResponseAdmitsTheWaitingRequest(t *testing.T
 
 func TestQUICFixH3StallResetOnTheTimerAdmitsTheWaitingRequest(t *testing.T) {
 	p, fast := newQUICFixGatedWritePeer(t)
-	p.qc.stallSoftCap = quicFixAdmitPendingCap / 2
+	p.qc.stallSoftCap.Store(quicFixAdmitPendingCap / 2)
 	now := turbo.UnixNano()
 	p.backdateStall(0, quicFixStallTimeoutPlus)
 	p.qc.lastSendProgress.Store(now - int64(quicFixStallTimeoutPlus))

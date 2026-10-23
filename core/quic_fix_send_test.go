@@ -74,10 +74,10 @@ func (p *quicTestPeer) pendingResponseBytes() (pending int, resets int) {
 }
 
 func (p *quicTestPeer) admitTogether(send func()) {
-	softCap := p.qc.stallSoftCap
-	p.qc.stallSoftCap = math.MaxInt64
+	softCap := p.qc.stallSoftCap.Load()
+	p.qc.stallSoftCap.Store(math.MaxInt64)
 	send()
-	p.qc.stallSoftCap = softCap
+	p.qc.stallSoftCap.Store(softCap)
 }
 
 func (p *quicTestPeer) awaitAdmissionSettled() {

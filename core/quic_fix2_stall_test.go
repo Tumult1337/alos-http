@@ -32,8 +32,8 @@ func TestQUICFix2SendStallResetsStreamsNotConn(t *testing.T) {
 		}
 	})
 	p.awaitHandlersIdle()
-	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap {
-		t.Fatalf("precondition: %d stalled bytes, want more than the %d soft cap", held, p.qc.stallSoftCap)
+	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap.Load() {
+		t.Fatalf("precondition: %d stalled bytes, want more than the %d soft cap", held, p.qc.stallSoftCap.Load())
 	}
 	p.qc.peerStreamWindow = quicFixBigResponse
 	now := turbo.UnixNano() + int64(quicFixStallTimeoutPlus)

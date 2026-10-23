@@ -505,10 +505,13 @@ func (ls *quicLossState) ptoExpiredFrames(space, limit int) [][]byte {
 	}
 	ls.sent[space] = remaining
 	ls.resetLiveIndex(space)
-	if len(frames) > 0 {
-		ls.ptoCount++
-	}
 	return frames
+}
+
+func (ls *quicLossState) backoffPTO() {
+	ls.mu.Lock()
+	ls.ptoCount++
+	ls.mu.Unlock()
 }
 
 func max64(a, b time.Duration) time.Duration {

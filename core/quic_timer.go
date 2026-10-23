@@ -143,15 +143,17 @@ func (qc *QUICConn) tick(now int64, checkIdle bool) {
 		qc.closeWithAppError(h3ErrNoError, "")
 		return
 	}
-	if !qc.handshakeDone.Load() {
-		qc.probeHandshakeSpaces()
-	}
+	probed := !qc.handshakeDone.Load() && qc.probeHandshakeSpaces()
 	if !qc.timerWork.Swap(false) {
 		return
 	}
 	qc.flushPendingAck(quicSpaceAppData)
 	for _, frames := range qc.loss.ptoExpiredFrames(quicSpaceAppData, 0) {
 		qc.sendFrames(quicSpaceAppData, frames, true)
+		probed = true
+	}
+	if probed {
+		qc.loss.backoffPTO()
 	}
 	qc.writeMu.Lock()
 	if len(qc.coalesceEnds) > 0 {

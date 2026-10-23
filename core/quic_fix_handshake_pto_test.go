@@ -309,3 +309,56 @@ func TestQUICFixLostHelloRetryRequestIsResentOnPTO(t *testing.T) {
 		t.Fatalf("after one PTO the server resent %d CRYPTO bytes, want the %d-byte HelloRetryRequest", len(again), len(hrr))
 	}
 }
+
+func (f *quicFixBigFlight) cryptoBySpace(t *testing.T, from int) (initial, handshake int) {
+	t.Helper()
+	for _, raw := range f.pc.snapshot()[from:] {
+		pkt := append([]byte(nil), raw...)
+		for len(pkt) > 0 && quicIsLongHeader(pkt) {
+			hdr, total, err := quicParseLongHeader(pkt)
+			if err != nil {
+				t.Fatalf("server sent an unparseable long header: %v", err)
+			}
+			keys, count := f.handshakeSendKeys, &handshake
+			if hdr.pktType == quicPktInitial {
+				keys, count = f.initialSendKeys, &initial
+			}
+			plain, err := quicDecryptPacket(pkt[:total], &hdr, keys, -1)
+			if err != nil {
+				t.Fatalf("server sent an undecryptable packet: %v", err)
+			}
+			_ = quicParseFrames(plain, &quicFrameVisitor{onCrypto: func(quicCryptoFrame) { *count++ }})
+			pkt = pkt[total:]
+		}
+	}
+	return initial, handshake
+}
+
+func TestQUICFixOnePTOTickProbesBothHandshakeSpacesAndBacksOffOnce(t *testing.T) {
+	f := newQUICFixBigFlight(t, true)
+	base := len(f.pc.snapshot())
+	f.qc.loss.mu.Lock()
+	before := f.qc.loss.ptoCount
+	age := 2 * (f.qc.loss.smoothedRTT + max(4*f.qc.loss.rttVar, quicTimerGranularity))
+	for _, space := range []int{quicSpaceInitial, quicSpaceHandshake} {
+		if len(f.qc.loss.sent[space]) == 0 {
+			f.qc.loss.mu.Unlock()
+			t.Fatalf("fixture tracks no packet in space %d", space)
+		}
+		for i := range f.qc.loss.sent[space] {
+			f.qc.loss.sent[space][i].sent -= int64(age)
+		}
+	}
+	f.qc.loss.mu.Unlock()
+	f.qc.tick(turbo.UnixNano(), false)
+	initial, handshake := f.cryptoBySpace(t, base)
+	if initial == 0 || handshake == 0 {
+		t.Fatalf("one PTO tick probed %d Initial and %d Handshake CRYPTO frames, want both spaces", initial, handshake)
+	}
+	f.qc.loss.mu.Lock()
+	after := f.qc.loss.ptoCount
+	f.qc.loss.mu.Unlock()
+	if after != before+1 {
+		t.Fatalf("PTO backoff went from %d to %d in one tick, want one step", before, after)
+	}
+}

@@ -143,7 +143,7 @@ func (qc *QUICConn) trackStalledSend(s *QUICStream) {
 }
 
 func (qc *QUICConn) sendStalledTooLong(now int64) bool {
-	return qc.stalledSendBytes.Load() > qc.stallSoftCap && time.Duration(now-qc.lastSendProgress.Load()) > quicSendStallTimeout
+	return qc.stalledSendBytes.Load() > qc.stallSoftCap.Load() && time.Duration(now-qc.lastSendProgress.Load()) > quicSendStallTimeout
 }
 
 func (qc *QUICConn) resetStalledStreams(now int64) {
@@ -334,7 +334,7 @@ type QUICConn struct {
 	recvFlowLimit      atomic.Uint64
 	stalledSendBytes   atomic.Int64
 	lastSendProgress   atomic.Int64
-	stallSoftCap       int64
+	stallSoftCap       atomic.Int64
 	stallHardCap       int64
 	activeReqStreams   atomic.Int32
 	bidiStreamsRetired atomic.Uint64
@@ -375,8 +375,9 @@ func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dc
 	qc.handshakeDeadline = quicHandshakeDeadline(server)
 	qc.peerAckDelayExponent = quicDefaultAckDelayExponent
 	qc.recvFlowLimit.Store(maxData)
-	qc.stallSoftCap = quicStalledSendSoftCap(server)
-	qc.stallHardCap = qc.stallSoftCap * quicStalledSendHardFactor
+	softCap := quicStalledSendSoftCap(server)
+	qc.stallSoftCap.Store(softCap)
+	qc.stallHardCap = softCap * quicStalledSendHardFactor
 	qc.maxRunningReqs = min(server.h2MaxRunningHandlers(), quicMaxConcurrentReqStreams)
 
 	qc.workShard = uint8(connShardCounter.Add(1) % reqStreamShards)
@@ -1302,7 +1303,7 @@ func (qc *QUICConn) admitRequestStream(s *QUICStream) {
 }
 
 func (qc *QUICConn) admitsHandlerLocked(pendingWrite int64) bool {
-	return qc.runningReqs < qc.maxRunningReqs && pendingWrite < qc.stallSoftCap
+	return qc.runningReqs < qc.maxRunningReqs && pendingWrite < qc.stallSoftCap.Load()
 }
 
 func (qc *QUICConn) pendingWriteBytes() int64 {
@@ -1948,18 +1949,24 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	}
 }
 
-func (qc *QUICConn) probeHandshakeSpaces() {
+func (qc *QUICConn) probeHandshakeSpaces() bool {
+	var expired [quicSpaceAppData][][]byte
 	for space := quicSpaceInitial; space <= quicSpaceHandshake; space++ {
 		qc.writeMu.Lock()
 		allowed := qc.addressValidated.Load() || qc.ampBudgetLocked() >= quicMaxPacketSize
 		qc.writeMu.Unlock()
-		if !allowed {
-			continue
-		}
-		for _, frames := range qc.loss.ptoExpiredFrames(space, quicPTOProbePackets) {
-			qc.retransmitFrames(space, frames)
+		if allowed {
+			expired[space] = qc.loss.ptoExpiredFrames(space, quicPTOProbePackets)
 		}
 	}
+	probed := false
+	for space, frames := range expired {
+		for _, f := range frames {
+			qc.retransmitFrames(space, f)
+			probed = true
+		}
+	}
+	return probed
 }
 
 func (qc *QUICConn) retransmitFrames(space int, frames []byte) {
