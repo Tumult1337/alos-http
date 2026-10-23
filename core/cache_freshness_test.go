@@ -323,6 +323,8 @@ func TestCache_HostileFreshnessIsNotStored(t *testing.T) {
 		{name: "expires-invalid-no-date", headers: [][2]string{{"Expires", "garbage"}}},
 		{name: "date-year-1", headers: [][2]string{{"Cache-Control", "max-age=3600"}, {"Date", cacheHostileYear1}}},
 		{name: "age-overflow", headers: [][2]string{{"Cache-Control", "max-age=3600"}, {"Age", "99999999999999999999"}}},
+		{name: "date-1700-expires-1900", headers: [][2]string{{"Date", "Fri, 01 Jan 1700 00:00:00 GMT"}, {"Expires", "Mon, 01 Jan 1900 00:00:00 GMT"}}},
+		{name: "date-0001-expires-2000", headers: [][2]string{{"Date", cacheHostileYear1}, {"Expires", "Sat, 01 Jan 2000 00:00:00 GMT"}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

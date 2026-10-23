@@ -132,6 +132,7 @@ func parseCacheFreshness(headers [][2]string, received time.Time) cacheFreshness
 	case f.hasExpires:
 		out.explicit, out.lifetime = true, f.expiresLifetime(base)
 	}
+	out.lifetime = clampCacheAge(out.lifetime)
 	return out
 }
 
