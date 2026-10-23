@@ -34,16 +34,15 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	cache := pe.activeCache()
 	cachePath := fpProxyPath(req)
-	var hookResult *ProxyRequest
 	if cache != nil && cacheableMethod {
 		entry, hit := cache.Get(req.Method, host, cachePath, req)
 		if hit {
-			allowed, rewritten := pe.cacheHitVerdict(ds, req)
+			allowed, serve := pe.cacheHitVerdict(ds, req)
 			if !allowed {
 				resp.Status(502).String("Request blocked by interceptor")
 				return
 			}
-			if rewritten == nil {
+			if serve {
 				cache.ServeCached(entry, req, resp)
 				if onResponse := pe.responseHook(); onResponse != nil {
 					pr := newCacheHitHookResponse(ds, entry, req, resp)
@@ -52,7 +51,6 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 				}
 				return
 			}
-			hookResult = rewritten
 		}
 	}
 
@@ -84,22 +82,19 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 		hostOverride := ds.config.HostHeader
 		storable := true
 		if onRequest := pe.requestHook(); onRequest != nil {
-			pr := hookResult
-			hookResult = nil
-			if pr == nil {
-				pr = &ProxyRequest{
-					Domain:     ds.config.Domain,
-					Backend:    b.Addr,
-					ClientAddr: req.RemoteAddr,
-					Method:     attemptReq.Method,
-					Path:       attemptReq.Path,
-					Headers:    append(make([][2]string, 0, len(req.Headers)), req.Headers...),
-					Host:       hostOverride,
-				}
-				if !onRequest(pr) {
-					resp.Status(502).String("Request blocked by interceptor")
-					return
-				}
+			attemptReq.Headers = append(make([][2]string, 0, len(req.Headers)), req.Headers...)
+			pr := &ProxyRequest{
+				Domain:     ds.config.Domain,
+				Backend:    b.Addr,
+				ClientAddr: req.RemoteAddr,
+				Method:     attemptReq.Method,
+				Path:       attemptReq.Path,
+				Headers:    attemptReq.Headers,
+				Host:       hostOverride,
+			}
+			if !onRequest(pr) {
+				resp.Status(502).String("Request blocked by interceptor")
+				return
 			}
 			storable = !proxyHookChangedRequest(pr, req, hostOverride)
 			attemptReq.Path = pr.Path
@@ -201,19 +196,16 @@ func proxyHookChangedRequest(pr *ProxyRequest, req *Request, host string) bool {
 	return pr.Path != req.Path || pr.Host != host || !slices.Equal(pr.Headers, req.Headers)
 }
 
-func (pe *ProxyEngine) cacheHitVerdict(ds *domainState, req *Request) (allowed bool, rewritten *ProxyRequest) {
+func (pe *ProxyEngine) cacheHitVerdict(ds *domainState, req *Request) (allowed, serve bool) {
 	onRequest := pe.requestHook()
 	if onRequest == nil {
-		return true, nil
+		return true, true
 	}
 	pr := cacheHitProxyRequest(ds, req)
 	if !onRequest(pr) {
-		return false, nil
+		return false, false
 	}
-	if proxyHookChangedRequest(pr, req, ds.config.HostHeader) {
-		return true, pr
-	}
-	return true, nil
+	return true, !proxyHookChangedRequest(pr, req, ds.config.HostHeader)
 }
 
 func cacheHitProxyRequest(ds *domainState, req *Request) *ProxyRequest {

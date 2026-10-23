@@ -32,13 +32,12 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 		promoteRequestStrings(req)
 	}
 
-	var hookResult *ProxyRequest
 	cache := pe.activeCache()
 	if cache != nil && cacheableMethod {
 		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath = proxyRequestTarget(req)
 		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			refusal, rewritten, serve := w.cacheHitVerdict(pe, ds, req)
+			refusal, serve := w.cacheHitVerdict(pe, ds, req)
 			if refusal.status != 0 {
 				admission.release(w.server)
 				refusal.answer(&stream.resp)
@@ -49,7 +48,6 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 				w.serveProxyCacheHit(pe, ds, cache, entry, req, &stream.resp)
 				return proxyStartServed
 			}
-			hookResult = rewritten
 		}
 	}
 
@@ -60,7 +58,6 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 	}
 
 	px := w.pxGet()
-	px.hookResult = hookResult
 	px.admission = admission
 	px.w = w
 	px.c = c
