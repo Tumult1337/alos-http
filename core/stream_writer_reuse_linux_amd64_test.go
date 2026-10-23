@@ -67,7 +67,7 @@ func TestH1StaleStreamWriterCannotWriteIntoNextResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	br := bufio.NewReader(conn)
 	for round := range swReuseRounds {
 		_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
@@ -168,7 +168,7 @@ func TestH1StreamWriterWritesAfterHandlerReturnStayIsolated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	br := bufio.NewReader(conn)
 	for round := range swReuseRounds {
 		_ = conn.SetDeadline(wallDeadline(h2FixCeiling))

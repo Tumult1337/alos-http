@@ -32,7 +32,7 @@ func TestRootGETH1RunsHandlerPerRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
 	br := bufio.NewReader(conn)
 	before := calls.Load()
@@ -110,7 +110,7 @@ func TestH2HalfClosedPeerIsClosedAfterAsyncResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
 	hello := append([]byte(nil), H2ClientPreface[:]...)
 	hello = appendH2Frame(hello, H2FrameSettings, 0, 0, nil)
@@ -143,7 +143,7 @@ func TestH2PeerEOFDuringHandlerStillGetsResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
 	hello := append([]byte(nil), H2ClientPreface[:]...)
 	hello = appendH2Frame(hello, H2FrameSettings, 0, 0, nil)

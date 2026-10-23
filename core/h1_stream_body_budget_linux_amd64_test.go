@@ -87,7 +87,7 @@ func h1StreamPostWait(t *testing.T, addr, path string, body string, waitClose bo
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
 	var req strings.Builder
 	fmt.Fprintf(&req, "POST %s HTTP/1.1\r\nHost: body.test\r\nTransfer-Encoding: chunked\r\n\r\n", path)

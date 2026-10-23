@@ -43,7 +43,7 @@ func benchRootGetH1(b *testing.B, path string) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	r := bufio.NewReaderSize(conn, 64<<10)
 	one := []byte("GET " + path + " HTTP/1.1\r\nHost: bench.test\r\n\r\n")
 	batch := bytes.Repeat(one, rootGetBenchBatch)
@@ -81,7 +81,7 @@ func benchRootGetH2(b *testing.B, path string) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	r := bufio.NewReaderSize(conn, 256<<10)
 	var hdr [9]byte
 	hello := append([]byte(nil), H2ClientPreface[:]...)

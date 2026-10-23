@@ -50,7 +50,7 @@ func TestH1DetachedSendfileFailureClosesConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
 	if _, err := io.WriteString(conn, "GET /files/big.bin HTTP/1.1\r\nHost: f.test\r\n\r\n"); err != nil {
 		t.Fatal(err)
