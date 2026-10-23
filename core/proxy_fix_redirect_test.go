@@ -53,7 +53,7 @@ func proxyFixRedirectRoundTrip(addr string) bool {
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(proxyFixIOTimeout))
-	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: "+proxyFixTLSDomain+"\r\n\r\n"); err != nil {
+	if _, err := io.WriteString(c, "GET / HTTP/1.1\r\nHost: a|b\r\n\r\n"); err != nil {
 		return false
 	}
 	_, err = io.Copy(io.Discard, c)
