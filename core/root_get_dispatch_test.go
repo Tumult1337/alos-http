@@ -4,6 +4,8 @@ package core
 
 import (
 	"bufio"
+	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -94,5 +96,36 @@ func TestRootGETH2HonorsZeroStreamWindow(t *testing.T) {
 	n, ended, err := rc.readStreamBody(1)
 	if err != nil || !ended || n == 0 {
 		t.Fatalf("after WINDOW_UPDATE: body=%d ended=%v err=%v", n, ended, err)
+	}
+}
+
+func TestH2HalfClosedPeerIsClosedAfterAsyncResponse(t *testing.T) {
+	addr := startH2FixServer(t, nil, func(srv *Server) {
+		srv.Router.GET("/slow", func(req *Request, resp *Response) {
+			time.Sleep(h2FixHandlerDelay)
+			resp.Status(200).String("late")
+		})
+	})
+	conn, err := net.DialTimeout("tcp", addr, h2FixCeiling)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
+	hello := append([]byte(nil), H2ClientPreface[:]...)
+	hello = appendH2Frame(hello, H2FrameSettings, 0, 0, nil)
+	hello = appendH2Frame(hello, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 1, h2FixRequestBlock("GET", "/slow"))
+	if _, err := conn.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("server kept a half-closed connection open after its last response: read %d bytes, %v", len(out), err)
+	}
+	if !bytes.Contains(out, []byte("late")) {
+		t.Fatalf("response body missing from %d bytes", len(out))
 	}
 }

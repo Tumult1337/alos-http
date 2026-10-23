@@ -329,6 +329,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		}
 		return c.epollH2DispatchStream(srv, streamID, stream, false, false)
 	}
+	c.armH2BodyWait()
 	st.streams[streamID] = stream
 	stream.State.Store(StreamOpen)
 	if meta.protocolSet || c.worker.streamsH2Body(stream) {
@@ -457,12 +458,61 @@ func (c *epollConn) resetH2Deadline(w *epollWorker) {
 	c.deadline = deadlineFrom(w.readTO)
 }
 
+func (c *epollConn) h2AwaitsBody() bool {
+	if len(c.h2.streams) > 0 {
+		return true
+	}
+	for _, in := range c.h2BodyIn {
+		if !in.tooLarge && in.recvWindow > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *epollConn) armH2BodyWait() {
+	if c.h2BodyDeadline == 0 || !c.h2AwaitsBody() {
+		c.h2BodyDeadline = deadlineFrom(c.worker.readTO)
+	}
+}
+
+func (c *epollConn) noteH2BodyProgress() {
+	c.h2BodyDeadline = deadlineFrom(c.worker.readTO)
+}
+
+func (c *epollConn) noteH2SendProgress() {
+	if c.h2SendDeadline != 0 {
+		c.h2SendDeadline = deadlineFrom(c.worker.writeTO)
+	}
+}
+
+func (c *epollConn) h2ProgressExpired(now int64) bool {
+	if c.h2BodyDeadline != 0 && now > c.h2BodyDeadline {
+		if c.h2AwaitsBody() {
+			return true
+		}
+		c.h2BodyDeadline = 0
+	}
+	if c.h2SendDeadline != 0 && now > c.h2SendDeadline {
+		if c.h2.sendingBytes > 0 {
+			return true
+		}
+		c.h2SendDeadline = 0
+	}
+	return false
+}
+
 func (c *epollConn) h2Idle() bool {
 	return c.h2Quiescent() && c.h2.expectContinuation == 0 && !c.unparsedInput()
 }
 
+func (c *epollConn) h2AnswersAfterEOF() bool {
+	st := &c.h2
+	return c.speaksH2() && (c.inFlight > 0 || len(st.sending) > 0 || len(st.waiting) > 0 || len(c.h2Streaming) > 0)
+}
+
 func (c *epollConn) h2PeerLeft() bool {
-	return c.h2.peerGoingAway && c.speaksH2() && c.h2Quiescent()
+	return c.speaksH2() && c.h2Quiescent() && (c.h2.peerGoingAway || c.peerHup && !c.unparsedInput())
 }
 
 func (c *epollConn) epollH2Trailers(srv *Server, streamID uint32, headerBlock []byte, endStream bool) bool {
@@ -569,6 +619,7 @@ func (c *epollConn) epollH2Data(srv *Server, streamID uint32, frameFlags byte, p
 		stream.bodyConn = &st.bodyReserved
 		stream.bodyAccounted += int64(len(payload))
 		stream.Body = append(stream.Body, payload...)
+		c.noteH2BodyProgress()
 		if stream.declaredLen >= 0 && int64(len(stream.Body)) > stream.declaredLen {
 			return c.rejectH2Body(streamID)
 		}
@@ -1091,6 +1142,9 @@ func (c *epollConn) h2SettleParked(w *epollWorker, streamID uint32, stream *H2St
 	if stream.Window.Load() <= 0 || st.connWindow <= 0 {
 		stall = pending
 	}
+	if st.sendingBytes == 0 && stall > 0 {
+		c.h2SendDeadline = deadlineFrom(w.writeTO)
+	}
 	st.sendingBytes += int64(stall - stream.stallBytes)
 	stream.stallBytes = stall
 	st.parkedBytes += int64(pending - stream.parkedBytes)
@@ -1194,6 +1248,7 @@ func (c *epollConn) h2DataChunk(stream *H2Stream, bodyLen, frameLimit int) (int,
 }
 
 func (c *epollConn) h2ConsumeData(stream *H2Stream, n int) {
+	c.noteH2SendProgress()
 	stream.respOff += n
 	c.h2.connWindow -= int64(n)
 	stream.Window.Add(-int64(n))

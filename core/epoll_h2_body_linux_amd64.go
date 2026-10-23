@@ -69,6 +69,7 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 		} else if !c.h2BufferBody(in, payload) {
 			return false
 		}
+		c.noteH2BodyProgress()
 	}
 	if endStream {
 		if !in.tooLarge && h2LengthMismatch(in.declared, in.received) {
@@ -118,6 +119,9 @@ func (c *epollConn) h2BodyAcked(w *epollWorker, in *h2BodyIn, gen uint32) {
 	frame := appendH2WindowUpdateFrame(w.h2FinishScratch[:0], in.streamID, uint32(n))
 	c.emitH2(frame)
 	w.h2FinishScratch = frame[:0]
+	if in.recvWindow <= 0 {
+		c.noteH2BodyProgress()
+	}
 	in.recvWindow += int64(n)
 	w.markFlush(c)
 }

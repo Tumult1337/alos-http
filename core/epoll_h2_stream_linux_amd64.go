@@ -417,7 +417,7 @@ func (c *epollConn) h2DropUnusedWriter(sw *epollH2StreamWriter) {
 
 func (c *epollConn) h2PumpAll(w *epollWorker) bool {
 	if len(c.h2Streaming) == 0 {
-		return (len(c.h2.sending) != 0 || c.h2.peerGoingAway) && c.h2PumpBuffered()
+		return (len(c.h2.sending) != 0 || c.h2.peerGoingAway || c.peerHup) && c.h2PumpBuffered()
 	}
 	before, directBefore := len(c.writeBuf), c.h2.directSent
 	for _, sw := range c.h2Streaming {

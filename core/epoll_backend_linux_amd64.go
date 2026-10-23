@@ -124,6 +124,8 @@ type epollConn struct {
 	reqBodyCopy     []byte
 	h1BodyAccounted int64
 	h1BodyDeadline  int64
+	h2BodyDeadline  int64
+	h2SendDeadline  int64
 	chunkScanPos    int
 	h2GoingAway     bool
 
@@ -1110,7 +1112,7 @@ func (w *epollWorker) sweepDeadlines() {
 		if c == nil || c.fd < 0 {
 			continue
 		}
-		if c.deadline != 0 && now > c.deadline {
+		if c.deadline != 0 && now > c.deadline || c.h2ProgressExpired(now) {
 			w.closeConn(c)
 			continue
 		}
@@ -1239,6 +1241,7 @@ func (w *epollWorker) acceptLoop() {
 		c.h1Off = 0
 		c.chunkScanPos = 0
 		c.h1BodyDeadline = 0
+		c.h2BodyDeadline, c.h2SendDeadline = 0, 0
 		c.h2GoingAway = false
 		if w.tlsMode {
 			c.deadline = deadlineFrom(w.handshakeTO)
@@ -1439,7 +1442,7 @@ func (w *epollWorker) readOnce(c *epollConn, peerClosed bool) (readAgain bool) {
 		c.writeBuf = w.acquireWriteBuf()
 	}
 	maxRead := w.server.effectiveReadCap()
-	prevReadN := c.readN
+	prevBuffered := c.bufferedInput()
 	closed := false
 	bufferFull := false
 	for {
@@ -1492,7 +1495,7 @@ func (w *epollWorker) readOnce(c *epollConn, peerClosed bool) (readAgain bool) {
 		w.closeConn(c)
 		return false
 	}
-	if prevReadN == 0 && c.readN > 0 {
+	if prevBuffered == 0 && c.bufferedInput() > 0 {
 		keepDeadline := c.tls && c.deadline != 0 && (c.phase != tlsConnPhaseApplication && c.phase != tlsConnPhaseH2Native || len(c.appBuf) > 0)
 		if !keepDeadline {
 			c.deadline = c.inputDeadline(deadlineFrom(w.nextReadTimeout(c)))
@@ -1628,10 +1631,11 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		c.peerHup = c.peerHup || closed || peerClosed
 		return
 	}
-	if closed {
+	if closed && !c.h2AnswersAfterEOF() {
 		w.closeConn(c)
 		return
 	}
+	c.peerHup = c.peerHup || closed
 	if c.fd < 0 {
 		return
 	}
@@ -1960,6 +1964,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.tlsUselessRecords = 0
 	c.cipherOff = 0
 	c.h2GoingAway = false
+	c.h2BodyDeadline, c.h2SendDeadline = 0, 0
 	c.appBufOff = 0
 	if c.appBuf != nil {
 		c.appBuf = c.appBuf[:0]
