@@ -157,26 +157,24 @@ func (c *epollConn) h1SealFile(sw *epollH1StreamWriter) {
 	bp := FileReadBufPool.Get().(*[]byte)
 	buf := (*bp)[:min(len(*bp), h1SealFileChunk)]
 	for room > 0 && sw.fileLeft > 0 {
-		n, err := preadNoWait(sw.fileFD, buf[:min(int64(len(buf)), int64(room), sw.fileLeft)], sw.fileOff)
-		if err == unix.EAGAIN {
-			sw.fileNeedIO = true
-			break
-		}
+		chunk := buf[:min(int64(len(buf)), int64(room), sw.fileLeft)]
+		iov := [1]unix.Iovec{{Base: &chunk[0]}}
+		iov[0].SetLen(len(chunk))
+		n, err := preadvAll(sw.fileFD, iov[:], sw.fileOff, unix.RWF_NOWAIT)
 		if n > 0 {
 			c.writeBuf = c.sealTLSAppData(c.writeBuf, buf[:n])
 			sw.fileOff += int64(n)
 			sw.fileLeft -= int64(n)
 			room -= n
-			continue
 		}
-		if err == unix.EINTR {
-			continue
+		if err == unix.EAGAIN {
+			sw.fileNeedIO = true
+			break
 		}
-		if err == nil {
-			err = io.ErrUnexpectedEOF
+		if err != nil {
+			sw.failFile(err)
+			break
 		}
-		sw.failFile(err)
-		break
 	}
 	FileReadBufPool.Put(bp)
 }
@@ -201,10 +199,33 @@ func (sw *epollH1StreamWriter) warmFileLocked() {
 	sw.mu.Lock()
 }
 
-func preadNoWait(fd int, buf []byte, off int64) (int, error) {
-	iov := [1]unix.Iovec{{Base: &buf[0]}}
-	iov[0].SetLen(len(buf))
-	return preadvFlags(fd, iov[:], off, unix.RWF_NOWAIT)
+func preadvAll(fd int, iov []unix.Iovec, off int64, flags int) (int, error) {
+	total := 0
+	for {
+		for len(iov) > 0 && iov[0].Len == 0 {
+			iov = iov[1:]
+		}
+		if len(iov) == 0 {
+			return total, nil
+		}
+		n, err := preadvFlags(fd, iov, off, flags)
+		if err != nil {
+			return total, err
+		}
+		if n == 0 {
+			return total, io.ErrUnexpectedEOF
+		}
+		total += n
+		off += int64(n)
+		for len(iov) > 0 && n >= int(iov[0].Len) {
+			n -= int(iov[0].Len)
+			iov = iov[1:]
+		}
+		if n > 0 {
+			iov[0].Base = (*byte)(unsafe.Add(unsafe.Pointer(iov[0].Base), n))
+			iov[0].SetLen(int(iov[0].Len) - n)
+		}
+	}
 }
 
 func preadvFlags(fd int, iov []unix.Iovec, off int64, flags int) (int, error) {
@@ -230,15 +251,12 @@ func warmFileRange(fd int, off, n int64) error {
 	defer FileReadBufPool.Put(bp)
 	buf := *bp
 	for n > 0 {
-		got, err := unix.Pread(fd, buf[:min(int64(len(buf)), n)], off)
-		if err == unix.EINTR {
-			continue
-		}
+		chunk := buf[:min(int64(len(buf)), n)]
+		iov := [1]unix.Iovec{{Base: &chunk[0]}}
+		iov[0].SetLen(len(chunk))
+		got, err := preadvAll(fd, iov[:], off, 0)
 		if err != nil {
 			return err
-		}
-		if got == 0 {
-			return io.ErrUnexpectedEOF
 		}
 		off += int64(got)
 		n -= int64(got)
