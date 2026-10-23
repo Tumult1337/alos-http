@@ -37,6 +37,7 @@ type BodyReader struct {
 	budget     *Server
 	budgetConn *atomic.Int64
 	held       int64
+	regrant    bool
 
 	deadlineAt    int64
 	deadlineHit   bool
@@ -75,7 +76,7 @@ func (b *BodyReader) Read(p []byte) (int, error) {
 		b.buf, b.off = b.buf[:0], 0
 	}
 	b.unacked += n
-	released := b.releaseHeldLocked(int64(n))
+	released := b.releaseConsumedLocked(n)
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
 	b.budget.releaseConnBodyBytes(b.budgetConn, released)
@@ -95,9 +96,10 @@ func (b *BodyReader) Close() error {
 		return nil
 	}
 	b.closed = true
-	b.unacked += len(b.buf) - b.off
+	dropped := len(b.buf) - b.off
+	b.unacked += dropped
 	b.buf, b.off = nil, 0
-	released := b.releaseHeldLocked(b.held)
+	released := b.releaseConsumedLocked(dropped)
 	b.stopDeadlineLocked()
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
@@ -171,28 +173,49 @@ func (b *BodyReader) chargeBudget(srv *Server, conn *atomic.Int64) {
 }
 
 func (b *BodyReader) reservePush(data []byte) bool {
-	if b.budget != nil && !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
-		return false
-	}
-	b.pushCharged(data)
-	return true
-}
-
-func (b *BodyReader) forcePush(data []byte) {
-	if b.budget != nil && !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
-		b.budget.forceReserveConnBodyBytes(b.budgetConn, len(data))
-	}
-	b.pushCharged(data)
-}
-
-func (b *BodyReader) pushCharged(data []byte) {
 	if b.budget == nil {
 		b.push(data)
-		return
+		return true
+	}
+	if !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
+		return false
 	}
 	if !b.pushReserved(data, int64(len(data))) {
 		b.budget.releaseConnBodyBytes(b.budgetConn, int64(len(data)))
 	}
+	return true
+}
+
+func (b *BodyReader) reserveWindow(window int64) bool {
+	if b.budget != nil && !b.budget.tryReserveConnBodyBytes(b.budgetConn, int(window)) {
+		return false
+	}
+	b.mu.Lock()
+	if b.budget != nil {
+		b.held += max(window, 0)
+	}
+	b.regrant = true
+	b.mu.Unlock()
+	return true
+}
+
+func (b *BodyReader) endWindow(window int64) {
+	b.mu.Lock()
+	released := int64(0)
+	if b.regrant {
+		b.regrant = false
+		released = b.releaseHeldLocked(max(window, 0) + int64(b.unacked))
+		b.unacked = 0
+	}
+	b.mu.Unlock()
+	b.budget.releaseConnBodyBytes(b.budgetConn, released)
+}
+
+func (b *BodyReader) releaseConsumedLocked(n int) int64 {
+	if b.regrant {
+		return 0
+	}
+	return b.releaseHeldLocked(int64(n))
 }
 
 func (b *BodyReader) pushReserved(data []byte, reserved int64) bool {

@@ -1537,14 +1537,6 @@ func (s *Server) tryReserveConnBodyBytes(connReserved *atomic.Int64, n int) bool
 	return true
 }
 
-func (s *Server) forceReserveConnBodyBytes(connReserved *atomic.Int64, n int) {
-	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
-		return
-	}
-	connReserved.Add(int64(n))
-	s.inFlightBodyBytes.Add(int64(n))
-}
-
 func (s *Server) releaseConnBodyBytes(connReserved *atomic.Int64, n int64) {
 	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
 		return

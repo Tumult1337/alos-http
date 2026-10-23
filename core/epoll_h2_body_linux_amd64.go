@@ -12,7 +12,7 @@ type h2BodyIn struct {
 	declared   int64
 	tooLarge   bool
 	tunnel     bool
-	queued     bool
+	windowHeld bool
 }
 
 func (w *epollWorker) streamsH2Body(stream *H2Stream) bool {
@@ -48,7 +48,6 @@ func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
 	if in == nil {
 		in = c.openH2BodyIn(w, stream)
 	}
-	in.queued = false
 	stream.waitBody = nil
 	stream.req.Body = nil
 	stream.req.bodyStream = in.reader
@@ -92,12 +91,13 @@ func (c *epollConn) h2EndBodyIn(in *h2BodyIn, err error) {
 		in.reader.abort(err)
 		return
 	}
+	in.reader.endWindow(in.recvWindow)
 	in.reader.finish(nil)
 }
 
 func (c *epollConn) h2BufferBody(in *h2BodyIn, payload []byte) bool {
-	if !in.queued {
-		in.reader.forcePush(payload)
+	if in.windowHeld {
+		in.reader.push(payload)
 		return true
 	}
 	if in.reader.reservePush(payload) {
@@ -107,9 +107,22 @@ func (c *epollConn) h2BufferBody(in *h2BodyIn, payload []byte) bool {
 	return false
 }
 
+func (c *epollConn) h2ReserveBodyWindow(stream *H2Stream) bool {
+	in := stream.waitBody
+	if in == nil || in.windowHeld || c.h2BodyIn[in.streamID] != in {
+		return true
+	}
+	if !in.reader.reserveWindow(in.recvWindow) {
+		c.h2.budgetBlocked = true
+		return false
+	}
+	in.windowHeld = true
+	return true
+}
+
 func (c *epollConn) h2ResetBodyIn(in *h2BodyIn, errCode uint32) {
 	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, in.streamID, errCode)
-	if in.queued {
+	if _, waiting := c.h2.findWaiting(in.streamID); waiting != nil {
 		c.abandonH2Stream(in.streamID, ErrStreamClosed)
 		return
 	}

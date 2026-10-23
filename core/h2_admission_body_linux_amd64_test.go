@@ -86,52 +86,6 @@ func TestH2AdmissionWaitingTunnelBodiesStayInBodyBudget(t *testing.T) {
 	}
 }
 
-func TestH2AdmissionRunningStreamedBodyKeepsFlowControl(t *testing.T) {
-	for _, endStream := range []bool{false, true} {
-		t.Run("endStream="+strconv.FormatBool(endStream), func(t *testing.T) {
-			h2AdmissionRunningStreamedBody(t, endStream)
-		})
-	}
-}
-
-func h2AdmissionRunningStreamedBody(t *testing.T, endStream bool) {
-	b := newH2AdmitBlocker(t)
-	addr, srv := startH2FixServerWith(t, func(c *Config) {
-		c.MaxInFlightBodyBytes = h2AdmitBodyBudget
-		c.StreamBodyAbove = 1
-	}, func(srv *Server) {
-		srv.Router.POST("/sink", b.handle)
-	})
-	rc := h2RawDial(t, addr, h2FixSettings())
-	rc.write(H2FrameWindowUpdate, 0, 0, h2FixWindowIncrement(h2FixMaxWindow-H2DefaultWindowSize))
-	_ = rc.conn.SetDeadline(wallDeadline(h2AdmitBurstDeadline))
-	want := make(map[uint32]bool, h2AdmitBodyStreams)
-	for i := range h2AdmitBodyStreams {
-		id := uint32(2*i + 1)
-		want[id] = true
-		rc.write(H2FrameHeaders, H2FlagEndHeaders, id, hpackBlock(
-			[2]string{":method", "POST"}, [2]string{":scheme", "http"},
-			[2]string{":path", "/sink"}, [2]string{":authority", h2FixAuthority}))
-		h2AdmitSendBody(rc, id, h2AdmitBodyPerStream, endStream)
-	}
-	if !h2FixPollUntil(func() bool { return b.running.Load() == h2AdmitBodyStreams }) {
-		t.Fatalf("%d of %d handlers run", b.running.Load(), h2AdmitBodyStreams)
-	}
-	total := int64(h2AdmitBodyStreams * h2AdmitBodyPerStream)
-	if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == total }) {
-		t.Fatalf("budget counts %d unread body bytes inside the stream windows, want %d", srv.inFlightBodyBytes.Load(), total)
-	}
-	bound := int64(srv.h2MaxRunningHandlers()) * int64(srv.h2InitialWindow())
-	if state := h2AdmissionProbe(t, srv); int64(state.held) > bound || (!endStream && int64(state.held) != total) {
-		t.Fatalf("running handlers hold %d body bytes, want %d and at most %d", state.held, total, bound)
-	}
-	b.open()
-	rc.h2AdmitCollect(t, want, 0)
-	if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == 0 }) {
-		t.Fatalf("finished handlers still hold %d body bytes", srv.inFlightBodyBytes.Load())
-	}
-}
-
 func TestH2AdmissionStreamedBodyBudgetReleasesOnRead(t *testing.T) {
 	const total = 3 * h2AdmitBodyBudget
 	const step = h2AdmitBodyPerStream / 4
@@ -139,7 +93,6 @@ func TestH2AdmissionStreamedBodyBudgetReleasesOnRead(t *testing.T) {
 	addr, srv := startH2FixServerWith(t, func(c *Config) {
 		c.MaxInFlightBodyBytes = h2AdmitBodyBudget
 		c.StreamBodyAbove = 1
-		c.H2InitialWindowSize = 2 * total
 		c.MaxBodySize = 2 * total
 	}, func(srv *Server) {
 		srv.Router.POST("/read", func(req *Request, resp *Response) {
@@ -342,8 +295,11 @@ func TestH2AdmissionAbortReleasesUnreadStreamedBody(t *testing.T) {
 				[2]string{":method", "POST"}, [2]string{":scheme", "http"},
 				[2]string{":path", "/sink"}, [2]string{":authority", h2FixAuthority}))
 			h2AdmitSendBody(rc, 1, h2AdmitBodyPerStream, false)
-			if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == h2AdmitBodyPerStream && b.running.Load() == 1 }) {
-				t.Fatalf("unread body holds %d budget bytes, want %d", srv.inFlightBodyBytes.Load(), h2AdmitBodyPerStream)
+			window := int64(srv.h2InitialWindow())
+			if !h2FixPollUntil(func() bool {
+				return srv.inFlightBodyBytes.Load() == window && b.running.Load() == 1 && h2AdmissionProbe(t, srv).held == h2AdmitBodyPerStream
+			}) {
+				t.Fatalf("running upload holds %d budget bytes, want its stream window %d", srv.inFlightBodyBytes.Load(), window)
 			}
 			end(rc)
 			if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == 0 }) {

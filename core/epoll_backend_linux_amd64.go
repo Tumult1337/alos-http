@@ -1116,6 +1116,9 @@ func (w *epollWorker) sweepDeadlines() {
 		if c.holdsIdleBuffers() && now-(c.deadline-w.idleTO) >= int64(epollSweepIntervalMs)*1_000_000 {
 			w.releaseIdleBuffers(c)
 		}
+		if c.h2.budgetBlocked {
+			c.h2AdmitWaiting()
+		}
 	}
 }
 

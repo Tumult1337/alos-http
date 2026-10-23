@@ -46,10 +46,11 @@ type tlsWorkerH2State struct {
 	headerAccum        []byte
 	headersBuf         [][2]string
 
-	sending   map[uint32]*H2Stream
-	busy      *H2Stream
-	waiting   []*H2Stream
-	admitting bool
+	sending       map[uint32]*H2Stream
+	busy          *H2Stream
+	waiting       []*H2Stream
+	admitting     bool
+	budgetBlocked bool
 
 	rstCount     int
 	rstWindow    int64
@@ -401,6 +402,7 @@ func (st *tlsWorkerH2State) releaseWaiting() {
 	}
 	st.waiting = st.waiting[:0]
 	st.admitting = false
+	st.budgetBlocked = false
 }
 
 func (st *tlsWorkerH2State) releaseSending(id uint32, stream *H2Stream) {
