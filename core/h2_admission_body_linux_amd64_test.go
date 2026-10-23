@@ -62,6 +62,7 @@ func TestH2AdmissionWaitingTunnelBodiesStayInBodyBudget(t *testing.T) {
 	rc := h2RawDialRecvBuf(t, addr, h2FixSettings([2]uint32{uint32(H2SettingInitialWindowSize), h2FixMaxWindow}), perfH2ParkReadBuffer)
 	_ = rc.conn.SetDeadline(wallDeadline(h2AdmitBurstDeadline))
 	first := h2AdmitStallConn(t, rc, srv)
+	sampler := startH2BudgetSampler(srv, h2ConnBodyCounter(t, srv))
 	for i := range h2AdmitBodyStreams {
 		id := first + uint32(2*i)
 		rc.write(H2FrameHeaders, H2FlagEndHeaders, id, hpackBlock(
@@ -83,6 +84,9 @@ func TestH2AdmissionWaitingTunnelBodiesStayInBodyBudget(t *testing.T) {
 	}
 	if int64(state.held) != srv.inFlightBodyBytes.Load() {
 		t.Fatalf("held %d body bytes but the budget counts %d", state.held, srv.inFlightBodyBytes.Load())
+	}
+	if peakServer, peakConn := sampler.finish(); peakServer > h2AdmitBodyBudget || peakConn > h2AdmitBodyBudget {
+		t.Fatalf("body counters peaked at server %d and connection %d, MaxInFlightBodyBytes %d", peakServer, peakConn, h2AdmitBodyBudget)
 	}
 }
 
@@ -295,11 +299,10 @@ func TestH2AdmissionAbortReleasesUnreadStreamedBody(t *testing.T) {
 				[2]string{":method", "POST"}, [2]string{":scheme", "http"},
 				[2]string{":path", "/sink"}, [2]string{":authority", h2FixAuthority}))
 			h2AdmitSendBody(rc, 1, h2AdmitBodyPerStream, false)
-			window := int64(srv.h2InitialWindow())
 			if !h2FixPollUntil(func() bool {
-				return srv.inFlightBodyBytes.Load() == window && b.running.Load() == 1 && h2AdmissionProbe(t, srv).held == h2AdmitBodyPerStream
+				return srv.inFlightBodyBytes.Load() == h2AdmitBodyPerStream && b.running.Load() == 1 && h2AdmissionProbe(t, srv).held == h2AdmitBodyPerStream
 			}) {
-				t.Fatalf("running upload holds %d budget bytes, want its stream window %d", srv.inFlightBodyBytes.Load(), window)
+				t.Fatalf("running upload holds %d budget bytes, want %d", srv.inFlightBodyBytes.Load(), h2AdmitBodyPerStream)
 			}
 			end(rc)
 			if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == 0 }) {

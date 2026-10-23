@@ -37,7 +37,6 @@ type BodyReader struct {
 	budget     *Server
 	budgetConn *atomic.Int64
 	held       int64
-	regrant    bool
 
 	deadlineAt    int64
 	deadlineHit   bool
@@ -76,7 +75,7 @@ func (b *BodyReader) Read(p []byte) (int, error) {
 		b.buf, b.off = b.buf[:0], 0
 	}
 	b.unacked += n
-	released := b.releaseConsumedLocked(n)
+	released := b.releaseHeldLocked(int64(n))
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
 	b.budget.releaseConnBodyBytes(b.budgetConn, released)
@@ -99,7 +98,7 @@ func (b *BodyReader) Close() error {
 	dropped := len(b.buf) - b.off
 	b.unacked += dropped
 	b.buf, b.off = nil, 0
-	released := b.releaseConsumedLocked(dropped)
+	released := b.releaseHeldLocked(int64(dropped))
 	b.stopDeadlineLocked()
 	notify := b.claimAckLocked()
 	b.mu.Unlock()
@@ -184,38 +183,6 @@ func (b *BodyReader) reservePush(data []byte) bool {
 		b.budget.releaseConnBodyBytes(b.budgetConn, int64(len(data)))
 	}
 	return true
-}
-
-func (b *BodyReader) reserveWindow(window int64) bool {
-	if b.budget != nil && !b.budget.tryReserveConnBodyBytes(b.budgetConn, int(window)) {
-		return false
-	}
-	b.mu.Lock()
-	if b.budget != nil {
-		b.held += max(window, 0)
-	}
-	b.regrant = true
-	b.mu.Unlock()
-	return true
-}
-
-func (b *BodyReader) endWindow(window int64) {
-	b.mu.Lock()
-	released := int64(0)
-	if b.regrant {
-		b.regrant = false
-		released = b.releaseHeldLocked(max(window, 0) + int64(b.unacked))
-		b.unacked = 0
-	}
-	b.mu.Unlock()
-	b.budget.releaseConnBodyBytes(b.budgetConn, released)
-}
-
-func (b *BodyReader) releaseConsumedLocked(n int) int64 {
-	if b.regrant {
-		return 0
-	}
-	return b.releaseHeldLocked(int64(n))
 }
 
 func (b *BodyReader) pushReserved(data []byte, reserved int64) bool {

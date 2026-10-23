@@ -1476,13 +1476,6 @@ func (s *Server) tryReserveBodyBytes(n int) bool {
 	if int64(n) > limit {
 		return false
 	}
-	if limit <= bodyBudgetAddPathMaxLimit {
-		if s.inFlightBodyBytes.Add(int64(n)) > limit {
-			s.inFlightBodyBytes.Add(-int64(n))
-			return false
-		}
-		return true
-	}
 	for {
 		used := s.inFlightBodyBytes.Load()
 		if int64(n) > limit-used {
@@ -1506,7 +1499,6 @@ func (s *Server) releaseBodyBytes(n int64) {
 const (
 	bodyBudgetConnShareDivisor = 8
 	bodyBudgetPressureDivisor  = 2
-	bodyBudgetAddPathMaxLimit  = 1 << 40
 )
 
 func (s *Server) connBodyShare() int64 {
@@ -1526,14 +1518,13 @@ func (s *Server) tryReserveConnBodyBytes(connReserved *atomic.Int64, n int) bool
 	if n <= 0 || s == nil || s.config.MaxInFlightBodyBytes < 0 {
 		return true
 	}
-	if connReserved.Add(int64(n)) > s.connBodyShare() && s.bodyBudgetUnderPressure(n) {
-		connReserved.Add(-int64(n))
+	if connReserved.Load()+int64(n) > s.connBodyShare() && s.bodyBudgetUnderPressure(n) {
 		return false
 	}
 	if !s.tryReserveBodyBytes(n) {
-		connReserved.Add(-int64(n))
 		return false
 	}
+	connReserved.Add(int64(n))
 	return true
 }
 

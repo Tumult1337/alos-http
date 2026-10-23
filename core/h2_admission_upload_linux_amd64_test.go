@@ -14,9 +14,10 @@ import (
 )
 
 const (
-	h2UploadStreams = 20
-	h2UploadSize    = 4 << 20
-	h2UploadWaiters = 8
+	h2AdmitBudgetUpload = 3 * h2AdmitBodyPerStream
+	h2UploadStreams     = 20
+	h2UploadSize        = 4 << 20
+	h2UploadWaiters     = 8
 )
 
 func h2UploadHeaders(rc *h2RawConn, id uint32, path string, size int) {
@@ -28,6 +29,7 @@ func h2UploadHeaders(rc *h2RawConn, id uint32, path string, size int) {
 func (rc *h2RawConn) h2UploadOutcomes(t *testing.T, want map[uint32]bool) (map[uint32]string, map[uint32]uint32) {
 	t.Helper()
 	bodies, resets := map[uint32]string{}, map[uint32]uint32{}
+	ended := map[uint32]bool{}
 	for done := 0; done < len(want); {
 		f, err := rc.tryRead()
 		if err != nil {
@@ -39,6 +41,15 @@ func (rc *h2RawConn) h2UploadOutcomes(t *testing.T, want map[uint32]bool) (map[u
 		if !want[f.streamID] {
 			continue
 		}
+		if _, reset := resets[f.streamID]; reset {
+			t.Fatalf("server sent frame type %d on stream %d after it reset the stream", f.typ, f.streamID)
+		}
+		if ended[f.streamID] {
+			if f.typ == H2FrameRSTStream && binary.BigEndian.Uint32(f.payload) == H2ErrNoError {
+				continue
+			}
+			t.Fatalf("server sent frame type %d on stream %d after its response ended", f.typ, f.streamID)
+		}
 		switch {
 		case f.typ == H2FrameRSTStream:
 			resets[f.streamID] = binary.BigEndian.Uint32(f.payload)
@@ -46,6 +57,7 @@ func (rc *h2RawConn) h2UploadOutcomes(t *testing.T, want map[uint32]bool) (map[u
 		case f.typ == H2FrameData:
 			bodies[f.streamID] += string(f.payload)
 			if f.flags&H2FlagEndStream != 0 {
+				ended[f.streamID] = true
 				done++
 			}
 		}
@@ -161,8 +173,8 @@ func TestH2AdmissionParallelUploadsStayInsideBudget(t *testing.T) {
 		t.Fatalf("body counters peaked at server %d and connection %d, MaxInFlightBodyBytes %d", peakServer, peakConn, budget)
 	}
 	for id, code := range resets {
-		if code != H2ErrRefusedStream {
-			t.Fatalf("stream %d of a client that obeys flow control reset with code %d, want REFUSED_STREAM", id, code)
+		if code != H2ErrEnhanceYourCalm && code != H2ErrRefusedStream {
+			t.Fatalf("stream %d reset with code %d, want ENHANCE_YOUR_CALM or REFUSED_STREAM", id, code)
 		}
 	}
 	accepted := 0
@@ -183,35 +195,93 @@ func TestH2AdmissionParallelUploadsStayInsideBudget(t *testing.T) {
 	}
 }
 
-func TestH2AdmissionBudgetBlockedStreamStartsAfterRelease(t *testing.T) {
+func TestH2AdmissionIdleBodyStreamsHoldNoBudget(t *testing.T) {
+	const idleStreams = 20
 	hold := make(chan struct{})
-	var started atomic.Int64
+	t.Cleanup(func() { close(hold) })
+	var idleRunning atomic.Int64
 	addr, srv := startH2FixServerWith(t, func(c *Config) {
 		c.StreamBodyAbove = 1
 		c.MaxInFlightBodyBytes = h2AdmitBodyBudget
-		c.H2InitialWindowSize = h2AdmitBodyBudget
 	}, func(srv *Server) {
-		srv.Router.POST("/hold", func(req *Request, resp *Response) {
-			started.Add(1)
+		srv.Router.POST("/idle", func(req *Request, resp *Response) {
+			idleRunning.Add(1)
 			<-hold
-			resp.Status(200).String("held")
+			resp.Status(200).String("idle")
+		})
+		srv.Router.POST("/read", func(req *Request, resp *Response) {
+			n, err := io.Copy(io.Discard, req.BodyStream())
+			resp.Status(200).String(strconv.FormatInt(n, 10) + " " + h2AdmitErrText(err))
 		})
 	})
-	first := h2RawDial(t, addr, h2FixSettings())
-	h2UploadHeaders(first, 1, "/hold", h2AdmitBodyPerStream)
-	if !h2FixPollUntil(func() bool { return started.Load() == 1 && srv.inFlightBodyBytes.Load() == h2AdmitBodyBudget }) {
-		t.Fatalf("first upload holds %d budget bytes, want %d", srv.inFlightBodyBytes.Load(), h2AdmitBodyBudget)
+	idle := h2RawDial(t, addr, h2FixSettings())
+	for i := range idleStreams {
+		h2UploadHeaders(idle, uint32(2*i+1), "/idle", h2AdmitBodyPerStream)
 	}
-	second := h2RawDial(t, addr, h2FixSettings())
-	h2UploadHeaders(second, 1, "/hold", h2AdmitBodyPerStream)
-	time.Sleep(h2FixQuietWindow)
-	if got := started.Load(); got != 1 {
-		t.Fatalf("%d uploads started with the budget full, want 1", got)
+	if !h2FixPollUntil(func() bool { return idleRunning.Load() == idleStreams }) {
+		t.Fatalf("%d of %d idle upload handlers run", idleRunning.Load(), idleStreams)
 	}
-	_ = first.conn.Close()
-	close(hold)
-	if !h2FixPollUntil(func() bool { return started.Load() == 2 }) {
-		t.Fatal("waiting upload did not start after another connection released the budget")
+	if got := srv.inFlightBodyBytes.Load(); got != 0 {
+		t.Fatalf("%d idle upload streams with no data hold %d budget bytes", idleStreams, got)
+	}
+	busy := h2RawDial(t, addr, h2FixSettings())
+	_ = busy.conn.SetDeadline(wallDeadline(h2AdmitBurstDeadline))
+	h2UploadHeaders(busy, 1, "/read", h2AdmitBudgetUpload)
+	h2AdmitSendBody(busy, 1, h2AdmitBudgetUpload, true)
+	bodies, resets := busy.h2UploadOutcomes(t, map[uint32]bool{1: true})
+	if want := strconv.Itoa(h2AdmitBudgetUpload) + " nil"; len(resets) != 0 || bodies[1] != want {
+		t.Fatalf("upload beside idle streams: resets %v, body %q, want no reset and %q", resets, bodies[1], want)
+	}
+}
+
+func h2AdmitErrText(err error) string {
+	if err == nil {
+		return "nil"
+	}
+	return err.Error()
+}
+
+func TestH2AdmissionRunningStreamOverBudgetIsReset(t *testing.T) {
+	const window = 2 * h2AdmitBodyBudget
+	readNow := make(chan struct{})
+	result := make(chan error, 1)
+	addr, srv := startH2FixServerWith(t, func(c *Config) {
+		c.StreamBodyAbove = 1
+		c.MaxInFlightBodyBytes = h2AdmitBodyBudget
+		c.H2InitialWindowSize = window
+		c.MaxBodySize = window
+	}, func(srv *Server) {
+		srv.Router.POST("/late", func(req *Request, resp *Response) {
+			<-readNow
+			_, err := io.Copy(io.Discard, req.BodyStream())
+			result <- err
+			resp.Status(200).String("late")
+		})
+	})
+	rc := h2RawDial(t, addr, h2FixSettings())
+	rc.write(H2FrameWindowUpdate, 0, 0, h2FixWindowIncrement(h2FixMaxWindow-H2DefaultWindowSize))
+	_ = rc.conn.SetDeadline(wallDeadline(h2AdmitBurstDeadline))
+	sampler := startH2BudgetSampler(srv, h2ConnBodyCounter(t, srv))
+	h2UploadHeaders(rc, 1, "/late", window)
+	h2AdmitSendBody(rc, 1, h2AdmitBodyBudget+h2AdmitBodyPerStream, false)
+	f, err := rc.awaitStreamOutcome(1)
+	if err != nil || f.typ != H2FrameRSTStream || binary.BigEndian.Uint32(f.payload) != H2ErrEnhanceYourCalm {
+		t.Fatalf("running upload over budget got frame type %d err %v, want RST_STREAM ENHANCE_YOUR_CALM", f.typ, err)
+	}
+	close(readNow)
+	if got := <-result; got == nil {
+		t.Fatal("handler read a reset body without an error")
+	}
+	for _, f := range rc.framesWithin(h2FixQuietWindow) {
+		if f.streamID == 1 {
+			t.Fatalf("server sent frame type %d on stream 1 after it reset the stream", f.typ)
+		}
+	}
+	if peakServer, peakConn := sampler.finish(); peakServer > h2AdmitBodyBudget || peakConn > h2AdmitBodyBudget {
+		t.Fatalf("body counters peaked at server %d and connection %d, MaxInFlightBodyBytes %d", peakServer, peakConn, h2AdmitBodyBudget)
+	}
+	if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == 0 }) {
+		t.Fatalf("budget still counts %d bytes", srv.inFlightBodyBytes.Load())
 	}
 }
 
@@ -275,12 +345,12 @@ func TestH2AdmissionStreamedBodyBudgetAccounting(t *testing.T) {
 		after     int
 		want      func(window int64) int64
 	}{
-		"trailers end releases the window":         {trailers: true, want: func(int64) int64 { return h2AdmitBodyPerStream }},
-		"read of an open body keeps the window":    {readBody: true, want: func(w int64) int64 { return w }},
-		"open body holds its window":               {want: func(w int64) int64 { return w }},
-		"ended body holds only buffered bytes":     {endStream: true, want: func(int64) int64 { return h2AdmitBodyPerStream }},
-		"close after end releases buffered bytes":  {endStream: true, closeBody: true, want: func(int64) int64 { return 0 }},
-		"data after close stays inside the window": {closeBody: true, after: h2AdmitBodyPerStream, want: func(w int64) int64 { return w }},
+		"trailers end holds buffered bytes":       {trailers: true, want: func(int64) int64 { return h2AdmitBodyPerStream }},
+		"read of an open body releases":           {readBody: true, want: func(int64) int64 { return 0 }},
+		"open body holds its buffered bytes":      {want: func(int64) int64 { return h2AdmitBodyPerStream }},
+		"ended body holds only buffered bytes":    {endStream: true, want: func(int64) int64 { return h2AdmitBodyPerStream }},
+		"close after end releases buffered bytes": {endStream: true, closeBody: true, want: func(int64) int64 { return 0 }},
+		"data after close holds no budget":        {closeBody: true, after: h2AdmitBodyPerStream, want: func(int64) int64 { return 0 }},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -433,14 +503,13 @@ func TestH2AdmissionStartedStreamKeepsFlowControlAfterWait(t *testing.T) {
 	h2FixGet(rc, 1, "/first")
 	h2UploadHeaders(rc, 3, "/late", before+after)
 	h2AdmitSendBody(rc, 3, before, false)
-	if !h2FixPollUntil(func() bool { return h2AdmissionProbe(t, srv).waiting == 1 }) {
-		t.Fatal("upload did not wait behind the running handler")
+	if !h2FixPollUntil(func() bool { return h2AdmissionProbe(t, srv).waiting == 1 && srv.inFlightBodyBytes.Load() == before }) {
+		t.Fatalf("waiting upload holds %d budget bytes, want %d", srv.inFlightBodyBytes.Load(), before)
 	}
 	close(first)
 	<-started
-	window := int64(srv.h2InitialWindow())
-	if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == window }) {
-		t.Fatalf("started upload holds %d budget bytes, want its stream window %d", srv.inFlightBodyBytes.Load(), window)
+	if got := srv.inFlightBodyBytes.Load(); got != before {
+		t.Fatalf("started upload holds %d budget bytes, want its %d buffered bytes", got, before)
 	}
 	h2AdmitSendBody(rc, 3, after, true)
 	time.Sleep(h2FixQuietWindow)
@@ -481,5 +550,53 @@ func TestBodyReaderReservePushIntoClosedReaderReleases(t *testing.T) {
 	}
 	if srv.inFlightBodyBytes.Load() != 0 || conn.Load() != 0 {
 		t.Fatalf("push into a closed reader holds server %d and connection %d budget bytes", srv.inFlightBodyBytes.Load(), conn.Load())
+	}
+}
+
+func TestH2AdmissionServerResetOfRunningStreamSendsNoResponse(t *testing.T) {
+	const smallWindow = 1 << 16
+	cases := map[string]struct {
+		declared, sent int
+		wantCode       uint32
+	}{
+		"body longer than content-length": {declared: 10, sent: 20, wantCode: H2ErrProtocol},
+		"body beyond the stream window":   {declared: 2 * smallWindow, sent: smallWindow + h2AdmitBodyFrame, wantCode: H2ErrFlowControl},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			running, respond := make(chan struct{}), make(chan struct{})
+			returned := make(chan struct{})
+			addr, srv := startH2FixServerWith(t, func(c *Config) {
+				c.StreamBodyAbove = 1
+				c.H2InitialWindowSize = smallWindow
+			}, func(srv *Server) {
+				srv.Router.POST("/late", func(req *Request, resp *Response) {
+					close(running)
+					<-respond
+					resp.Status(200).String("late")
+					close(returned)
+				})
+			})
+			rc := h2RawDial(t, addr, h2FixSettings())
+			rc.write(H2FrameWindowUpdate, 0, 0, h2FixWindowIncrement(h2FixMaxWindow-H2DefaultWindowSize))
+			_ = rc.conn.SetDeadline(wallDeadline(h2AdmitBurstDeadline))
+			h2UploadHeaders(rc, 1, "/late", tc.declared)
+			<-running
+			h2AdmitSendBody(rc, 1, tc.sent, false)
+			f, err := rc.awaitStreamOutcome(1)
+			if err != nil || f.typ != H2FrameRSTStream || binary.BigEndian.Uint32(f.payload) != tc.wantCode {
+				t.Fatalf("got frame type %d err %v, want RST_STREAM code %d", f.typ, err, tc.wantCode)
+			}
+			close(respond)
+			<-returned
+			for _, f := range rc.framesWithin(h2FixQuietWindow) {
+				if f.streamID == 1 {
+					t.Fatalf("server sent frame type %d on stream 1 after it reset the stream", f.typ)
+				}
+			}
+			if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == 0 }) {
+				t.Fatalf("budget still counts %d bytes", srv.inFlightBodyBytes.Load())
+			}
+		})
 	}
 }

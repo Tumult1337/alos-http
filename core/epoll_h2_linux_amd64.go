@@ -523,7 +523,6 @@ func (c *epollConn) epollH2Trailers(srv *Server, streamID uint32, headerBlock []
 		return c.rejectH2Body(streamID)
 	}
 	delete(c.h2BodyIn, streamID)
-	in.reader.endWindow(in.recvWindow)
 	in.reader.finishWithTrailers(trailers)
 	return false
 }
@@ -535,11 +534,7 @@ func h2LengthMismatch(declared, received int64) bool {
 func (c *epollConn) rejectH2Body(streamID uint32) bool {
 	st := &c.h2
 	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrProtocol)
-	epollReleaseH2Stream(st, streamID)
-	c.h2AbortBodyIn(streamID)
-	if _, waiting := st.findWaiting(streamID); waiting != nil {
-		c.abandonH2Stream(streamID, ErrStreamClosed)
-	}
+	c.abandonH2Stream(streamID, ErrStreamClosed)
 	if st.countReset() {
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrEnhanceYourCalm)
 		return true
@@ -732,7 +727,7 @@ func (c *epollConn) epollH2DispatchStream(srv *Server, streamID uint32, stream *
 	if streamBody {
 		stream.waitBody = c.openH2BodyIn(c.worker, stream)
 	}
-	if len(c.h2.waiting) == 0 && c.h2AdmitsHandler() && c.h2ReserveBodyWindow(stream) {
+	if len(c.h2.waiting) == 0 && c.h2AdmitsHandler() {
 		return c.startH2Stream(srv, streamID, stream, streamBody)
 	}
 	c.h2.waiting = append(c.h2.waiting, stream)
@@ -751,9 +746,8 @@ func (c *epollConn) h2AdmitWaiting() {
 		return
 	}
 	st.admitting = true
-	st.budgetBlocked = false
 	srv := c.worker.server
-	for len(st.waiting) > 0 && !c.closeAfter && c.h2AdmitsHandler() && c.h2ReserveBodyWindow(st.waiting[0]) {
+	for len(st.waiting) > 0 && !c.closeAfter && c.h2AdmitsHandler() {
 		stream := st.removeWaiting(0)
 		if c.startH2Stream(srv, stream.ID, stream, stream.waitBody != nil) {
 			c.closeAfter = true
