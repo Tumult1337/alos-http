@@ -496,7 +496,7 @@ func (c *epollConn) h2ResetStalledStreams(w *epollWorker, now int64) {
 }
 
 func (c *epollConn) cancelStalledH2Stream(streamID uint32) {
-	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrCancel)
+	c.emitH2Reset(c.worker, streamID, H2ErrCancel)
 	c.abandonH2Stream(streamID, ErrStreamClosed)
 }
 
@@ -515,7 +515,7 @@ func (c *epollConn) h2DropPeerInput(w *epollWorker) {
 	}
 	for id, sw := range c.h2Streaming {
 		if sw.sendDeadline != 0 {
-			c.cancelStalledH2Stream(id)
+			c.abandonH2Stream(id, ErrClientGone)
 		}
 	}
 }

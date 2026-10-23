@@ -259,3 +259,28 @@ func TestH2PeerEOFMidFrameAbortsStreamedBodyReader(t *testing.T) {
 		t.Fatal("a FIN inside a frame left the handler blocked on the body")
 	}
 }
+
+func TestH2PeerEOFDropsWindowStalledStreamedResponse(t *testing.T) {
+	p := newH2Progress(t)
+	p.w.readTO = int64(time.Hour)
+	p.w.writeTO = int64(time.Hour)
+	h2ProgressStreamedRoute(p, 100<<10)
+	settings := h2FixSettings([2]uint32{uint32(H2SettingInitialWindowSize), 0})
+	p.open(settings, appendH2Frame(nil, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 1, h2FixRequestBlock("GET", "/streamed")))
+	p.settleHandlers()
+	if len(p.c.h2Streaming) != 1 {
+		t.Fatalf("streamed response is not waiting on the peer window: streaming=%d", len(p.c.h2Streaming))
+	}
+	if err := unix.Shutdown(p.peer, unix.SHUT_WR); err != nil {
+		t.Fatal(err)
+	}
+	p.w.readable(p.c, false)
+	deadline := turbo.Deadline(h2FixCeiling)
+	for p.c.fd >= 0 && turbo.Until(deadline) > 0 {
+		p.w.flushPending()
+		time.Sleep(time.Millisecond)
+	}
+	if p.c.fd >= 0 {
+		t.Fatal("a streamed response that waits for a WINDOW_UPDATE kept the connection open after peer EOF")
+	}
+}
