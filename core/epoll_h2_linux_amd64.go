@@ -262,7 +262,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		if st.streams[streamID] != nil || c.h2BodyIn[streamID] != nil {
 			return c.epollH2Trailers(srv, streamID, headerBlock, endStream)
 		}
-		if endStream && !c.h2StreamAwaitingResponse(streamID) {
+		if endStream && !c.h2StreamAwaitingResponse(streamID) || c.h2StreamResetByServer(streamID) {
 			return c.discardH2ClosedStreamHeaders(headerBlock)
 		}
 	}
@@ -375,6 +375,11 @@ func (c *epollConn) h2StreamAwaitingResponse(streamID uint32) bool {
 	return st.sending[streamID] != nil || c.h2Streaming[streamID] != nil || st.findBusy(streamID) != nil
 }
 
+func (c *epollConn) h2StreamResetByServer(streamID uint32) bool {
+	stream := c.h2.findBusy(streamID)
+	return stream != nil && stream.abandoned
+}
+
 func (c *epollConn) discardH2ClosedStreamHeaders(headerBlock []byte) bool {
 	st := &c.h2
 	fields, err := st.decoder.DecodeInto(st.headersBuf[:0], headerBlock)
@@ -479,9 +484,9 @@ func (c *epollConn) h2ResetStalledStreams(w *epollWorker, now int64) {
 			reset = true
 		}
 	}
-	for _, sw := range c.h2Streaming {
+	for id, sw := range c.h2Streaming {
 		if sw.sendDeadline != 0 && now > sw.sendDeadline {
-			c.resetStalledH2Writer(w, sw)
+			c.cancelStalledH2Stream(id)
 			reset = true
 		}
 	}
@@ -493,17 +498,6 @@ func (c *epollConn) h2ResetStalledStreams(w *epollWorker, now int64) {
 func (c *epollConn) cancelStalledH2Stream(streamID uint32) {
 	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, streamID, H2ErrCancel)
 	c.abandonH2Stream(streamID, ErrStreamClosed)
-}
-
-func (c *epollConn) resetStalledH2Writer(w *epollWorker, sw *epollH2StreamWriter) {
-	sw.mu.Lock()
-	if sw.err == nil {
-		sw.err = errH2StreamStalled
-	}
-	sw.sendRST = true
-	sw.space.Broadcast()
-	sw.mu.Unlock()
-	c.h2PumpSealed(w, sw)
 }
 
 func (c *epollConn) h2DropPeerInput(w *epollWorker) {
@@ -519,9 +513,9 @@ func (c *epollConn) h2DropPeerInput(w *epollWorker) {
 			st.releaseSending(id, stream)
 		}
 	}
-	for _, sw := range c.h2Streaming {
+	for id, sw := range c.h2Streaming {
 		if sw.sendDeadline != 0 {
-			c.resetStalledH2Writer(w, sw)
+			c.cancelStalledH2Stream(id)
 		}
 	}
 }

@@ -74,10 +74,13 @@ var timeNow = time.Now
 // MaxInFlightBodyBytes caps aggregate request-body bytes buffered by multiplexed
 // HTTP/2 and HTTP/3 streams and by streamed HTTP/1 bodies. 0 applies a 64 MiB default; -1 disables the budget
 // (unsafe on an Internet-facing server). Streams that would exceed it are reset.
-// While the server holds more than half of the budget, one HTTP/2 connection can hold at most its share,
-// max(MaxInFlightBodyBytes/8, MaxBodySize) capped at MaxInFlightBodyBytes (8 MiB at the defaults); a stream
-// above it gets RST_STREAM(REFUSED_STREAM) while its handler waits for admission and RST_STREAM(ENHANCE_YOUR_CALM) otherwise.
-// A streamed HTTP/1 body that finds no room gets 503 and the connection closes.
+// The per-connection share check runs only while the server holds more than half of the budget. Below that
+// point one connection can reserve up to about half of the budget (32 MiB at the defaults) and keeps those
+// bytes when the pressure starts. The share is max(MaxInFlightBodyBytes/8, MaxBodySize) capped at
+// MaxInFlightBodyBytes, or the whole budget when MaxBodySize is -1. It applies to HTTP/2, HTTP/3, WebSocket
+// and streamed HTTP/1 connections. An HTTP/2 stream above it gets RST_STREAM(REFUSED_STREAM) while its
+// handler waits for admission and RST_STREAM(ENHANCE_YOUR_CALM) otherwise.
+// A streamed HTTP/1 body that finds no room while it holds no buffered bytes gets 503 and the connection closes.
 //
 //	Example: MaxInFlightBodyBytes: 32 << 20.
 //

@@ -124,6 +124,7 @@ type epollConn struct {
 	reqBodyCopy     []byte
 	h1BodyAccounted int64
 	h1BodyReserved  atomic.Int64
+	peerInputRead   bool
 	h1BodyDeadline  int64
 	chunkScanPos    int
 	h2GoingAway     bool
@@ -1234,6 +1235,7 @@ func (w *epollWorker) acceptLoop() {
 		c.dispatching = false
 		c.readPending = false
 		c.peerHup = false
+		c.peerInputRead = false
 		c.inputEOF = false
 		c.flushQueued = false
 		c.h1ContinueSent = false
@@ -1506,6 +1508,7 @@ func (w *epollWorker) readOnce(c *epollConn, peerClosed bool) (readAgain bool) {
 		c.ownReadBuf(w)
 	}
 	fullAt := c.bufferedInput()
+	c.peerInputRead = closed || peerClosed && !bufferFull
 	w.serviceBuffered(c, closed, peerClosed)
 	if c.readScratch {
 		w.settleReadScratch(c)
@@ -1632,7 +1635,7 @@ func (w *epollWorker) serviceBuffered(c *epollConn, closed, peerClosed bool) {
 		c.peerHup = c.peerHup || closed || peerClosed
 		return
 	}
-	if (closed || peerClosed) && c.speaksH2() {
+	if c.peerInputRead && c.speaksH2() {
 		c.h2DropPeerInput(w)
 	}
 	if closed && !c.h2AnswersAfterEOF() {
@@ -1952,6 +1955,7 @@ func (w *epollWorker) closeConn(c *epollConn) {
 	c.dispatching = false
 	c.readPending = false
 	c.peerHup = false
+	c.peerInputRead = false
 	c.inputEOF = false
 	c.h1ContinueSent = false
 	c.hsReader = nil
