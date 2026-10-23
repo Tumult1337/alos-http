@@ -1893,7 +1893,7 @@ func (w *epollWorker) disarmOut(c *epollConn) {
 	} else if c.ws != nil {
 		c.deadline = c.ws.deadline(false)
 	} else if c.speaksH2() {
-		c.restoreH2Deadline(w)
+		c.replaceH2WriteDeadline(w)
 	} else if w.idleTO > 0 {
 		c.deadline = deadlineFrom(w.idleTO)
 	}

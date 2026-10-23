@@ -448,14 +448,29 @@ func (c *epollConn) h2Quiescent() bool {
 }
 
 func (c *epollConn) restoreH2Deadline(w *epollWorker) {
-	if c.fd < 0 || !c.speaksH2() || c.lingering || c.closeAfter || c.deadline != 0 || c.inFlight > 0 || c.dispatching || c.outArmed || c.writeSent != len(c.writeBuf) {
+	if c.deadline != 0 {
+		return
+	}
+	c.resetH2Deadline(w)
+}
+
+func (c *epollConn) replaceH2WriteDeadline(w *epollWorker) {
+	if w.writeTO <= 0 {
+		c.restoreH2Deadline(w)
+		return
+	}
+	c.resetH2Deadline(w)
+}
+
+func (c *epollConn) resetH2Deadline(w *epollWorker) {
+	if c.fd < 0 || !c.speaksH2() || c.lingering || c.closeAfter || c.inFlight > 0 || c.dispatching || c.outArmed || c.writeSent != len(c.writeBuf) {
 		return
 	}
 	if c.h2Quiescent() && c.h2.expectContinuation == 0 && !c.unparsedInput() {
 		c.deadline = deadlineFrom(w.idleTO)
-	} else if c.h2.expectContinuation != 0 || c.unparsedInput() || len(c.h2.streams) != 0 || len(c.h2BodyIn) != 0 {
-		c.deadline = deadlineFrom(w.readTO)
+		return
 	}
+	c.deadline = deadlineFrom(w.readTO)
 }
 
 func (c *epollConn) h2PeerLeft() bool {
