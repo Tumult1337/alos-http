@@ -5,7 +5,9 @@ package core
 import (
 	"bufio"
 	"net"
+	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -96,5 +98,29 @@ func TestProxyBufferReservationReleasesChargedConnAfterDetach(t *testing.T) {
 	detached := &proxyExchange{pe: pe}
 	if detached.reserveResponseBuffer(1) {
 		t.Fatalf("an exchange without a client connection reserved budget")
+	}
+}
+
+func TestProxyH2AuthorizedRequestIsNotCached(t *testing.T) {
+	var served atomic.Int64
+	addr := proxyG2CacheStart(t, proxyG2CachePath{name: "h2 loop", h2: true}, proxyG2CacheOrigin(t, &served), func(*ProxyRequest) bool { return true })
+	c := proxyFixH2cDial(t, addr)
+	defer c.Close()
+	block := proxyFixAppendHPACKLiteral(nil, proxyFixHpackStaticMethod, "GET")
+	block = append(block, proxyFixHpackStaticSchemeHTTP)
+	block = proxyFixAppendHPACKLiteral(block, proxyFixHpackStaticPath, "/c")
+	block = proxyFixAppendHPACKLiteral(block, proxyFixHpackStaticAuthority, proxyFixDomain)
+	block = append(block, 0x00, byte(len("authorization")))
+	block = append(block, "authorization"...)
+	block = append(block, byte(len("Bearer secret")))
+	block = append(block, "Bearer secret"...)
+	if _, err := c.Write(proxyFixAppendH2Frame(nil, h2FrameHeaders, h2FlagEndStream|h2FlagEndHeaders, 1, block)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if r := c.collect(t, 1)[1]; r.status != "200" {
+		t.Fatalf("authorized request: status %q", r.status)
+	}
+	if r := proxyG2Get(t, proxyG2CachePath{name: "h2 loop", h2: true}, addr, "/c"); r.status != http.StatusOK || served.Load() != 2 {
+		t.Fatalf("an anonymous request was answered from the response to an authorized request: %+v, origin served %d", r, served.Load())
 	}
 }

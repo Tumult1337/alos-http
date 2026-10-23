@@ -23,6 +23,7 @@ func TestFPTLS12CertificateRejectsMalformedChain(t *testing.T) {
 		{"empty list", fpG2CertList()},
 		{"list length past body", append([]byte{0, 0, 9}, 0, 0, 1, 0x30)},
 		{"trailing bytes after list", append(fpG2CertList([]byte{0x30}), 0xff)},
+		{"framed entry after the list", append(fpG2CertList([]byte{0x30}), 0, 0, 1, 0x31)},
 		{"entry past list", []byte{0, 0, 4, 0, 0, 5, 0x30}},
 		{"truncated entry length", []byte{0, 0, 2, 0, 0}},
 	} {
@@ -67,6 +68,7 @@ func TestFPTLS13CertificateRejectsMalformedChain(t *testing.T) {
 		{"missing extensions length", wrap(rawList([]byte{0, 0, 1, 0x30}))},
 		{"context past body", []byte{5, 0}},
 		{"non-empty request context", append([]byte{1, 7}, rawList(withLen([]byte{0x30}, nil))...)},
+		{"context length byte before a framed list", append([]byte{1}, rawList(withLen([]byte{0x30}, nil))...)},
 	} {
 		tr := &tlsTransport{skipVerify: true, version: 0x0304, state: tlsExpectEncrypted}
 		if err := tr.handleEncryptedHandshake(nil, append(append([]byte(nil), fpFixEE13...), fpFixHandshakeMsg(tlsHSCertificate, tc.body)...)); err == nil {
