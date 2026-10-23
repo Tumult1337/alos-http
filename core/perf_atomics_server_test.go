@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/guno1928/alosmap"
 	"github.com/guno1928/turbo"
@@ -30,18 +31,37 @@ func perfKeepParallel(hit bool, sum int64, s string) {
 }
 
 type perfServerHotPadded struct {
-	_                 [CacheLineSize]byte
-	activeConns       atomic.Int64
-	_                 [CacheLineSize - 8]byte
-	inFlightBodyBytes atomic.Int64
-	_                 [CacheLineSize - 8]byte
-	shuttingDown      atomic.Bool
-	fastDispatch      atomic.Bool
-	plainRootFast     atomic.Pointer[plainRootFastResponse]
-	h2RootFast        atomic.Pointer[h2RootFastResponse]
-	altSvc            atomic.Pointer[altSvcHeader]
-	limits            atomic.Pointer[Limits]
-	_                 [CacheLineSize]byte
+	_             [CacheLineSize]byte
+	activeConns   atomic.Int64
+	_             [CacheLineSize - 8]byte
+	_             atomic.Int64
+	_             [CacheLineSize - 8]byte
+	shuttingDown  atomic.Bool
+	fastDispatch  atomic.Bool
+	plainRootFast atomic.Pointer[plainRootFastResponse]
+	h2RootFast    atomic.Pointer[h2RootFastResponse]
+	altSvc        atomic.Pointer[altSvcHeader]
+	_             atomic.Pointer[Limits]
+	_             [CacheLineSize]byte
+}
+
+func TestPerfAtomicsServerHotPaddedLayoutIsPinned(t *testing.T) {
+	var p perfServerHotPadded
+	got := []uintptr{
+		unsafe.Sizeof(p),
+		unsafe.Offsetof(p.activeConns),
+		unsafe.Offsetof(p.shuttingDown),
+		unsafe.Offsetof(p.fastDispatch),
+		unsafe.Offsetof(p.plainRootFast),
+		unsafe.Offsetof(p.h2RootFast),
+		unsafe.Offsetof(p.altSvc),
+	}
+	want := []uintptr{296, 64, 192, 196, 200, 208, 216}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("layout[%d]=%d want %d", i, got[i], want[i])
+		}
+	}
 }
 
 func perfReadHotConfig(s *Server) bool {

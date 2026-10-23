@@ -17,11 +17,6 @@ type perfPaddedU64 struct {
 	_ [CacheLineSize - 8]byte
 }
 
-type perfPaddedI64 struct {
-	v atomic.Int64
-	_ [CacheLineSize - 8]byte
-}
-
 type perfLoopReqCounters struct {
 	totalReqs uint64
 	rawReqs   uint64
