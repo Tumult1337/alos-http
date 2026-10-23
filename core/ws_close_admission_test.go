@@ -92,6 +92,16 @@ func wsCloseAdmissionServer(t *testing.T, blocker *wsBlockingClose, cfgFn func(*
 				blocker.upgrading <- struct{}{}
 				<-blocker.upgradeGate
 			})
+			r.GET("/ws-copied-server-close", func(req *Request, resp *Response) {
+				copied := *req
+				h := blocker.handler()
+				h.OnMessage = func(ws *WSConn, op byte, msg []byte) { _ = ws.Close() }
+				ServeWebSocketEvents(&copied, resp, WSUpgradeOptions{}, h)
+			})
+			r.GET("/ws-copied-close-and-block", func(req *Request, resp *Response) {
+				copied := *req
+				ServeWebSocketEvents(&copied, resp, WSUpgradeOptions{}, blocker.messageHandler())
+			})
 			r.GET("/ws-copied", func(req *Request, resp *Response) {
 				copied := *req
 				ServeWebSocketEvents(&copied, resp, WSUpgradeOptions{}, blocker.handler())
@@ -325,4 +335,27 @@ func TestWSEventsHijackedTLSPathOnCloseHoldsPerIPSlot(t *testing.T) {
 	}
 	blocker.unblock()
 	waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+}
+
+func TestWSEventsHijackedServerCloseKeepsSlotsForCallbacks(t *testing.T) {
+	for _, path := range []string{"/ws-copied-server-close", "/ws-copied-close-and-block"} {
+		t.Run(path, func(t *testing.T) {
+			blocker := newWSBlockingClose()
+			ts := wsCloseAdmissionServer(t, blocker, func(cfg *Config) { cfg.MaxConnsPerIP = 1 })
+			c, _, _ := wsEvDial(t, ts, path)
+			if _, err := c.Write(wsClientFrame(0x80|wsOpText, []byte("m"))); err != nil {
+				t.Fatal(err)
+			}
+			blocker.awaitEntered(t)
+			time.Sleep(wsCloseAdmissionSettle)
+			if got := ts.srv.activeConns.Load(); got != 1 {
+				t.Fatalf("activeConns after a server-side close with a blocked callback = %d, want 1", got)
+			}
+			if status := wsCloseAdmissionUpgrade(t, ts); status != 0 && status != http.StatusTooManyRequests {
+				t.Fatalf("upgrade while a callback of a server-closed conn blocks: status %d, want refusal", status)
+			}
+			blocker.unblock()
+			waitFor(t, wsEvCloseWait, func() bool { return ts.srv.activeConns.Load() == 0 })
+		})
+	}
 }

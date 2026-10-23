@@ -461,23 +461,17 @@ func wsDeliverClose(srv *Server, ws *WSConn, h *WSEventHandler) {
 }
 
 func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
+	if tracked := trackedConnOf(ws.conn); tracked != nil && tracked.retainSlots() {
+		defer tracked.releaseHold()
+	}
 	var buf []byte
 	for {
 		op, msg, err := ws.readMessageReserved(buf[:0])
 		if err != nil {
 			ws.releaseMessageBytes()
 			ws.noteCloseCode(wsStatusAbnormal)
-			var held *trackedHandoffConn
-			if h.OnClose != nil {
-				if tracked := trackedConnOf(ws.conn); tracked != nil && tracked.retainSlots() {
-					held = tracked
-				}
-			}
 			ws.Close()
 			wsDeliverClose(srv, ws, &h)
-			if held != nil {
-				held.releaseHold()
-			}
 			return
 		}
 		if cap(msg) <= wsFrameReadChunk {
