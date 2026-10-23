@@ -102,3 +102,20 @@ func TestWsSendFrameDoesNotAllocate(t *testing.T) {
 		t.Fatalf("allocs=%v", allocs)
 	}
 }
+
+func TestSocketSendIovecsClearsIovecSlots(t *testing.T) {
+	tx, rx := socketPairForSend(t)
+	iov := appendIovec(appendIovec(make([]unix.Iovec, 0, 2), []byte("ab")), []byte("cd"))
+	n, err := socketSendIovecs(tx, iov)
+	if err != nil || n != 4 {
+		t.Fatalf("n=%d err=%v", n, err)
+	}
+	if got := drainSocket(t, rx); string(got) != "abcd" {
+		t.Fatalf("got %q", got)
+	}
+	for i, slot := range iov {
+		if slot.Base != nil || slot.Len != 0 {
+			t.Fatalf("slot %d still holds a pointer: %+v", i, slot)
+		}
+	}
+}

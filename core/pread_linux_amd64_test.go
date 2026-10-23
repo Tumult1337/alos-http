@@ -165,3 +165,42 @@ func TestStaticEmptyFileServedOverH1TLSAndH2(t *testing.T) {
 		})
 	}
 }
+
+func diskTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("/var/tmp", "alos-cold-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+func TestH1TLSSealFileColdCacheDeliversIntactBody(t *testing.T) {
+	perfCoreSettleStaticFiles(t)
+	root := diskTempDir(t)
+	content := serveContentPattern(perfCoreH2FileSize)
+	path := filepath.Join(root, "big.bin")
+	perfCoreWriteStatic(t, path, content)
+	ts := newTestServer(t, testServerOptions{TLS: true, Domain: perfCoreH2FileDomain, Routes: func(r *Router) {
+		r.GET("/s/*filepath", Static("/s", StaticConfig{Root: root, CacheMaxFileSize: staticCacheEvictingFileSize}))
+	}})
+	cl := ts.client(t, "http/1.1")
+	for round := 0; round < 3; round++ {
+		perfCoreDropPageCache(t, path)
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		probe := make([]byte, 4096)
+		_, probeErr := preadvAll(int(f.Fd()), preadTestIovecs(probe), 0, unix.RWF_NOWAIT)
+		f.Close()
+		if probeErr != unix.EAGAIN {
+			t.Skipf("filesystem under /var/tmp serves RWF_NOWAIT reads from a dropped cache: %v", probeErr)
+		}
+		resp, body, err := perfCoreH2FileGet(cl, ts.url("/s/big.bin"), "")
+		if err != nil || resp.StatusCode != 200 || resp.ProtoMajor != 1 || !bytes.Equal(body, content) {
+			t.Fatalf("round %d: err %v len %d equal=%v", round, err, len(body), bytes.Equal(body, content))
+		}
+	}
+}
