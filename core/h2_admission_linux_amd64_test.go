@@ -151,6 +151,7 @@ func h2AdmitPost(rc *h2RawConn, streamID uint32, size int) {
 func (rc *h2RawConn) h2AdmitCollect(t *testing.T, want map[uint32]bool, forbidden uint32) map[uint32]string {
 	t.Helper()
 	bodies := make(map[uint32]string, len(want))
+	done := make(map[uint32]bool, len(want))
 	ended := 0
 	for ended < len(want) {
 		f, err := rc.tryRead()
@@ -164,11 +165,14 @@ func (rc *h2RawConn) h2AdmitCollect(t *testing.T, want map[uint32]bool, forbidde
 		case H2FrameGoAway:
 			t.Fatalf("GOAWAY after %d/%d streams ended", ended, len(want))
 		case H2FrameRSTStream:
-			t.Fatalf("server reset stream %d with code %d", f.streamID, binary.BigEndian.Uint32(f.payload))
+			if code := binary.BigEndian.Uint32(f.payload); !done[f.streamID] || code != H2ErrNoError {
+				t.Fatalf("server reset stream %d with code %d", f.streamID, code)
+			}
 		case H2FrameData:
 			bodies[f.streamID] += string(f.payload)
 		}
-		if (f.typ == H2FrameData || f.typ == H2FrameHeaders) && f.flags&H2FlagEndStream != 0 && want[f.streamID] {
+		if (f.typ == H2FrameData || f.typ == H2FrameHeaders) && f.flags&H2FlagEndStream != 0 && want[f.streamID] && !done[f.streamID] {
+			done[f.streamID] = true
 			ended++
 		}
 	}

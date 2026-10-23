@@ -733,6 +733,7 @@ func (c *epollConn) epollH2DispatchStream(srv *Server, streamID uint32, stream *
 	}
 	if streamBody {
 		stream.waitBody = c.openH2BodyIn(c.worker, stream)
+		stream.waitBody.queued = true
 	}
 	c.h2.waiting = append(c.h2.waiting, stream)
 	return false

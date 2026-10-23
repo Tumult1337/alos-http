@@ -171,17 +171,28 @@ func (b *BodyReader) chargeBudget(srv *Server, conn *atomic.Int64) {
 }
 
 func (b *BodyReader) reservePush(data []byte) bool {
+	if b.budget != nil && !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
+		return false
+	}
+	b.pushCharged(data)
+	return true
+}
+
+func (b *BodyReader) forcePush(data []byte) {
+	if b.budget != nil && !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
+		b.budget.forceReserveConnBodyBytes(b.budgetConn, len(data))
+	}
+	b.pushCharged(data)
+}
+
+func (b *BodyReader) pushCharged(data []byte) {
 	if b.budget == nil {
 		b.push(data)
-		return true
-	}
-	if !b.budget.tryReserveConnBodyBytes(b.budgetConn, len(data)) {
-		return false
+		return
 	}
 	if !b.pushReserved(data, int64(len(data))) {
 		b.budget.releaseConnBodyBytes(b.budgetConn, int64(len(data)))
 	}
-	return true
 }
 
 func (b *BodyReader) pushReserved(data []byte, reserved int64) bool {

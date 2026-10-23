@@ -86,7 +86,7 @@ func TestH2AdmissionWaitingTunnelBodiesStayInBodyBudget(t *testing.T) {
 	}
 }
 
-func TestH2AdmissionRunningStreamedBodyStaysInBodyBudget(t *testing.T) {
+func TestH2AdmissionRunningStreamedBodyKeepsFlowControl(t *testing.T) {
 	for _, endStream := range []bool{false, true} {
 		t.Run("endStream="+strconv.FormatBool(endStream), func(t *testing.T) {
 			h2AdmissionRunningStreamedBody(t, endStream)
@@ -105,8 +105,10 @@ func h2AdmissionRunningStreamedBody(t *testing.T, endStream bool) {
 	rc := h2RawDial(t, addr, h2FixSettings())
 	rc.write(H2FrameWindowUpdate, 0, 0, h2FixWindowIncrement(h2FixMaxWindow-H2DefaultWindowSize))
 	_ = rc.conn.SetDeadline(wallDeadline(h2AdmitBurstDeadline))
+	want := make(map[uint32]bool, h2AdmitBodyStreams)
 	for i := range h2AdmitBodyStreams {
 		id := uint32(2*i + 1)
+		want[id] = true
 		rc.write(H2FrameHeaders, H2FlagEndHeaders, id, hpackBlock(
 			[2]string{":method", "POST"}, [2]string{":scheme", "http"},
 			[2]string{":path", "/sink"}, [2]string{":authority", h2FixAuthority}))
@@ -115,22 +117,16 @@ func h2AdmissionRunningStreamedBody(t *testing.T, endStream bool) {
 	if !h2FixPollUntil(func() bool { return b.running.Load() == h2AdmitBodyStreams }) {
 		t.Fatalf("%d of %d handlers run", b.running.Load(), h2AdmitBodyStreams)
 	}
-	var state h2AdmissionState
-	h2FixPollUntil(func() bool {
-		state = h2AdmissionProbe(t, srv)
-		return state.held >= h2AdmitBodyStreams*h2AdmitBodyPerStream
-	})
-	if state.held > h2AdmitBodyBudget || srv.inFlightBodyBytes.Load() > h2AdmitBodyBudget {
-		t.Fatalf("handlers that do not read hold %d body bytes, budget counts %d, MaxInFlightBodyBytes %d",
-			state.held, srv.inFlightBodyBytes.Load(), h2AdmitBodyBudget)
+	total := int64(h2AdmitBodyStreams * h2AdmitBodyPerStream)
+	if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == total }) {
+		t.Fatalf("budget counts %d unread body bytes inside the stream windows, want %d", srv.inFlightBodyBytes.Load(), total)
 	}
-	if !endStream && int64(state.held) != srv.inFlightBodyBytes.Load() {
-		t.Fatalf("handlers hold %d body bytes but the budget counts %d", state.held, srv.inFlightBodyBytes.Load())
-	}
-	if srv.inFlightBodyBytes.Load() == 0 {
-		t.Fatal("budget counts no bytes for buffered streamed bodies")
+	bound := int64(srv.h2MaxRunningHandlers()) * int64(srv.h2InitialWindow())
+	if state := h2AdmissionProbe(t, srv); int64(state.held) > bound || (!endStream && int64(state.held) != total) {
+		t.Fatalf("running handlers hold %d body bytes, want %d and at most %d", state.held, total, bound)
 	}
 	b.open()
+	rc.h2AdmitCollect(t, want, 0)
 	if !h2FixPollUntil(func() bool { return srv.inFlightBodyBytes.Load() == 0 }) {
 		t.Fatalf("finished handlers still hold %d body bytes", srv.inFlightBodyBytes.Load())
 	}
