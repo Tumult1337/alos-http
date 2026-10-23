@@ -279,19 +279,22 @@ type QUICConn struct {
 	dstCIDSeq    uint64
 	rxDCID       [quicConnIDLen]byte
 
-	pathMu        sync.Mutex
-	pathAddr      netip.AddrPort
-	pathGen       atomic.Uint32
-	rxPath        netip.AddrPort
-	rxPathGen     uint32
-	lastValidAddr netip.AddrPort
-	probe         quicPathProbe
-	probing       atomic.Bool
-	rxFrom        netip.AddrPort
-	rxLen         int
-	rxNonProbing  bool
-	pathResponses []byte
-	offPath       quicOffPathBudget
+	pathMu           sync.Mutex
+	pathAddr         netip.AddrPort
+	pathGen          atomic.Uint32
+	rxPath           netip.AddrPort
+	rxPathGen        uint32
+	lastValidAddr    netip.AddrPort
+	probe            quicPathProbe
+	probing          atomic.Bool
+	rxFrom           netip.AddrPort
+	rxLen            int
+	rxNonProbing     bool
+	pathResponses    []byte
+	inDatagram       bool
+	flightInDatagram bool
+	handshakeAckDue  [quicSpaceAppData]bool
+	offPath          quicOffPathBudget
 
 	maxDataLocal    uint64
 	maxDataRemote   uint64
@@ -457,6 +460,12 @@ func (qc *QUICConn) processPacket(data []byte, from netip.AddrPort) {
 	if len(data) == 0 {
 		return
 	}
+	datagramLen := len(data)
+	qc.inDatagram, qc.flightInDatagram = true, false
+	defer func() {
+		qc.inDatagram = false
+		qc.flushHandshakeAcks(datagramLen)
+	}()
 	if debugFlag.Load() {
 		Dbg("[QUIC-DBG] processPacket: %d bytes, first=0x%02x", len(data), data[0])
 	}
@@ -668,13 +677,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 		qc.recvLargest[space] = int64(pn)
 	}
 	if !qc.recordRecvPN(space, pn) {
-		if space != quicSpaceInitial || qc.handshakeDone.Load() {
-			if space == quicSpaceAppData {
-				qc.stashAck(space)
-			} else {
-				qc.sendACK(space)
-			}
-		}
+		qc.acknowledge(space)
 		return
 	}
 	needsAck := false
@@ -805,13 +808,70 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 		qc.resumeCongestionBlocked()
 	}
 
-	if needsAck && (space != quicSpaceInitial || qc.handshakeDone.Load()) {
-		if space == quicSpaceAppData {
-			qc.stashAck(space)
-		} else {
-			qc.sendACK(space)
-		}
+	if needsAck {
+		qc.acknowledge(space)
 	}
+}
+
+func (qc *QUICConn) acknowledge(space int) {
+	if space == quicSpaceAppData {
+		qc.stashAck(space)
+		return
+	}
+	qc.handshakeAckDue[space] = true
+	if !qc.inDatagram {
+		qc.flushHandshakeAcks(qc.rxLen)
+	}
+}
+
+func (qc *QUICConn) flushHandshakeAcks(datagramLen int) {
+	if qc.flightInDatagram {
+		qc.handshakeAckDue[quicSpaceInitial] = false
+	}
+	qc.writeMu.Lock()
+	defer qc.writeMu.Unlock()
+	var datagram []byte
+	for space := quicSpaceInitial; space <= quicSpaceHandshake; space++ {
+		if !qc.handshakeAckDue[space] {
+			continue
+		}
+		qc.handshakeAckDue[space] = false
+		datagram = qc.appendAckOnlyPacketLocked(datagram, space)
+	}
+	if len(datagram) == 0 || len(datagram) > quicAmplificationFactor*datagramLen {
+		return
+	}
+	validated := qc.addressValidated.Load()
+	if !validated && qc.bytesSent.Load()+uint64(len(datagram)) > quicAmplificationFactor*qc.bytesReceived.Load() {
+		return
+	}
+	switch {
+	case qc.uringUDP != nil && qc.udpAddr != nil:
+		qc.uringUDP.sendTo(datagram, qc.udpAddr)
+	case qc.udpConn != nil:
+		_, _ = writeQUICDatagram(qc.udpConn, datagram, qc.remoteAddr)
+	}
+	if !validated {
+		qc.bytesSent.Add(uint64(len(datagram)))
+	}
+}
+
+func (qc *QUICConn) appendAckOnlyPacketLocked(datagram []byte, space int) []byte {
+	keys := qc.sendKeys[space]
+	if keys == nil || !keys.valid {
+		keys = qc.keys[space]
+	}
+	if keys == nil || !keys.valid || len(qc.ackRanges[space]) == 0 {
+		return datagram
+	}
+	frames := quicAppendACKFrameRanges(nil, 0, qc.ackRanges[space])
+	pn := qc.sendPN[space]
+	qc.sendPN[space]++
+	largestAcked := qc.loss.largestAckedPN(space)
+	if space == quicSpaceInitial {
+		return quicBuildInitialPacket(datagram, qc.dstCID(), qc.srcCID(), nil, frames, pn, largestAcked, keys)
+	}
+	return quicBuildHandshakePacket(datagram, qc.dstCID(), qc.srcCID(), frames, pn, largestAcked, keys)
 }
 
 func (qc *QUICConn) stashAck(space int) {
@@ -1308,15 +1368,6 @@ func (qc *QUICConn) openLocalUniStream() *QUICStream {
 	return s
 }
 
-func (qc *QUICConn) sendACK(space int) {
-	if len(qc.ackRanges[space]) == 0 {
-		return
-	}
-	var frames []byte
-	frames = quicAppendACKFrameRanges(frames, 0, qc.ackRanges[space])
-	qc.sendFrames(space, frames, false)
-}
-
 func (qc *QUICConn) sendFrames(space int, frames []byte, ackEliciting bool) {
 	qc.writeMu.Lock()
 	qc.sendFramesLocked(space, frames, ackEliciting)
@@ -1685,6 +1736,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		qc.firstFlight.sent = true
 	}
 
+	qc.flightInDatagram = true
 	qc.writeMu.Lock()
 	defer qc.writeMu.Unlock()
 
@@ -1734,7 +1786,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		chunk := serverHello[shOff:min(len(serverHello), shOff+maxCryptoPerPacket)]
 		var initialFrames []byte
 		if shOff == 0 && largest >= 0 {
-			initialFrames = quicAppendACKFrame(initialFrames, uint64(largest), 0, 0)
+			initialFrames = quicAppendACKFrameRanges(initialFrames, 0, qc.ackRanges[quicSpaceInitial])
 		}
 		initialFrames = quicAppendCryptoFrame(initialFrames, qc.firstFlight.initialOffset+uint64(shOff), chunk)
 		shOff += len(chunk)
