@@ -253,6 +253,7 @@ type QUICConn struct {
 		sent              bool
 		initialOffset     uint64
 		lastSent          int64
+		resends           int
 	}
 
 	streams        map[uint64]*QUICStream
@@ -1655,9 +1656,12 @@ func (qc *QUICConn) resendFirstFlightOnDuplicate() {
 	if qc.tlsState.stage != quicTLSStageWaitFinished {
 		return
 	}
-	if !qc.loss.claimHandshakeResend(qc.firstFlight.lastSent, turbo.Now()) {
+	now := turbo.Now()
+	if now-qc.firstFlight.lastSent < int64(qc.loss.handshakeResendWindow(qc.firstFlight.resends)) {
 		return
 	}
+	qc.firstFlight.lastSent = now
+	qc.firstFlight.resends++
 	if debugFlag.Load() {
 		Dbg("[QUIC-DBG] retransmitting handshake flight (client repeated its Initial)")
 	}
@@ -1680,7 +1684,6 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		copy(qc.firstFlight.fin, fin)
 		qc.firstFlight.sent = true
 	}
-	qc.firstFlight.lastSent = turbo.Now()
 
 	qc.writeMu.Lock()
 	defer qc.writeMu.Unlock()

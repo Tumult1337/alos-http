@@ -125,21 +125,6 @@ func TestQUICFixDuplicateClientHelloAfterPTOResendsTheFlightOnce(t *testing.T) {
 	}
 }
 
-func TestQUICFixFlightResendBacksOffThePTO(t *testing.T) {
-	f := newQUICFixFlightConn(t)
-	f.qc.writeMu.Lock()
-	before := f.qc.loss.ptoTimeout()
-	f.qc.writeMu.Unlock()
-	f.backdateFlightPastPTO()
-	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
-	f.qc.writeMu.Lock()
-	after := f.qc.loss.ptoTimeout()
-	f.qc.writeMu.Unlock()
-	if after != 2*before {
-		t.Fatalf("PTO %v after a client-clocked flight resend, want %v", after, 2*before)
-	}
-}
-
 func TestQUICFixDuplicateFirstHelloDuringRetryKeepsTheLaterFlight(t *testing.T) {
 	srv := New(Config{Certs: []CertConfig{{Domain: "a.test", Source: CertSelfSigned}}})
 	srv.ensureTLSRuntime()
@@ -194,35 +179,94 @@ func TestQUICFixDuplicateFirstHelloDuringRetryKeepsTheLaterFlight(t *testing.T) 
 	}
 }
 
-const quicFixServerProcessing = 10 * time.Millisecond
+func (f *quicFixFlightConn) resendWindow() time.Duration {
+	return f.qc.loss.handshakeResendWindow(f.qc.firstFlight.resends)
+}
+
+func (f *quicFixFlightConn) ackLatestInitial() {
+	f.qc.writeMu.Lock()
+	next := f.qc.sendPN[quicSpaceInitial]
+	f.qc.writeMu.Unlock()
+	f.feedInitial(quicAppendACKFrame(nil, next-1, 0, 0))
+}
 
 func TestQUICFixDuplicateClientHelloAtTheClientsFirstPTOResendsTheFlight(t *testing.T) {
 	f := newQUICFixFlightConn(t)
 	flight := f.datagrams()
 	clientPTO := quicInitialRTT + 4*(quicInitialRTT/2)
-	f.qc.firstFlight.lastSent -= int64(clientPTO - quicFixServerProcessing)
+	f.qc.firstFlight.lastSent -= int64(clientPTO)
 	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
 	if resent := f.datagrams() - flight; resent != flight {
-		t.Fatalf("a duplicate ClientHello one client PTO (%v) after the ClientHello drew %d datagrams, want one %d-datagram flight", clientPTO, resent, flight)
+		t.Fatalf("a duplicate ClientHello one client PTO (%v) after the ClientHello arrived drew %d datagrams, want one %d-datagram flight", clientPTO, resent, flight)
 	}
 }
 
 func TestQUICFixResendWindowDoublesAfterEachResend(t *testing.T) {
 	f := newQUICFixFlightConn(t)
 	flight := f.datagrams()
-	f.qc.firstFlight.lastSent -= int64(quicInitialRTT)
+	base := f.resendWindow()
+	f.qc.firstFlight.lastSent -= int64(base)
 	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
 	if resent := f.datagrams() - flight; resent != flight {
-		t.Fatalf("a duplicate ClientHello one RTT after the flight drew %d datagrams, want %d", resent, flight)
+		t.Fatalf("a duplicate ClientHello one PTO after the ClientHello drew %d datagrams, want %d", resent, flight)
 	}
-	f.qc.firstFlight.lastSent -= int64(quicInitialRTT)
+	f.qc.firstFlight.lastSent -= int64(base)
 	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
 	if resent := f.datagrams() - flight; resent != flight {
-		t.Fatalf("a duplicate ClientHello one RTT after the first resend drew %d datagrams in total, want %d", resent, flight)
+		t.Fatalf("a duplicate ClientHello one PTO after the first resend drew %d datagrams in total, want %d", resent, flight)
 	}
-	f.qc.firstFlight.lastSent -= int64(quicInitialRTT)
+	f.qc.firstFlight.lastSent -= int64(base)
 	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
 	if resent := f.datagrams() - flight; resent != 2*flight {
-		t.Fatalf("a duplicate ClientHello two RTTs after the first resend drew %d datagrams in total, want %d", resent, 2*flight)
+		t.Fatalf("a duplicate ClientHello two PTOs after the first resend drew %d datagrams in total, want %d", resent, 2*flight)
+	}
+}
+
+const (
+	quicFixReplaySteps = 200
+	quicFixReplayStep  = 5 * time.Millisecond
+)
+
+func quicFixMaxResends(elapsed time.Duration) int {
+	bound := 1
+	for window := quicTimerGranularity; window <= elapsed; window *= 2 {
+		bound++
+	}
+	return bound
+}
+
+func TestQUICFixClientAcksWithTinyRTTCannotSpeedUpFlightResends(t *testing.T) {
+	f := newQUICFixFlightConn(t)
+	flight := f.datagrams()
+	for i := 0; i < quicFixReplaySteps; i++ {
+		f.ackLatestInitial()
+		f.qc.firstFlight.lastSent -= int64(quicFixReplayStep)
+		f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
+	}
+	f.qc.loss.mu.Lock()
+	smoothed, sampled := f.qc.loss.smoothedRTT, f.qc.loss.firstRTTDone
+	f.qc.loss.mu.Unlock()
+	if !sampled || smoothed >= quicFixReplayStep {
+		t.Fatalf("fixture ACKs left smoothed RTT %v (sampled %v); they must drive it below the %v replay step", smoothed, sampled, quicFixReplayStep)
+	}
+	resends := (f.datagrams() - flight) / flight
+	if bound := quicFixMaxResends(quicFixReplaySteps * quicFixReplayStep); resends > bound || resends == 0 {
+		t.Fatalf("%d replays with tiny-RTT ACKs over %v drew %d flight resends, want 1..%d", quicFixReplaySteps, quicFixReplaySteps*quicFixReplayStep, resends, bound)
+	}
+}
+
+func TestQUICFixDuplicateOneRTTAfterTheFlightWaitsForThePTO(t *testing.T) {
+	f := newQUICFixFlightConn(t)
+	flight := f.datagrams()
+	f.qc.loss.mu.Lock()
+	smoothed := f.qc.loss.smoothedRTT
+	f.qc.loss.mu.Unlock()
+	if smoothed >= f.resendWindow() {
+		t.Fatalf("smoothed RTT %v is not below the resend window %v", smoothed, f.resendWindow())
+	}
+	f.qc.firstFlight.lastSent -= int64(smoothed)
+	f.feedInitial(quicAppendCryptoFrame(nil, 0, f.hello))
+	if extra := f.datagrams() - flight; extra != 0 {
+		t.Fatalf("a duplicate ClientHello one smoothed RTT (%v) after the ClientHello drew %d datagrams before the PTO", smoothed, extra)
 	}
 }

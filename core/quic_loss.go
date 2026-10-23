@@ -416,14 +416,14 @@ func (ls *quicLossState) ptoTimeout() time.Duration {
 	return pto * time.Duration(1<<uint(ls.ptoCount))
 }
 
-func (ls *quicLossState) claimHandshakeResend(lastSent, now int64) bool {
+func (ls *quicLossState) handshakeResendWindow(resends int) time.Duration {
 	ls.mu.Lock()
-	defer ls.mu.Unlock()
-	if now-lastSent < int64(ls.smoothedRTT<<uint(ls.ptoCount)) {
-		return false
+	window := ls.smoothedRTT + max64(4*ls.rttVar, quicTimerGranularity)
+	ls.mu.Unlock()
+	for i := 0; i < resends && window < math.MaxInt64/2; i++ {
+		window *= 2
 	}
-	ls.ptoCount++
-	return true
+	return window
 }
 
 func (ls *quicLossState) hasSentPackets(space int) bool {

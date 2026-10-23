@@ -7,6 +7,8 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"hash"
+
+	"github.com/guno1928/turbo"
 )
 
 type quicTLSState struct {
@@ -118,6 +120,7 @@ func (ts *quicTLSState) handleCryptoData(qc *QUICConn, space int, data []byte) {
 		if space != quicSpaceInitial {
 			return
 		}
+		qc.firstFlight.lastSent = turbo.Now()
 		ts.handleClientHello(qc, data)
 		if ts.stage == quicTLSStageWaitFinished {
 			ts.initialConsumed += len(data)
