@@ -108,6 +108,7 @@ type ResponseCache struct {
 	ttlNs    int64
 	stop     chan struct{}
 	stopOnce sync.Once
+	raceSeam func()
 }
 
 // Cache returns middleware that caches handler responses in memory according to
@@ -210,6 +211,7 @@ func (rc *ResponseCache) handle(next HandlerFunc, req *Request, resp *Response) 
 			serveCached(resp, ent, ent.negotiate(req))
 			return
 		}
+		rc.crossRaceSeam()
 		rc.evictEntry(key, ent)
 	}
 	next(req, resp)
@@ -257,6 +259,7 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 			if cur, ok := rc.store.Load(ownedKey); ok {
 				return liveEntry(cur)
 			}
+			rc.crossRaceSeam()
 			stored, _ := rc.store.LoadOrStore(ownedKey, rc.newEntry(status, resp, body))
 			return liveEntry(stored)
 		}
@@ -384,6 +387,12 @@ func (rc *ResponseCache) sweepLoop() {
 	}
 }
 
+func (rc *ResponseCache) crossRaceSeam() {
+	if rc.raceSeam != nil {
+		rc.raceSeam()
+	}
+}
+
 func (rc *ResponseCache) evictEntry(key string, ent *cachedResponse) {
 	rc.store.CompareAndDelete(key, ent)
 }
@@ -392,6 +401,7 @@ func (rc *ResponseCache) evictExpired() {
 	now := turbo.UnixNano()
 	rc.store.Range(func(key string, ent *cachedResponse) bool {
 		if now > ent.expiresAtNs {
+			rc.crossRaceSeam()
 			rc.evictEntry(key, ent)
 		}
 		return true
@@ -414,6 +424,7 @@ func (rc *ResponseCache) evictOverflow() {
 		return true
 	})
 	slices.SortFunc(victims, func(a, b aged) int { return cmp.Compare(a.ts, b.ts) })
+	rc.crossRaceSeam()
 	for i := 0; i < over && i < len(victims); i++ {
 		rc.evictEntry(victims[i].key, victims[i].ent)
 	}

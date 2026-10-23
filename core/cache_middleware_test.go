@@ -861,3 +861,74 @@ func TestCache_BusyFill_FreshEntryBuildsNoCopy(t *testing.T) {
 		t.Fatalf("busy request on a fresh entry allocated %d bytes per call, want under %d", perRound, bodyBytes/4)
 	}
 }
+
+func replaceOnce(rc *ResponseCache, key string, fresh *cachedResponse) {
+	fired := false
+	rc.raceSeam = func() {
+		if fired {
+			return
+		}
+		fired = true
+		rc.store.Store(key, fresh)
+	}
+}
+
+func TestCache_Handle_ExpiredPathKeepsReplacedEntry(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute})
+	defer rc.Stop()
+	h := func(req *Request, resp *Response) { resp.Status(500).String("x") }
+	req := cReq("GET", "x", "/a", "")
+	key := rc.key(req)
+	now := turbo.UnixNano()
+	rc.store.Store(key, &cachedResponse{status: 200, expiresAtNs: now - 1, storedAtNs: now - 2})
+	fresh := &cachedResponse{status: 200, expiresAtNs: now + int64(time.Hour), storedAtNs: now}
+	replaceOnce(rc, key, fresh)
+	rc.handle(h, req, cResp())
+	if cur, ok := rc.store.Load(key); !ok || cur != fresh {
+		t.Fatal("expired path removed the entry that replaced the stale one")
+	}
+}
+
+func TestCache_EvictExpired_KeepsReplacedEntry(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute})
+	defer rc.Stop()
+	now := turbo.UnixNano()
+	rc.store.Store("k", &cachedResponse{expiresAtNs: now - 1, storedAtNs: now - 2})
+	fresh := &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now}
+	replaceOnce(rc, "k", fresh)
+	rc.evictExpired()
+	if cur, ok := rc.store.Load("k"); !ok || cur != fresh {
+		t.Fatal("evictExpired removed the entry that replaced the stale one")
+	}
+}
+
+func TestCache_EvictOverflow_KeepsReplacedEntry(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 1})
+	defer rc.Stop()
+	now := turbo.UnixNano()
+	rc.store.Store("old", &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now - 10})
+	rc.store.Store("new", &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now})
+	fresh := &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now + 1}
+	replaceOnce(rc, "old", fresh)
+	rc.evictOverflow()
+	if cur, ok := rc.store.Load("old"); !ok || cur != fresh {
+		t.Fatal("evictOverflow removed the entry that replaced the victim")
+	}
+}
+
+func TestCache_BusyFill_KeepsCompressedEntryThatLandsMidWrite(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, Gzip: true, GzipMinBytes: 10})
+	defer rc.Stop()
+	now := turbo.UnixNano()
+	compressed := &cachedResponse{status: 200, encodings: offerGzip, expiresAtNs: now + int64(time.Hour), storedAtNs: now}
+	replaceOnce(rc, "k", compressed)
+	rc.filling.Store("k", struct{}{})
+	resp := cResp()
+	resp.Status(200).String(bigBody(300))
+	if got := rc.captureAndStore("k", "GET", resp); got != compressed {
+		t.Fatalf("busy request returned %+v, want the compressed entry", got)
+	}
+	if cur, _ := rc.store.Load("k"); cur != compressed {
+		t.Fatal("busy request overwrote the compressed entry")
+	}
+}
