@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"io"
 	"net"
 	"os"
 	"testing"
@@ -98,22 +97,26 @@ const proxyFixRedirectPerIP = 3
 
 func TestProxyFixRedirectEnforcesPerIPLimit(t *testing.T) {
 	_, _, httpAddr := proxyFixStartTLS(t, Config{MaxConnsPerIP: proxyFixRedirectPerIP}, nil)
-	proxyFixOpenStalled(t, httpAddr, proxyFixRedirectPerIP)
-	time.Sleep(proxyFixStep)
-	extra := proxyFixDial(t, httpAddr)
-	defer extra.Close()
-	_, _ = extra.Write([]byte("G"))
-	_ = extra.SetReadDeadline(wallDeadline(3 * proxyFixStep))
-	var one [1]byte
-	_, err := extra.Read(one[:])
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("connection %d from one IP to the redirect listener was held open; MaxConnsPerIP=%d not enforced",
-			proxyFixRedirectPerIP+1, proxyFixRedirectPerIP)
+	total := proxyFixRedirectPerIP + 1
+	conns := proxyFixOpenStalled(t, httpAddr, total)
+	closedByServer := make(chan bool, total)
+	for _, c := range conns {
+		go func(c net.Conn) {
+			_ = c.SetReadDeadline(wallDeadline(3 * proxyFixStep))
+			var one [1]byte
+			_, err := c.Read(one[:])
+			closedByServer <- err != nil && !errors.Is(err, os.ErrDeadlineExceeded)
+		}(c)
 	}
-	if err != io.EOF && err != nil {
-		var opErr *net.OpError
-		if !errors.As(err, &opErr) {
-			t.Fatalf("over-limit connection: unexpected error %v", err)
+	closed := 0
+	for range conns {
+		if <-closedByServer {
+			closed++
 		}
+	}
+	held := total - closed
+	if closed < 1 || held < proxyFixRedirectPerIP-1 || held > proxyFixRedirectPerIP {
+		t.Fatalf("%d of %d connections from one IP to the redirect listener were held open; MaxConnsPerIP=%d admits %d, or %d when the startup probe still holds a slot",
+			held, total, proxyFixRedirectPerIP, proxyFixRedirectPerIP, proxyFixRedirectPerIP-1)
 	}
 }
