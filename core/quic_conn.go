@@ -252,6 +252,7 @@ type QUICConn struct {
 		ee, cert, cv, fin []byte
 		sent              bool
 		initialOffset     uint64
+		lastSent          int64
 	}
 
 	streams        map[uint64]*QUICStream
@@ -838,6 +839,10 @@ func (qc *QUICConn) handleCryptoFrame(space int, f quicCryptoFrame) {
 	}
 	end := f.offset + uint64(len(f.data))
 	if f.offset > maxBuf || end > maxBuf {
+		return
+	}
+	if space == quicSpaceInitial && len(f.data) > 0 && end <= uint64(qc.tlsState.messageStart(space)) {
+		qc.resendFirstFlightOnDuplicate()
 		return
 	}
 	if end > uint64(len(qc.cryptoBuf[space])) {
@@ -1615,6 +1620,21 @@ func (qc *QUICConn) grantStreams(limit *uint64, maxStreams uint64, bidi bool) {
 	qc.writeMu.Unlock()
 }
 
+func (qc *QUICConn) resendFirstFlightOnDuplicate() {
+	if qc.tlsState.stage != quicTLSStageWaitFinished {
+		return
+	}
+	if !qc.loss.claimHandshakeResend(qc.firstFlight.lastSent, turbo.Now()) {
+		return
+	}
+	if debugFlag.Load() {
+		Dbg("[QUIC-DBG] retransmitting handshake flight (client repeated its Initial)")
+	}
+	qc.loss.discardSpace(quicSpaceInitial)
+	qc.loss.discardSpace(quicSpaceHandshake)
+	qc.sendFirstFlight(qc.firstFlight.serverHello, qc.firstFlight.ee, qc.firstFlight.cert, qc.firstFlight.cv, qc.firstFlight.fin)
+}
+
 func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 	if !qc.firstFlight.sent {
 		qc.firstFlight.serverHello = make([]byte, len(serverHello))
@@ -1629,6 +1649,7 @@ func (qc *QUICConn) sendFirstFlight(serverHello, ee, cert, cv, fin []byte) {
 		copy(qc.firstFlight.fin, fin)
 		qc.firstFlight.sent = true
 	}
+	qc.firstFlight.lastSent = turbo.Now()
 
 	qc.writeMu.Lock()
 	defer qc.writeMu.Unlock()

@@ -18,12 +18,12 @@ type quicTLSState struct {
 	clientHSSecret []byte
 	stage          int
 
-	retry             *tls13Retry
-	secondHelloOffset int
-	hsConsumed        int
-	masterSecret      []byte
-	clientAuth        *tls13ClientAuth
-	peerChain         [][]byte
+	retry           *tls13Retry
+	initialConsumed int
+	hsConsumed      int
+	masterSecret    []byte
+	clientAuth      *tls13ClientAuth
+	peerChain       [][]byte
 }
 
 const (
@@ -58,7 +58,7 @@ func (qc *QUICConn) closeWithTLSAlert(alert tlsAlert) {
 func (ts *quicTLSState) messageStart(space int) int {
 	switch space {
 	case quicSpaceInitial:
-		return ts.secondHelloOffset
+		return ts.initialConsumed
 	case quicSpaceHandshake:
 		return ts.hsConsumed
 	}
@@ -107,7 +107,7 @@ func (ts *quicTLSState) sendSessionTicket(qc *QUICConn) {
 func (ts *quicTLSState) sendHelloRetry(qc *QUICConn, cs *CipherSuiteConfig, group tlsGroup, ch *ParsedClientHello, hello []byte) {
 	retry, hrr := newHelloRetry(cs, group, ch, hello)
 	ts.retry = retry
-	ts.secondHelloOffset = len(hello)
+	ts.initialConsumed = len(hello)
 	qc.firstFlight.initialOffset = uint64(len(hrr))
 	qc.sendFrames(quicSpaceInitial, quicAppendCryptoFrame(nil, 0, hrr), true)
 }
@@ -119,14 +119,10 @@ func (ts *quicTLSState) handleCryptoData(qc *QUICConn, space int, data []byte) {
 			return
 		}
 		ts.handleClientHello(qc, data)
-	case quicTLSStageWaitFinished:
-		if space == quicSpaceInitial && qc.firstFlight.sent {
-			if debugFlag.Load() {
-				Dbg("[QUIC-DBG] retransmitting handshake flight (browser retried Initial)")
-			}
-			qc.sendFirstFlight(qc.firstFlight.serverHello, qc.firstFlight.ee, qc.firstFlight.cert, qc.firstFlight.cv, qc.firstFlight.fin)
-			return
+		if ts.stage == quicTLSStageWaitFinished {
+			ts.initialConsumed += len(data)
 		}
+	case quicTLSStageWaitFinished:
 		if space != quicSpaceHandshake {
 			return
 		}

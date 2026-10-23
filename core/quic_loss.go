@@ -357,6 +357,16 @@ func (ls *quicLossState) ptoTimeout() time.Duration {
 	return pto * time.Duration(1<<uint(ls.ptoCount))
 }
 
+func (ls *quicLossState) claimHandshakeResend(lastSent, now int64) bool {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if now-lastSent < int64(ls.ptoTimeout()) {
+		return false
+	}
+	ls.ptoCount++
+	return true
+}
+
 func (ls *quicLossState) hasSentPackets(space int) bool {
 	ls.mu.Lock()
 	n := len(ls.sent[space])
