@@ -2,10 +2,18 @@ module github.com/guno1928/alos-http/tests/h3interop
 
 go 1.26.9
 
+toolchain go1.26.10
+
 require (
 	github.com/guno1928/alos-http v0.0.0
 	github.com/guno1928/turbo v0.0.0-20260706091412-3b318c1e1ce7
 	github.com/quic-go/quic-go v0.59.1
+)
+
+require (
+	filippo.io/edwards25519 v1.2.0 // indirect
+	github.com/klauspost/compress v1.20.3 // indirect
+	github.com/molecule-man/go-brrr v1.3.0 // indirect
 )
 
 require (
