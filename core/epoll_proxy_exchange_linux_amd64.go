@@ -70,6 +70,7 @@ type proxyExchange struct {
 	h2Body     []byte
 	h2Reserved int64
 	budgetConn *epollConn
+	hookResult *ProxyRequest
 	h2Expected int64
 	refusal    proxyRefusal
 	h2Streamed bool
@@ -192,12 +193,13 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 		promoteRequestStrings(req)
 	}
 
+	var hookResult *ProxyRequest
 	cache := pe.activeCache()
 	if cache != nil && cacheableMethod {
 		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath = proxyRequestTarget(req)
 		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			refusal, serve := w.cacheHitVerdict(pe, ds, req)
+			refusal, rewritten, serve := w.cacheHitVerdict(pe, ds, req)
 			if refusal.status != 0 {
 				admission.release(w.server)
 				refusal.answer(&c.resp)
@@ -208,6 +210,7 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 				w.serveProxyCacheHit(pe, ds, cache, entry, req, &c.resp)
 				return proxyStartServed
 			}
+			hookResult = rewritten
 		}
 	}
 
@@ -217,6 +220,7 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 	}
 
 	px := w.pxGet()
+	px.hookResult = hookResult
 	px.admission = admission
 	px.w = w
 	px.c = c
@@ -444,20 +448,43 @@ func (w *epollWorker) guardUserHook(req *Request, call func()) (completed bool) 
 	return true
 }
 
-func (w *epollWorker) cacheHitVerdict(pe *ProxyEngine, ds *domainState, req *Request) (proxyRefusal, bool) {
-	onRequest := pe.requestHook()
-	if onRequest == nil {
-		return proxyRefusal{}, true
-	}
-	pr := cacheHitProxyRequest(ds, req)
+func (w *epollWorker) runProxyRequestHook(onRequest ProxyInterceptFunc, px *proxyExchange, b *backend, req *Request, host string) (*ProxyRequest, proxyRefusal) {
+	hook := &proxyHookRequest{}
+	pr := &hook.ProxyRequest
+	pr.Domain = px.ds.config.Domain
+	pr.Backend = b.Addr
+	pr.ClientAddr = px.clientAddr
+	pr.Method = req.Method
+	pr.Path = req.Path
+	pr.Headers = append(hook.headers[:0], req.Headers...)
+	pr.Host = host
+	return pr, w.callProxyRequestHook(onRequest, pr, req)
+}
+
+func (w *epollWorker) callProxyRequestHook(onRequest ProxyInterceptFunc, pr *ProxyRequest, req *Request) proxyRefusal {
 	allowed := false
 	if !w.guardUserHook(req, func() { allowed = onRequest(pr) }) {
-		return proxyRefusedHookFailed, false
+		return proxyRefusedHookFailed
 	}
 	if !allowed {
-		return proxyRefusedByHook, false
+		return proxyRefusedByHook
 	}
-	return proxyRefusal{}, !proxyHookChangedRequest(pr, req, ds.config.HostHeader)
+	return proxyRefusal{}
+}
+
+func (w *epollWorker) cacheHitVerdict(pe *ProxyEngine, ds *domainState, req *Request) (proxyRefusal, *ProxyRequest, bool) {
+	onRequest := pe.requestHook()
+	if onRequest == nil {
+		return proxyRefusal{}, nil, true
+	}
+	pr := cacheHitProxyRequest(ds, req)
+	if refusal := w.callProxyRequestHook(onRequest, pr, req); refusal.status != 0 {
+		return refusal, nil, false
+	}
+	if proxyHookChangedRequest(pr, req, ds.config.HostHeader) {
+		return proxyRefusal{}, pr, false
+	}
+	return proxyRefusal{}, nil, true
 }
 
 func (w *epollWorker) serveProxyCacheHit(pe *ProxyEngine, ds *domainState, cache *ProxyCache, entry *cacheEntry, req *Request, resp *Response) {
@@ -516,25 +543,16 @@ func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error)
 	req := px.request()
 	hostHdr := ds.config.HostHeader
 	if onRequest := px.pe.requestHook(); onRequest != nil {
-		hook := &proxyHookRequest{}
-		pr := &hook.ProxyRequest
-		pr.Domain = ds.config.Domain
-		pr.Backend = b.Addr
-		pr.ClientAddr = px.clientAddr
-		pr.Method = req.Method
-		pr.Path = req.Path
-		pr.Headers = append(hook.headers[:0], req.Headers...)
-		pr.Host = hostHdr
+		pr := px.hookResult
+		px.hookResult = nil
+		if pr == nil {
+			var refusal proxyRefusal
+			if pr, refusal = w.runProxyRequestHook(onRequest, px, b, req, hostHdr); refusal.status != 0 {
+				px.b = nil
+				return refusal, nil
+			}
+		}
 		originalPath := req.Path
-		allowed := false
-		if !w.guardUserHook(req, func() { allowed = onRequest(pr) }) {
-			px.b = nil
-			return proxyRefusedHookFailed, nil
-		}
-		if !allowed {
-			px.b = nil
-			return proxyRefusedByHook, nil
-		}
 		if proxyHookChangedRequest(pr, req, hostHdr) {
 			px.mayCache = false
 		}
