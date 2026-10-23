@@ -427,7 +427,7 @@ func writeHTTPRouteStatus(conn net.Conn, status int) {
 	out = append(out, ' ')
 	out = append(out, statusText(status)...)
 	out = append(out, "\r\n"...)
-	out = appendH1ResponseDate(out, status, nil)
+	out = appendDateUnlessSet(out, nil)
 	out = append(out, "Content-Length: 0\r\nConnection: close\r\n\r\n"...)
 	_ = writeFull(conn, out)
 }
@@ -534,7 +534,7 @@ func buildACMEResponse(body []byte) []byte {
 	buf = append(buf, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: "...)
 	buf = appendInt(buf, len(body))
 	buf = append(buf, "\r\n"...)
-	buf = appendH1ResponseDate(buf, 200, nil)
+	buf = appendDateUnlessSet(buf, nil)
 	buf = append(buf, "Connection: close\r\n\r\n"...)
 	buf = append(buf, body...)
 
@@ -672,7 +672,7 @@ func buildRedirectResponse(location string) []byte {
 	buf = append(buf, "HTTP/1.1 301 Moved Permanently\r\nLocation: "...)
 	buf = append(buf, location...)
 	buf = append(buf, "\r\n"...)
-	buf = appendH1ResponseDate(buf, 301, nil)
+	buf = appendDateUnlessSet(buf, nil)
 	buf = append(buf, "Content-Length: 0\r\nConnection: close\r\n\r\n"...)
 
 	result := make([]byte, len(buf))

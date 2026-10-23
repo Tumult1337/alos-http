@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/alosmap"
@@ -54,7 +55,7 @@ import (
 //	Example: GzipMinBytes: 1024.
 //
 // GzipLevel is the gzip level used when Gzip is set; values outside 1–9 default
-// to 6.
+// to 2.
 //
 //	Example: GzipLevel: 9.
 //
@@ -101,6 +102,8 @@ type cachedResponse struct {
 type ResponseCache struct {
 	cfg      CacheConfig
 	store    *alosmap.TypedMap[string, *cachedResponse]
+	filling  *alosmap.TypedMap[string, struct{}]
+	builds   atomic.Int64
 	methods  map[string]struct{}
 	ttlNs    int64
 	stop     chan struct{}
@@ -123,7 +126,7 @@ func Cache(cfg CacheConfig) MiddlewareFunc {
 
 // NewResponseCache builds a ResponseCache from cfg, applying defaults for any
 // zero field (TTL 60s, Methods {"GET"}, MaxEntries 10000, MaxBodyBytes 1 MiB,
-// GzipMinBytes 512, GzipLevel 6, SweepInterval 15s) and starting the background
+// GzipMinBytes 512, GzipLevel 2, SweepInterval 15s) and starting the background
 // sweeper. Call Stop when done to end the sweeper goroutine.
 //
 // Example: rc := NewResponseCache(CacheConfig{})
@@ -145,7 +148,7 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 		cfg.GzipMinBytes = 512
 	}
 	if cfg.GzipLevel < 1 || cfg.GzipLevel > 9 {
-		cfg.GzipLevel = 6
+		cfg.GzipLevel = defaultCompressLevel
 	}
 	cfg.BrotliLevel = normalizeBrotliLevel(cfg.BrotliLevel)
 	if cfg.SweepInterval <= 0 {
@@ -158,6 +161,7 @@ func NewResponseCache(cfg CacheConfig) *ResponseCache {
 	rc := &ResponseCache{
 		cfg:     cfg,
 		store:   alosmap.NewTyped[string, *cachedResponse]().Prealloc(128),
+		filling: alosmap.NewTyped[string, struct{}](),
 		methods: methods,
 		ttlNs:   int64(cfg.TTL),
 		stop:    make(chan struct{}),
@@ -223,7 +227,7 @@ func (ent *cachedResponse) negotiate(req *Request) encodingType {
 }
 
 func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *cachedResponse {
-	if resp == nil || resp.IsStreamed() {
+	if resp == nil || resp.IsStreamed() || resp.fileBody {
 		return nil
 	}
 	status := resp.StatusCode
@@ -246,6 +250,17 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 			return nil
 		}
 	}
+	ownedKey := strings.Clone(key)
+	compress := (rc.cfg.Gzip || rc.cfg.Brotli) && len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType)
+	if compress {
+		if _, busy := rc.filling.LoadOrStore(ownedKey, struct{}{}); busy {
+			return nil
+		}
+		defer rc.filling.Delete(ownedKey)
+		if cur, ok := rc.store.Load(ownedKey); ok && turbo.UnixNano() <= cur.expiresAtNs {
+			return cur
+		}
+	}
 	now := turbo.UnixNano()
 	ent := &cachedResponse{
 		status:      status,
@@ -255,12 +270,13 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 		expiresAtNs: now + rc.ttlNs,
 		storedAtNs:  now,
 	}
-	if len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType) {
+	if compress {
+		rc.builds.Add(1)
 		if rc.cfg.Gzip {
-			ent.gzipBody = compressedVariant(body, encodingGzip, rc.cfg.GzipLevel)
+			ent.gzipBody = compressOnce(body, encodingGzip, rc.cfg.GzipLevel)
 		}
 		if rc.cfg.Brotli {
-			ent.brotliBody = compressedVariant(body, encodingBrotli, rc.cfg.BrotliLevel)
+			ent.brotliBody = compressOnce(body, encodingBrotli, rc.cfg.BrotliLevel)
 		}
 	}
 	if ent.gzipBody != nil {
@@ -270,7 +286,7 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 		ent.encodings |= offerBrotli
 	}
 	ent.addVary = ent.encodings != 0 && !varyCoversAcceptEncoding(ent.headers)
-	rc.store.Store(strings.Clone(key), ent)
+	rc.store.Store(ownedKey, ent)
 	return ent
 }
 
@@ -287,13 +303,13 @@ func serveCached(resp *Response, ent *cachedResponse, enc encodingType) {
 	resp.ContentType = ent.contentType
 	switch enc {
 	case encodingGzip:
-		resp.SetBody(ent.gzipBody)
+		resp.referenceBody(ent.gzipBody)
 		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
 	case encodingBrotli:
-		resp.SetBody(ent.brotliBody)
+		resp.referenceBody(ent.brotliBody)
 		resp.SetHeaderUnsafe("Content-Encoding", contentEncodingNames[enc])
 	default:
-		resp.SetBody(ent.body)
+		resp.referenceBody(ent.body)
 	}
 	if ent.addVary {
 		resp.SetHeaderUnsafe("Vary", "Accept-Encoding")
@@ -442,18 +458,5 @@ func cloneHeaders(h [][2]string) [][2]string {
 func cloneBytes(b []byte) []byte {
 	out := make([]byte, len(b))
 	copy(out, b)
-	return out
-}
-
-func compressedVariant(body []byte, enc encodingType, level int) []byte {
-	bp := LargeBufPool.Get().(*[]byte)
-	buf := appendCompressed((*bp)[:0], body, enc, level)
-	var out []byte
-	if len(buf) > 0 && len(buf) < len(body) {
-		out = make([]byte, len(buf))
-		copy(out, buf)
-	}
-	*bp = buf
-	putBoxedBufCapped(&LargeBufPool, bp, largeBufPoolMaxCap)
 	return out
 }

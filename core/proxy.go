@@ -412,6 +412,7 @@ type backend struct {
 	ActiveConns   atomic.Int64
 	trust         *upstreamTrust
 	outlier       outlierState
+	fp            fpBackendTarget
 }
 
 type domainState struct {
@@ -543,6 +544,7 @@ func (pe *ProxyEngine) AddDomain(cfg DomainConfig) {
 			TLS:           bc.TLS,
 			TLSSkipVerify: bc.TLSSkipVerify,
 			trust:         newUpstreamTrust(bc),
+			fp:            newFPBackendTarget(bc.Addr),
 		}
 		b.Healthy.Store(true)
 		backends[i] = b

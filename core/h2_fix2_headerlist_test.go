@@ -75,7 +75,7 @@ func (rc *h2RawConn) h2Fix2Status(streamID uint32) string {
 	case H2FrameRSTStream:
 		return fmt.Sprintf("RST_STREAM(%d)", binary.BigEndian.Uint32(f.payload))
 	}
-	fields, err := NewHpackDecoder().Decode(f.payload)
+	fields, err := f.fields, f.fieldErr
 	if err != nil {
 		rc.t.Fatalf("stream %d response HEADERS: %v", streamID, err)
 	}

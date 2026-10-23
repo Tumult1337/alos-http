@@ -148,11 +148,9 @@ func (w *epollWorker) writeClientResponse(c *epollConn, status int, headers resp
 		c.writeBuf = append(c.writeBuf, body...)
 		return
 	}
-	scratch := w.beScratch[:0]
-	scratch = appendProxyResponseHead(scratch, status, headers, declaredLen, keepAlive, contentType)
-	scratch = append(scratch, body...)
+	scratch := appendProxyResponseHead(w.beScratch[:0], status, headers, declaredLen, keepAlive, contentType)
 	w.beScratch = scratch[:0]
-	c.writeBuf = c.sealTLSAppData(c.writeBuf, scratch)
+	c.writeBuf = c.sealTLSAppDataParts(c.writeBuf, scratch, body)
 }
 
 // proxyDeclaredLength is what Content-Length must say. A HEAD response carries
@@ -519,7 +517,7 @@ func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error)
 		hostHdr = pr.Host
 	}
 
-	authority := fpProxyAuthority(b.Addr)
+	authority := b.fpAuthority()
 	if hostHdr == "" {
 		if ds.config.PreserveHost && req.Host != "" {
 			hostHdr = req.Host
@@ -531,7 +529,7 @@ func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error)
 	px.Exchange.wroteRequest = false
 	px.Exchange.replayable = proxyRequestReplayable(req.Method, req.Headers, ds.config.TrustIdempotencyKey)
 
-	ip, port, err := resolveAuthority(authority)
+	ip, port, err := b.fpResolve(authority)
 	if err != nil {
 		return proxyRefusal{}, err
 	}

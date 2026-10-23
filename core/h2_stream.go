@@ -46,6 +46,7 @@ type H2Stream struct {
 	respOff         int
 	respHeadersSent bool
 	stallBytes      int
+	parkedBytes     int
 	dispatchGen     uint32
 	wsTunnel        bool
 	abandoned       bool
@@ -54,6 +55,13 @@ type H2Stream struct {
 	cancel   cancelSlot
 	busyPrev *H2Stream
 	busyNext *H2Stream
+
+	conn      *epollConn
+	runFn     func()
+	doneNext  *H2Stream
+	inlineSeq uint64
+	handler   HandlerFunc
+	route     *inlineRoute
 }
 
 // Reset clears an H2Stream so it can be reused from a pool.
@@ -65,8 +73,12 @@ func (s *H2Stream) Reset() {
 	s.bodyConn = nil
 	s.bodyAccounted = 0
 	s.ID = 0
-	s.State.Store(StreamIdle)
-	s.Window.Store(0)
+	if s.State.Load() != StreamIdle {
+		s.State.Store(StreamIdle)
+	}
+	if s.Window.Load() != 0 {
+		s.Window.Store(0)
+	}
 	s.RecvWindow = 0
 	s.Method = ""
 	s.Path = ""
@@ -88,8 +100,12 @@ func (s *H2Stream) Reset() {
 	s.respOff = 0
 	s.respHeadersSent = false
 	s.stallBytes = 0
+	s.parkedBytes = 0
 	s.dispatchGen = 0
 	s.wsTunnel = false
 	s.abandoned = false
 	s.abandonCounted = false
+	s.conn = nil
+	s.handler = nil
+	s.route = nil
 }

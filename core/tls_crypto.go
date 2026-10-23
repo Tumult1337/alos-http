@@ -264,6 +264,17 @@ func (t *TrafficAEAD) Decrypt(ciphertext []byte) ([]byte, error) {
 	return pt, nil
 }
 
+func (t *TrafficAEAD) decryptAppend(dst, ciphertext []byte) ([]byte, error) {
+	sp := &t.scratch
+	t.prepareRecord(sp, uint16(len(ciphertext)))
+	out, err := t.aead.Open(dst, sp.nonce[:t.nonceSize], ciphertext, sp.ad[:])
+	if err != nil {
+		return nil, err
+	}
+	t.seq++
+	return out, nil
+}
+
 // GenerateSelfSignedForDomain creates a self-signed ECDSA P-256 certificate valid for
 // 365 days for domain, used as a DNS SAN, or as an IP SAN if domain parses as an IP
 // address, and returns the DER-encoded certificate and its private key.

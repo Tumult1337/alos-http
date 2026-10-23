@@ -16,7 +16,7 @@ func startAppFixWSIdentityServer(t *testing.T, inline bool) *testServer {
 	return newTestServer(t, testServerOptions{
 		Config: func(cfg *Config) {
 			cfg.PlainHTTP = true
-			cfg.InlineHandlers = inline
+			cfg.InlineHandlers, cfg.DisableInlineHandlers = inline, !inline
 		},
 		Routes: func(r *Router) {
 			r.GET("/ws", func(req *Request, resp *Response) {

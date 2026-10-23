@@ -73,7 +73,7 @@ func TestRouterHEADOverHTTP2SendsNoData(t *testing.T) {
 			t.Fatalf("HEAD over HTTP/2 sent %d body bytes", len(f.payload))
 		}
 		if f.typ == H2FrameHeaders {
-			if status := h2RawStatusFromHeaders(t, f.payload); status != 200 {
+			if status := f.status(t); status != 200 {
 				t.Fatalf("HEAD status %d", status)
 			}
 		}

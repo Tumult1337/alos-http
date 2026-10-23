@@ -73,6 +73,7 @@ type CertEntry struct {
 	Source   CertSource
 
 	cachedCertMsg     []byte
+	cachedCert12Msg   []byte
 	cachedEEH1        []byte
 	cachedEEH2        []byte
 	cachedEEEmpty     []byte
@@ -134,6 +135,9 @@ func (cs *CertStore) Lookup(serverName string) *CertEntry {
 func (entry *CertEntry) initCachedHandshake() {
 	if entry.cachedCertMsg == nil && len(entry.ChainDER) > 0 {
 		entry.cachedCertMsg = BuildCertificate(entry.ChainDER)
+	}
+	if entry.cachedCert12Msg == nil && len(entry.ChainDER) > 0 {
+		entry.cachedCert12Msg = buildTLS12Certificate(entry.ChainDER)
 	}
 	if entry.cachedEEH1 == nil {
 		entry.cachedEEH1 = BuildEncryptedExtensions("http/1.1")

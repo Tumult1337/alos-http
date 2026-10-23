@@ -5,30 +5,41 @@ package core
 import (
 	"bytes"
 	"math/bits"
+	"net/http"
 )
 
-func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
-	dst, _ = appendPlainResponseModeAt(resp, dst, keepAlive, includeBody, responseDateValue(resp.StatusCode, resp.Headers))
-	return dst
+func plainOKHead(resp *Response) []byte {
+	if preset := plainContentTypePreset(resp.ContentType); preset >= 0 && (len(resp.Headers) == 0 || !headersHaveFold(resp.Headers, "Date")) {
+		return currentHTTPDate().ok200[preset]
+	}
+	return nil
 }
 
-func appendPlainResponseModeAt(resp *Response, dst []byte, keepAlive bool, includeBody bool, date string) ([]byte, responseDateSpan) {
-	dst = appendStatusLine(dst, resp.StatusCode)
-
-	if resp.ContentType != "" {
-		switch resp.ContentType {
-		case "application/json; charset=utf-8":
-			dst = append(dst, ctPrefixJSON...)
-		case "text/plain; charset=utf-8":
-			dst = append(dst, ctPrefixTextPlain...)
-		case "text/html; charset=utf-8":
-			dst = append(dst, ctPrefixTextHTML...)
-		case "application/octet-stream":
-			dst = append(dst, ctPrefixOctet...)
-		default:
-			dst = append(dst, "Content-Type: "...)
-			dst = appendHeaderValueStripped(dst, resp.ContentType)
-			dst = append(dst, '\r', '\n')
+func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
+	var head []byte
+	if resp.StatusCode == http.StatusOK {
+		head = plainOKHead(resp)
+	}
+	if head != nil {
+		dst = append(dst, head...)
+	} else {
+		dst = appendStatusLine(dst, resp.StatusCode)
+		dst = appendDateUnlessSet(dst, resp.Headers)
+		if resp.ContentType != "" {
+			switch resp.ContentType {
+			case "application/json; charset=utf-8":
+				dst = append(dst, ctPrefixJSON...)
+			case "text/plain; charset=utf-8":
+				dst = append(dst, ctPrefixTextPlain...)
+			case "text/html; charset=utf-8":
+				dst = append(dst, ctPrefixTextHTML...)
+			case "application/octet-stream":
+				dst = append(dst, ctPrefixOctet...)
+			default:
+				dst = append(dst, "Content-Type: "...)
+				dst = appendHeaderValueStripped(dst, resp.ContentType)
+				dst = append(dst, '\r', '\n')
+			}
 		}
 	}
 
@@ -48,25 +59,12 @@ func appendPlainResponseModeAt(resp *Response, dst []byte, keepAlive bool, inclu
 		}
 	}
 
-	for i := range resp.Headers {
-		dst = append(dst, resp.Headers[i][0]...)
-		dst = append(dst, ':', ' ')
-		dst = append(dst, resp.Headers[i][1]...)
-		dst = append(dst, '\r', '\n')
-	}
-
-	dst, dateSpan := appendH1Date(dst, date)
-	ka, cl := serverConnHeaders(resp)
-	if keepAlive {
-		dst = append(dst, ka...)
-	} else {
-		dst = append(dst, cl...)
-	}
-	dst = append(dst, '\r', '\n')
+	dst = appendH1HeaderFields(dst, resp.Headers)
+	dst = append(dst, serverConnHeadTail(resp, keepAlive)...)
 	if includeBody && !suppressBody {
-		dst = resp.appendBody(dst)
+		dst = resp.appendBody(growIOBuf(dst, resp.BodyLen()))
 	}
-	return dst, dateSpan
+	return dst
 }
 
 func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
@@ -113,10 +111,6 @@ func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, 
 		return nil, 0, false, false
 	}
 	if !ok {
-		return nil, 0, false, false
-	}
-	fast = s.currentPlainRootDate(fast)
-	if fast == nil {
 		return nil, 0, false, false
 	}
 	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true

@@ -5,6 +5,7 @@ package core
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -213,7 +214,8 @@ func TestH2ResponseHeaderFragmentationStreamAndBodyFlow(t *testing.T) {
 
 func TestH2ResponseHeaderFragmentationBufferedBodyFlow(t *testing.T) {
 	headers, _ := responseHeaderBlockOfSize(t, 32769)
-	connection := &epollConn{}
+	server := New(Config{ServerName: "ALOS"})
+	connection := &epollConn{worker: &epollWorker{server: server}}
 	connection.h2.maxFrameSize = H2DefaultMaxFrameSize
 	stream := &H2Stream{}
 	stream.resp.StatusCode = 200
@@ -222,9 +224,16 @@ func TestH2ResponseHeaderFragmentationBufferedBodyFlow(t *testing.T) {
 	first, done := connection.h2AppendWindowed(nil, stream, 15, 1<<20)
 	encoder := HpackEncoder{}
 	encodeH2ResponseHeaders(&encoder, 200, "", 2, headers, "ALOS")
-	expected := encoder.Buf
+	expected, err := newHpackDecoder(4096).Decode(encoder.Buf)
+	if err != nil {
+		t.Fatal(err)
+	}
 	got, body, _ := responseHeaderFlight(t, first, 15, H2DefaultMaxFrameSize, false)
-	if done || !bytes.Equal(got, expected) || len(body) != 0 || stream.respOff != 0 || connection.h2.connWindow != 0 || stream.Window.Load() != 0 {
+	gotFields, err := newHpackDecoder(4096).Decode(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done || !slices.Equal(gotFields, expected) || len(body) != 0 || stream.respOff != 0 || connection.h2.connWindow != 0 || stream.Window.Load() != 0 {
 		t.Fatal("buffered headers/data flow changed")
 	}
 	connection.h2.connWindow = 2

@@ -361,7 +361,7 @@ func TestBrotliResponseCache(t *testing.T) {
 		if hdr(resp, "vary") != "Accept-Encoding" || varyFieldLines(resp) != 1 {
 			t.Errorf("request %d (%q): Vary %q", i, c.accept, hdr(resp, "vary"))
 		}
-		if !bytes.Equal(decodeContent(t, c.want, resp.body), compressibleTestBody) {
+		if !bytes.Equal(decodeContent(t, c.want, resp.GetBody()), compressibleTestBody) {
 			t.Errorf("request %d (%q): body does not decode to the original", i, c.accept)
 		}
 	}
@@ -407,7 +407,7 @@ func TestProxyCacheHonoursZeroQValue(t *testing.T) {
 		if hdr(resp, "vary") != "Accept-Encoding" {
 			t.Errorf("Accept-Encoding %q: Vary %q", c.accept, hdr(resp, "vary"))
 		}
-		if !bytes.Equal(decodeContent(t, c.want, resp.body), compressibleTestBody) {
+		if !bytes.Equal(decodeContent(t, c.want, resp.GetBody()), compressibleTestBody) {
 			t.Errorf("Accept-Encoding %q: body does not decode", c.accept)
 		}
 	}

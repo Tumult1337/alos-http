@@ -133,7 +133,7 @@ func openH2WebSocket(t *testing.T, rc *h2RawConn, id uint32, path string, extra 
 	if f.typ != H2FrameHeaders {
 		t.Fatalf("extended CONNECT answered with frame type %d", f.typ)
 	}
-	hdrs, err := NewHpackDecoder().Decode(f.payload)
+	hdrs, err := f.fields, f.fieldErr
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +251,7 @@ func TestWebSocketH2Echo(t *testing.T) {
 	}
 
 	rc.write(H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 3, hpackBlock([2]string{":method", "GET"}, [2]string{":scheme", "http"}, [2]string{":path", "/ok"}, [2]string{":authority", harnessDomain}))
-	if f, err := rc.awaitStreamOutcome(3); err != nil || f.typ != H2FrameHeaders || h2RawStatusFromHeaders(t, f.payload) != 200 {
+	if f, err := rc.awaitStreamOutcome(3); err != nil || f.typ != H2FrameHeaders || f.status(t) != 200 {
 		t.Fatalf("connection unusable after the WebSocket: %+v %v", f, err)
 	}
 }
@@ -314,7 +314,7 @@ func TestWebSocketH2MalformedRequests(t *testing.T) {
 		}
 	}
 	rc.write(H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 9, hpackBlock([2]string{":method", "GET"}, [2]string{":scheme", "http"}, [2]string{":path", "/ok"}, [2]string{":authority", harnessDomain}))
-	if f, err := rc.awaitStreamOutcome(9); err != nil || f.typ != H2FrameHeaders || h2RawStatusFromHeaders(t, f.payload) != 200 {
+	if f, err := rc.awaitStreamOutcome(9); err != nil || f.typ != H2FrameHeaders || f.status(t) != 200 {
 		t.Fatalf("connection unusable after malformed requests: %+v %v", f, err)
 	}
 }
@@ -326,7 +326,7 @@ func TestWebSocketH2RejectsBadVersion(t *testing.T) {
 		[2]string{":method", "CONNECT"}, [2]string{":protocol", "websocket"}, [2]string{":scheme", "http"},
 		[2]string{":path", "/ws"}, [2]string{":authority", harnessDomain}, [2]string{"sec-websocket-version", "8"}))
 	f, err := rc.awaitStreamOutcome(1)
-	if err != nil || f.typ != H2FrameHeaders || h2RawStatusFromHeaders(t, f.payload) != 426 {
+	if err != nil || f.typ != H2FrameHeaders || f.status(t) != 426 {
 		t.Fatalf("frame %+v err %v, want 426", f, err)
 	}
 }

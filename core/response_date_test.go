@@ -180,11 +180,22 @@ func TestResponseDateEligibility(t *testing.T) {
 	}
 }
 
+func dateMemoH2Fields(t *testing.T, fast *h2RootFastResponse) [][2]string {
+	t.Helper()
+	wire := appendFastH2RootResponse(nil, fast, 123, H2DefaultMaxFrameSize)
+	block, body, _ := responseHeaderFlight(t, wire, 123, H2DefaultMaxFrameSize, len(fast.body) == 0)
+	if !bytes.Equal(body, fast.body) {
+		t.Fatal("cached H2 body changed")
+	}
+	fields, err := newHpackDecoder(4096).Decode(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fields
+}
+
 func TestResponseDateDefaultRootClock(t *testing.T) {
 	server := rootFastServer(t, Config{})
-	if server.dateNow != nil {
-		t.Fatal("fixture unexpectedly overrides clock")
-	}
 	dateRequireCurrent(t, dateH1Fields(t, server.plainRootFast.Load().getKeepAlive))
 	dateRequireCurrent(t, dateMemoH2Fields(t, server.h2RootFast.Load()))
 }

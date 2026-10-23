@@ -2,7 +2,10 @@
 
 package core
 
-import "unsafe"
+import (
+	"math/bits"
+	"unsafe"
+)
 
 const promoteArenaChunk = 16 << 10
 
@@ -58,6 +61,21 @@ func (r *Request) promoteAlloc(n int) []byte {
 	start := r.promoteOff
 	r.promoteOff += n
 	return r.promoteBuf[start : start+n : start+n]
+}
+
+type promoteArena struct {
+	buf []byte
+	off int
+}
+
+func (a *promoteArena) alloc(n int) []byte {
+	if a.off+n > len(a.buf) {
+		a.buf = make([]byte, max(n, promoteArenaChunk))
+		a.off = 0
+	}
+	start := a.off
+	a.off += n
+	return a.buf[start : start+n : start+n]
 }
 
 func promoteTake(buf []byte, off int, s string) (string, int) {
@@ -152,8 +170,18 @@ func promoteRequestHead(r *Request, block []byte) {
 	if !r.aliasesReadBuf {
 		return
 	}
+	promoteRequestHeadInto(r, block, r.promoteAlloc(len(block)))
+}
+
+func promoteRequestHeadArena(r *Request, block []byte, arena *promoteArena) {
+	if !r.aliasesReadBuf {
+		return
+	}
+	promoteRequestHeadInto(r, block, arena.alloc(len(block)))
+}
+
+func promoteRequestHeadInto(r *Request, block, buf []byte) {
 	r.aliasesReadBuf = false
-	buf := r.promoteAlloc(len(block))
 	copy(buf, block)
 	a := aliasRebase{
 		base: uintptr(unsafe.Pointer(unsafe.SliceData(block))),
@@ -172,6 +200,11 @@ func promoteRequestHead(r *Request, block []byte) {
 	if !sameStringBytes(r.RemoteAddr, r.ownedRemoteAddr) {
 		a.promoteAll(r, named[6:7])
 	}
-	a.promoteAll(r, (*promoteCachedFields)(unsafe.Pointer(&r.cachedCL))[:])
+	cached := (*promoteCachedFields)(unsafe.Pointer(&r.cachedCL))
+	for m := r.headerCacheMask; m != 0; m &= m - 1 {
+		if i := bits.TrailingZeros32(m); i < len(cached) {
+			a.promoteAll(r, cached[i:i+1])
+		}
+	}
 	a.promoteAll(r, unsafe.Slice((*string)(unsafe.Pointer(unsafe.SliceData(r.Headers))), 2*len(r.Headers)))
 }

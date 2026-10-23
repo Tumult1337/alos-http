@@ -209,7 +209,7 @@ var timeNow = time.Now
 //
 //	Example: EnableCompress: true.
 //
-// CompressLevel is the compression level 1–9 used when EnableCompress is set; defaults to 6.
+// CompressLevel is the compression level 1–9 used when EnableCompress is set; defaults to 2.
 //
 //	Example: CompressLevel: 9.
 //
@@ -241,14 +241,25 @@ var timeNow = time.Now
 //
 //	Example: ProxyMode: true.
 //
-// InlineHandlers runs HTTP/1.1 handlers directly on the event-loop thread
-// instead of handing each request to a goroutine. It removes the goroutine
-// hand-off and wake-up from every request, which is measurably faster for
-// handlers that return in microseconds, but a handler that blocks (database
-// call, sleep, slow upstream) stalls every other connection on that worker
-// for as long as it runs. Leave it off unless every handler is non-blocking.
+// Handlers run on the event-loop thread by default (HTTP/1.1 and HTTP/2 on
+// the epoll backend), which removes the goroutine hand-off and wake-up from
+// every request. A handler that keeps the loop for more than about 2ms (sleep,
+// database call, slow upstream) has the loop handed to a fresh goroutine so
+// the other connections keep being served, and its route moves to goroutine
+// dispatch until it proves fast again. Handlers that stream, hijack or upgrade
+// the connection leave the loop the moment they do so. Requests with streamed
+// bodies, and every request on a server with a reverse proxy or HTTP routes
+// configured, use goroutine dispatch.
+//
+// InlineHandlers additionally buffers request bodies that StreamBodyAbove
+// would otherwise stream, so those requests run on the loop as well.
 //
 //	Example: InlineHandlers: true.
+//
+// DisableInlineHandlers hands every request to a goroutine instead, except on
+// routes marked with Route.Inline. InlineHandlers takes precedence.
+//
+//	Example: DisableInlineHandlers: true.
 //
 // WebSocketOriginMode controls Origin validation for WebSocket upgrades; defaults to WSOriginSameOrigin.
 //
@@ -330,6 +341,8 @@ type Config struct {
 	ProxyMode       bool
 	InlineHandlers  bool
 
+	DisableInlineHandlers bool
+
 	WSReadTimeout           time.Duration
 	WSWriteTimeout          time.Duration
 	WebSocketOriginMode     WSOriginMode
@@ -338,7 +351,7 @@ type Config struct {
 
 const minPreallocFloor = 1_024
 
-// DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 6, and request logging enabled.
+// DefaultConfig returns a Config with sensible defaults: it listens on ":8443" with a 120s idle timeout, 30s handshake and shutdown timeouts, an 8 KiB header limit, gzip level 2, and request logging enabled.
 func DefaultConfig() Config {
 	return Config{
 		Addr:                 ":8443",
@@ -355,7 +368,7 @@ func DefaultConfig() Config {
 		MaxConcurrentReqs:    0,
 		MaxConns:             8192,
 		ServerName:           "ALOS",
-		CompressLevel:        6,
+		CompressLevel:        defaultCompressLevel,
 		CompressMinSize:      256,
 		CompressBrotliLevel:  defaultBrotliLevel,
 		WorkerCount:          0,
@@ -451,6 +464,26 @@ func respServerName(resp *Response) string {
 		return resp.lazyReq.server.config.ServerName
 	}
 	return "ALOS"
+}
+
+var (
+	connKeepAliveTail = append(append([]byte(nil), connKeepAlive...), '\r', '\n')
+	connCloseTail     = append(append([]byte(nil), connClose...), '\r', '\n')
+)
+
+func serverConnHeadTail(resp *Response, keepAlive bool) []byte {
+	if resp != nil && resp.lazyReq != nil && resp.lazyReq.server != nil {
+		if s := resp.lazyReq.server; s.srvKeepAliveTail != nil {
+			if keepAlive {
+				return s.srvKeepAliveTail
+			}
+			return s.srvCloseTail
+		}
+	}
+	if keepAlive {
+		return connKeepAliveTail
+	}
+	return connCloseTail
 }
 
 func serverConnHeaders(resp *Response) (keepAlive, closeHdr []byte) {
@@ -619,15 +652,17 @@ type Server struct {
 	shutdownOnce      sync.Once
 	wakersMu          sync.Mutex
 	wakers            map[shutdownWaker]struct{}
+	inlineWatch       inlineWatchdog
 	connBandwidthOn   bool
 	globalLimiter     *GlobalLimiter
+	_                 [CacheLineSize]byte
 	activeReqs        atomic.Int64
 	inFlightBodyBytes atomic.Int64
+	_                 [CacheLineSize - 8]byte
 	fastDispatch      atomic.Bool
 	plainRootFast     atomic.Pointer[plainRootFastResponse]
 	h2RootFast        atomic.Pointer[h2RootFastResponse]
 	rootFastMu        sync.Mutex
-	dateNow           func() int64
 	altSvc            atomic.Pointer[altSvcHeader]
 	trustedProxies    trustedProxyMatcher
 	perIPLimiter      *perIPRequestLimiter
@@ -641,6 +676,8 @@ type Server struct {
 	onResponseHooks   atomic.Pointer[[]func(*Request, *Response)]
 	srvKeepAlive      []byte
 	srvClose          []byte
+	srvKeepAliveTail  []byte
+	srvCloseTail      []byte
 }
 
 type trackedHandoffConn struct {
@@ -654,23 +691,20 @@ type trackedHandoffConn struct {
 
 type ipReqCounter struct {
 	n atomic.Int64
+	_ [CacheLineSize - 8]byte
 }
 
 type plainRootFastResponse struct {
-	dateUnix            int64
-	keepDate, closeDate responseDateSpan
-	getKeepAlive        []byte
-	getClose            []byte
-	getKeepAliveTLS     []byte
-	getCloseTLS         []byte
-	handlerAltSvc       bool
-	tlsKeepAlive        []byte
-	tlsClose            []byte
+	getKeepAlive    []byte
+	getClose        []byte
+	getKeepAliveTLS []byte
+	getCloseTLS     []byte
+	handlerAltSvc   bool
+	tlsKeepAlive    []byte
+	tlsClose        []byte
 }
 
 type h2RootFastResponse struct {
-	dateUnix      int64
-	date          responseDateSpan
 	headerPayload []byte
 	body          []byte
 	framed        []byte
@@ -713,7 +747,7 @@ func New(configs ...Config) *Server {
 		cfg.ServerName = "ALOS"
 	}
 	if cfg.CompressLevel == 0 {
-		cfg.CompressLevel = 6
+		cfg.CompressLevel = defaultCompressLevel
 	}
 	if cfg.CompressMinSize == 0 {
 		cfg.CompressMinSize = 256
@@ -758,6 +792,8 @@ func New(configs ...Config) *Server {
 		s.srvKeepAlive = []byte("Connection: keep-alive\r\nServer: " + cfg.ServerName + "\r\n")
 		s.srvClose = []byte("Connection: close\r\nServer: " + cfg.ServerName + "\r\n")
 	}
+	s.srvKeepAliveTail = append(append([]byte(nil), s.srvKeepAlive...), '\r', '\n')
+	s.srvCloseTail = append(append([]byte(nil), s.srvClose...), '\r', '\n')
 	if cfg.ProxyMode {
 		s.trustedProxies = newTrustedProxyMatcher(nil, true)
 	} else if len(cfg.TrustedProxies) > 0 {
@@ -1422,6 +1458,16 @@ func (s *Server) tryReserveBodyBytes(n int) bool {
 		return true
 	}
 	limit := s.config.MaxInFlightBodyBytes
+	if int64(n) > limit {
+		return false
+	}
+	if limit <= bodyBudgetAddPathMaxLimit {
+		if s.inFlightBodyBytes.Add(int64(n)) > limit {
+			s.inFlightBodyBytes.Add(-int64(n))
+			return false
+		}
+		return true
+	}
 	for {
 		used := s.inFlightBodyBytes.Load()
 		if int64(n) > limit-used {
@@ -1445,6 +1491,7 @@ func (s *Server) releaseBodyBytes(n int64) {
 const (
 	bodyBudgetConnShareDivisor = 8
 	bodyBudgetPressureDivisor  = 2
+	bodyBudgetAddPathMaxLimit  = 1 << 40
 )
 
 func (s *Server) connBodyShare() int64 {
@@ -1528,10 +1575,8 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
 		return nil
 	}
-	unix := s.responseDateUnix()
-	date := responseDateValueAt(resp.StatusCode, resp.Headers, unix)
-	keepAlive, keepDate := appendPlainResponseModeAt(&resp, make([]byte, 0, resp.BodyLen()+128), true, true, date)
-	closeResp, closeDate := appendPlainResponseModeAt(&resp, make([]byte, 0, len(keepAlive)), false, true, date)
+	keepAlive := appendPlainResponseMode(&resp, make([]byte, 0, resp.BodyLen()+128), true, true)
+	closeResp := appendPlainResponseMode(&resp, make([]byte, 0, len(keepAlive)), false, true)
 	if len(keepAlive) == 0 || len(closeResp) == 0 {
 		return nil
 	}
@@ -1542,7 +1587,6 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	copy(closeTLS, closeResp)
 	closeTLS[len(closeResp)] = 0x17
 	return &plainRootFastResponse{
-		dateUnix: unix, keepDate: keepDate, closeDate: closeDate,
 		getKeepAlive:    keepAlive,
 		getClose:        closeResp,
 		getKeepAliveTLS: keepAliveTLS,
@@ -1582,12 +1626,9 @@ func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
 	enc := HpackEncoder{}
 	headerPayload := make([]byte, 0, resp.BodyLen()+128)
 	enc.Reset(headerPayload)
-	unix := s.responseDateUnix()
-	date := responseDateValueAt(resp.StatusCode, resp.Headers, unix)
-	dateSpan := encodeH2ResponseHeadersAt(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName, date)
+	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName)
 
 	fastResp := newH2RootFastResponse(append([]byte(nil), enc.Buf...), append([]byte(nil), resp.transmittedBodyBytes()...))
-	fastResp.dateUnix, fastResp.date = unix, dateSpan
 	fastResp.handlerAltSvc = headersHaveFold(resp.Headers, altSvcHeaderName)
 	return fastResp
 }
@@ -1822,17 +1863,20 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 
 	clientIP := extractIP(req.RemoteAddr)
 	if s.perIPLimiter != nil {
-		if !s.perIPLimiter.acquire(clientIP, s.perIPRequestLimit()) {
+		slot, ok := s.perIPLimiter.hold(clientIP, s.perIPRequestLimit())
+		if !ok {
 			statsBlocked()
 			resp.Status(429).String("Too Many Requests")
 			return
 		}
-		defer func() {
-			if req.connTakenOver && s.trustedProxies.active {
-				return
-			}
-			s.perIPLimiter.release(clientIP)
-		}()
+		if slot != nil {
+			defer func() {
+				if req.connTakenOver && s.trustedProxies.active {
+					return
+				}
+				slot.release()
+			}()
+		}
 	}
 
 	if !s.runRequestHooks(req, resp) {

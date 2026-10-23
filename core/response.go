@@ -4,8 +4,9 @@ package core
 
 import (
 	"strings"
+	"unsafe"
 
-	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/encoder"
 )
 
 // StreamWriter is the interface used for chunked and streaming HTTP responses
@@ -48,6 +49,7 @@ type Response struct {
 	ContentType string
 	streamer    StreamWriter
 	streamed    bool
+	fileBody    bool
 	sw          StreamWriter
 	lazyReq     *Request
 }
@@ -67,7 +69,7 @@ func (r *Response) Reset() {
 	r.StatusCode = 200
 	clear(r.Headers)
 	r.Headers = r.Headers[:0]
-	r.body = shrinkBuffer(r.body, 4096)
+	r.body = recycleBodyBuf(r.body)
 	r.bodyString = ""
 	r.bodyIsText = false
 	r.ContentType = ""
@@ -75,17 +77,25 @@ func (r *Response) Reset() {
 	r.streamed = false
 	r.sw = nil
 	r.lazyReq = nil
+	r.fileBody = false
+}
+
+func (r *Response) releaseSentBody() {
+	if cap(r.body) >= bodyPoolMinCap && largeBufs.put(r.body) {
+		r.body = nil
+	}
 }
 
 func (r *Response) resetFastH1() {
 	r.StatusCode = 200
 	clear(r.Headers)
 	r.Headers = r.Headers[:0]
-	r.body = shrinkBuffer(r.body, 4096)
+	r.body = recycleBodyBuf(r.body)
 	r.bodyString = ""
 	r.bodyIsText = false
 	r.ContentType = ""
 	r.streamed = false
+	r.fileBody = false
 }
 
 // SetSW sets the StreamWriter returned by EnsureStreamWriter without marking
@@ -220,10 +230,26 @@ func (r *Response) HTML(s string) *Response {
 //	resp.Status(200).Bytes(fileData)
 func (r *Response) Bytes(b []byte) *Response {
 	r.ContentType = "application/octet-stream"
-	r.body = append(r.body[:0], b...)
+	r.body = appendPooled(r.body[:0], b)
 	r.bodyString = ""
 	r.bodyIsText = false
 	return r
+}
+
+func (r *Response) BytesNoCopy(b []byte) *Response {
+	r.setBodyNoCopy(b, "application/octet-stream")
+	return r
+}
+
+func (r *Response) setBodyNoCopy(b []byte, contentType string) {
+	r.ContentType = contentType
+	r.referenceBody(b)
+}
+
+func (r *Response) referenceBody(b []byte) {
+	r.body = r.body[:0]
+	r.bodyString = UnsafeString(b)
+	r.bodyIsText = true
 }
 
 // JSON writes already-encoded JSON bytes.
@@ -232,7 +258,7 @@ func (r *Response) Bytes(b []byte) *Response {
 //	resp.JSON(payload)
 func (r *Response) JSON(jsonBytes []byte) *Response {
 	r.ContentType = "application/json; charset=utf-8"
-	r.body = append(r.body[:0], jsonBytes...)
+	r.body = appendPooled(r.body[:0], jsonBytes)
 	r.bodyString = ""
 	r.bodyIsText = false
 	return r
@@ -259,13 +285,12 @@ func (r *Response) JSONString(s string) *Response {
 //	_ = resp.Status(200).JSONMarshal(User{ID: 1, Name: "Alice"})
 //	_ = resp.JSONMarshal(map[string]any{"ok": true})
 func (r *Response) JSONMarshal(v any) error {
-	data, err := sonic.Marshal(v)
-	if err != nil {
+	r.body = r.body[:0]
+	if err := encoder.EncodeInto(&r.body, v, sonicDefaultEncodeOptions); err != nil {
 		r.Status(500).String("json marshal error")
 		return err
 	}
 	r.ContentType = "application/json; charset=utf-8"
-	r.body = append(r.body[:0], data...)
 	r.bodyString = ""
 	r.bodyIsText = false
 	return nil
@@ -276,7 +301,7 @@ func (r *Response) JSONMarshal(v any) error {
 //	resp.ContentType = "application/xml"
 //	resp.SetBody([]byte("<ok/>"))
 func (r *Response) SetBody(b []byte) {
-	r.body = append(r.body[:0], b...)
+	r.body = appendPooled(r.body[:0], b)
 	r.bodyString = ""
 	r.bodyIsText = false
 }
@@ -290,6 +315,15 @@ func (r *Response) prepareBody(n int) []byte {
 	r.bodyString = ""
 	r.bodyIsText = false
 	return r.body
+}
+
+func (r *Response) ownsBodyBuffer(b []byte) bool {
+	if r.bodyIsText || r.fileBody || len(b) == 0 || cap(r.body) == 0 {
+		return false
+	}
+	start := uintptr(unsafe.Pointer(unsafe.SliceData(r.body)))
+	p := uintptr(unsafe.Pointer(unsafe.SliceData(b)))
+	return p >= start && p+uintptr(cap(b)) <= start+uintptr(cap(r.body))
 }
 
 func (r *Response) bodyBytesUnsafe() []byte {
@@ -325,6 +359,13 @@ func (r *Response) BodyLen() int {
 }
 
 func responseBodyDisposition(method string, statusCode int) (suppressBody bool, omitContentLength bool) {
+	if statusCode == 200 && len(method) != len("HEAD") && len(method) != len("CONNECT") {
+		return false, false
+	}
+	return responseBodyDispositionSlow(method, statusCode)
+}
+
+func responseBodyDispositionSlow(method string, statusCode int) (suppressBody bool, omitContentLength bool) {
 	if statusCode >= 100 && statusCode < 200 {
 		return true, true
 	}

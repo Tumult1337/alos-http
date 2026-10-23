@@ -215,19 +215,9 @@ func (r *Request) Reset() {
 	r.expect = h1ExpectNone
 	r.trailers = nil
 	r.allow = ""
-	r.cachedCL = ""
-	r.cachedConn = ""
-	r.cachedTE = ""
-	r.cachedHost = ""
-	r.cachedAE = ""
-	r.cachedOrigin = ""
-	r.cachedXFF = ""
-	r.cachedXRI = ""
-	r.cachedAuth = ""
-	r.cachedUpgrade = ""
-	r.cachedWSKey = ""
-	r.cachedWSVer = ""
-	r.headerCacheMask = 0
+	if r.headerCacheMask != 0 {
+		r.clearCachedHeaders()
+	}
 	r.server = nil
 	r.attachConn = nil
 	r.connTakenOver = false
@@ -254,6 +244,47 @@ func (r *Request) Reset() {
 	}
 }
 
+func (r *Request) clearCachedHeaders() {
+	mask := r.headerCacheMask
+	if mask&headerCacheContentLength != 0 {
+		r.cachedCL = ""
+	}
+	if mask&headerCacheConnection != 0 {
+		r.cachedConn = ""
+	}
+	if mask&headerCacheTransferEncoding != 0 {
+		r.cachedTE = ""
+	}
+	if mask&headerCacheHost != 0 {
+		r.cachedHost = ""
+	}
+	if mask&headerCacheAcceptEncoding != 0 {
+		r.cachedAE = ""
+	}
+	if mask&headerCacheOrigin != 0 {
+		r.cachedOrigin = ""
+	}
+	if mask&headerCacheXForwardedFor != 0 {
+		r.cachedXFF = ""
+	}
+	if mask&headerCacheXRealIP != 0 {
+		r.cachedXRI = ""
+	}
+	if mask&headerCacheAuthorization != 0 {
+		r.cachedAuth = ""
+	}
+	if mask&headerCacheUpgrade != 0 {
+		r.cachedUpgrade = ""
+	}
+	if mask&headerCacheWSKey != 0 {
+		r.cachedWSKey = ""
+	}
+	if mask&headerCacheWSVersion != 0 {
+		r.cachedWSVer = ""
+	}
+	r.headerCacheMask = 0
+}
+
 func (r *Request) resetFastH1() {
 	r.aliasesReadBuf = false
 	r.peerAddr = ""
@@ -272,44 +303,8 @@ func (r *Request) resetFastH1() {
 	r.expect = h1ExpectNone
 	r.trailers = nil
 	r.allow = ""
-	if mask := r.headerCacheMask; mask != 0 {
-		if mask&headerCacheContentLength != 0 {
-			r.cachedCL = ""
-		}
-		if mask&headerCacheConnection != 0 {
-			r.cachedConn = ""
-		}
-		if mask&headerCacheTransferEncoding != 0 {
-			r.cachedTE = ""
-		}
-		if mask&headerCacheHost != 0 {
-			r.cachedHost = ""
-		}
-		if mask&headerCacheAcceptEncoding != 0 {
-			r.cachedAE = ""
-		}
-		if mask&headerCacheOrigin != 0 {
-			r.cachedOrigin = ""
-		}
-		if mask&headerCacheXForwardedFor != 0 {
-			r.cachedXFF = ""
-		}
-		if mask&headerCacheXRealIP != 0 {
-			r.cachedXRI = ""
-		}
-		if mask&headerCacheAuthorization != 0 {
-			r.cachedAuth = ""
-		}
-		if mask&headerCacheUpgrade != 0 {
-			r.cachedUpgrade = ""
-		}
-		if mask&headerCacheWSKey != 0 {
-			r.cachedWSKey = ""
-		}
-		if mask&headerCacheWSVersion != 0 {
-			r.cachedWSVer = ""
-		}
-		r.headerCacheMask = 0
+	if r.headerCacheMask != 0 {
+		r.clearCachedHeaders()
 	}
 	r.attachConn = nil
 	r.connTakenOver = false
@@ -365,15 +360,18 @@ func (r *Request) cacheHeaderLookup(bit uint32, slot *string, name string) strin
 	if r.headerCacheMask&bit != 0 {
 		return *slot
 	}
+	*slot, _ = r.findHeader(name)
+	r.headerCacheMask |= bit
+	return *slot
+}
+
+func (r *Request) findHeader(name string) (string, bool) {
 	for i := range r.Headers {
-		if EqualFoldASCII(r.Headers[i][0], name) {
-			*slot = r.Headers[i][1]
-			r.headerCacheMask |= bit
-			return *slot
+		if h := &r.Headers[i]; len(h[0]) == len(name) && EqualFoldASCII(h[0], name) {
+			return h[1], true
 		}
 	}
-	r.headerCacheMask |= bit
-	return ""
+	return "", false
 }
 
 func (r *Request) h1UpgradeFieldSeen() bool {
@@ -430,12 +428,13 @@ type aead13Conn struct {
 
 	mu      sync.Mutex
 	readBuf []byte
+	readOff int
 }
 
 func (c *aead13Conn) Read(p []byte) (int, error) {
-	if len(c.readBuf) > 0 {
-		n := copy(p, c.readBuf)
-		c.readBuf = c.readBuf[n:]
+	if c.readOff < len(c.readBuf) {
+		n := copy(p, c.readBuf[c.readOff:])
+		c.readOff += n
 		return n, nil
 	}
 	const maxSkips = 16
@@ -493,6 +492,7 @@ func (c *aead13Conn) Read(p []byte) (int, error) {
 		n := copy(p, content)
 		if n < len(content) {
 			c.readBuf = append(c.readBuf[:0], content[n:]...)
+			c.readOff = 0
 		}
 		*bp = (*bp)[:0]
 		RecordBufPool.Put(bp)
@@ -601,12 +601,8 @@ func (r *Request) Header(name string) string {
 			return r.cacheHeaderLookup(headerCacheWSVersion, &r.cachedWSVer, "Sec-WebSocket-Version")
 		}
 	}
-	for i := range r.Headers {
-		if EqualFoldASCII(r.Headers[i][0], name) {
-			return r.Headers[i][1]
-		}
-	}
-	return ""
+	value, _ := r.findHeader(name)
+	return value
 }
 
 func (r *Request) LastEventID() string { return r.Header("last-event-id") }
@@ -705,13 +701,11 @@ func (r *Request) parseCookiesLazy() {
 	r.cookiesParsed = true
 	r.cookiesCache = r.cookiesCache[:0]
 	for i := range r.Headers {
-		if !EqualFoldASCII(r.Headers[i][0], "Cookie") {
+		if !headerNameIs(r.Headers[i][0], "cookie") {
 			continue
 		}
-		r.cookiesCache = append(r.cookiesCache, parseCookieHeader(r.Headers[i][1])...)
+		r.cookiesCache = appendCookieHeader(r.cookiesCache, r.Headers[i][1], maxCookiePairs)
 		if len(r.cookiesCache) >= maxCookiePairs {
-			clear(r.cookiesCache[maxCookiePairs:])
-			r.cookiesCache = r.cookiesCache[:maxCookiePairs]
 			return
 		}
 	}

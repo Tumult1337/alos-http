@@ -57,7 +57,7 @@ func TestPanicReportEpoll(t *testing.T) {
 				TLS: tc.tls,
 				Config: func(cfg *Config) {
 					cfg.PlainHTTP = !tc.tls
-					cfg.InlineHandlers = tc.inline
+					cfg.InlineHandlers, cfg.DisableInlineHandlers = tc.inline, !tc.inline
 					cfg.Logger = slog.New(capture)
 					cfg.OnPanic = reports.hook
 				},

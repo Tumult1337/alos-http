@@ -4,6 +4,7 @@ package core
 
 import (
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -326,6 +327,10 @@ func (rle *RateLimitEngine) matchRule(path string) *compiledRule {
 // is currently blocked.
 //
 // Example: allowed, _, retryAfter := engine.Check(req.RemoteAddr, req.Path)
+const rateLimitKeyScratchSize = 128
+
+var rateLimitKeyScratch = sync.Pool{New: func() any { return new([rateLimitKeyScratchSize]byte) }}
+
 func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, time.Duration) {
 	cr := rle.matchRule(path)
 	if cr == nil {
@@ -335,26 +340,30 @@ func (rle *RateLimitEngine) Check(ip string, path string) (bool, *compiledRule, 
 		ip = rateLimitKeyForIP(ip)
 	}
 
-	var keyBuf [128]byte
 	keyLen := len(ip) + 1 + len(cr.keyBase)
 	var key string
-	if keyLen <= len(keyBuf) {
+	var keyBuf *[rateLimitKeyScratchSize]byte
+	if keyLen <= rateLimitKeyScratchSize {
+		keyBuf = rateLimitKeyScratch.Get().(*[rateLimitKeyScratchSize]byte)
 		n := copy(keyBuf[:], ip)
 		keyBuf[n] = '|'
 		copy(keyBuf[n+1:], cr.keyBase)
-		key = string(keyBuf[:keyLen])
+		key = UnsafeString(keyBuf[:keyLen])
 	} else {
 		key = ip + "|" + cr.keyBase
 	}
 	entry := rle.entryFor(key)
 	allowed, retryAfter := rle.admitEntry(key, entry, cr)
+	if keyBuf != nil {
+		rateLimitKeyScratch.Put(keyBuf)
+	}
 	return allowed, cr, retryAfter
 }
 
 func (rle *RateLimitEngine) entryFor(key string) *rlEntry {
 	entry, ok := rle.clients.Load(key)
 	if !ok {
-		entry, _ = rle.clients.LoadOrStore(key, &rlEntry{})
+		entry, _ = rle.clients.LoadOrStore(strings.Clone(key), &rlEntry{})
 	}
 	return entry
 }

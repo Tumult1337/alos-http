@@ -43,12 +43,14 @@ func h2DeadlineFixture(t *testing.T) (*epollWorker, *epollConn, int) {
 
 func h2DeadlineTask(t *testing.T, w *epollWorker) {
 	t.Helper()
-	select {
-	case task := <-w.taskCh:
-		task(w)
-	case <-time.After(h2FixCeiling):
+	start := time.Now()
+	for !w.taskPending.Load() && time.Since(start) < h2FixCeiling {
+		time.Sleep(time.Millisecond)
+	}
+	if !w.taskPending.Load() {
 		t.Fatal("async completion was not posted")
 	}
+	w.drainTasks()
 }
 
 func h2DeadlineWant(t *testing.T, c *epollConn, before, after, timeout int64) {

@@ -18,12 +18,14 @@ import (
 func h1ReceivedFixture(t *testing.T, cfg Config) (*epollWorker, *epollConn, int) {
 	t.Helper()
 	cfg.MaxConnsPerIP = -1
+	cfg.DisableInlineHandlers = !cfg.InlineHandlers
 	w := newWorkerForBackendTest(t)
 	if limiter := w.server.perIPConnLimiter.Load(); limiter != nil {
 		limiter.Stop()
 	}
 	w.server = New(cfg)
 	w.be.panicReporter = w.server
+	w.inlineAll = w.server.inlineDispatchEnabled()
 	w.refreshLimits()
 	w.maxPendingWrite = epollMaxPendingWriteDefault
 	w.taskCh = make(chan func(*epollWorker), 32)
@@ -81,6 +83,18 @@ func h1ReceivedFinish(t *testing.T, w *epollWorker, c *epollConn) {
 	if c.inFlight != 0 {
 		t.Fatalf("completion left %d handlers", c.inFlight)
 	}
+}
+
+func h1ReceivedRunInline(t *testing.T, w *epollWorker) {
+	t.Helper()
+	if !w.inlinePending() {
+		t.Fatal("inline handler was not queued")
+	}
+	w.inlineDeadline = turbo.Now() + int64(h2FixCeiling)
+	if !w.runInlineQueue() {
+		t.Fatal("inline queue handed off the event loop")
+	}
+	w.drainTasks()
 }
 
 func h1ReceivedBlockedHandler(t *testing.T, w *epollWorker, c *epollConn) (<-chan string, func()) {
@@ -399,6 +413,7 @@ func TestH1ReceivedBodyInlineClose(t *testing.T) {
 	w.server.computeFastDispatch()
 	h1ReceivedInput(t, c, "POST /body HTTP/1.1\r\nHost: body.test\r\nContent-Length: 5\r\n\r\nhello")
 	w.serviceBuffered(c, false, false)
+	h1ReceivedRunInline(t, w)
 	if !observed || c.inFlight != 0 || w.pool.slotsHeld() != 0 {
 		t.Fatal("inline close did not finish the real owner")
 	}
@@ -467,10 +482,14 @@ func TestH1ReceivedBodyStreamingSelection(t *testing.T) {
 				t.Fatalf("selection=%v want %v", got, test.streamed)
 			}
 			h1ReceivedInput(t, c, head+body)
-			out, step := c.serveH1(w.server, nil)
+			_, step := c.serveH1(w.server, nil)
 			if test.inline {
-				if step != h1StepClose || !bytes.Contains(out, []byte("200 OK")) {
-					t.Fatalf("inline step=%d output=%q", step, out)
+				if step != h1StepDispatched {
+					t.Fatalf("inline queue step=%d", step)
+				}
+				h1ReceivedRunInline(t, w)
+				if !bytes.Contains(c.writeBuf, []byte("200 OK")) {
+					t.Fatalf("inline output=%q", c.writeBuf)
 				}
 			} else if step != h1StepDispatched {
 				t.Fatalf("async dispatch step=%d", step)
@@ -590,6 +609,8 @@ func TestH1ReceivedBodyHeadLeavesVictimCapacity(t *testing.T) {
 		t.Fatalf("victim write=%d: %v", n, err)
 	}
 	w.readable(victim, false)
+	h1ReceivedRunInline(t, w)
+	w.flushPending()
 	output := make([]byte, epollReadBufCap)
 	length, err := unix.Read(pair[1], output)
 	if err != nil {
@@ -603,31 +624,47 @@ func TestH1ReceivedBodyHeadLeavesVictimCapacity(t *testing.T) {
 	}
 }
 
-func TestH1ReceivedBodyInlineTakeover(t *testing.T) {
-	w, c, _ := h1ReceivedFixture(t, Config{InlineHandlers: true})
-	observed := false
+func TestH1ReceivedBodyTakeover(t *testing.T) {
+	w, c, _ := h1ReceivedFixture(t, Config{})
+	observed := make(chan struct{})
 	w.server.Router.POST("/body", func(req *Request, _ *Response) {
+		defer close(observed)
 		if string(req.Body) != "hello" {
-			t.Fatal("takeover lost body")
+			t.Error("takeover lost body")
+			return
 		}
 		connection := req.HijackConn()
 		if connection == nil {
-			t.Fatal("real takeover failed")
+			t.Error("real takeover failed")
+			return
 		}
-		h1ReceivedAssert(t, c, 5)
 		if err := connection.Close(); err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
-		h1ReceivedAssert(t, c, 5)
-		observed = true
 	})
 	w.server.Router.Build()
 	w.server.computeFastDispatch()
 	h1ReceivedInput(t, c, "POST /body HTTP/1.1\r\nHost: body.test\r\nContent-Length: 5\r\n\r\nhello")
 	w.serviceBuffered(c, false, false)
-	h1ReceivedAssert(t, c, 0)
-	w.drainTasks()
-	if !observed || c.inFlight != 0 || w.pool.slotsHeld() != 0 || c.takeoverPinned {
+	h1ReceivedAssert(t, c, 5)
+	start := time.Now()
+	for finished := false; !finished; {
+		select {
+		case <-observed:
+			finished = true
+		case <-time.After(time.Millisecond):
+			if time.Since(start) > h2FixCeiling {
+				t.Fatal("takeover handler did not finish")
+			}
+			w.drainTasks()
+		}
+	}
+	start = time.Now()
+	for c.inFlight != 0 && time.Since(start) < h2FixCeiling {
+		time.Sleep(time.Millisecond)
+		w.drainTasks()
+	}
+	if c.inFlight != 0 || w.pool.slotsHeld() != 0 || c.takeoverPinned {
 		t.Fatal("takeover owner or pin was retained")
 	}
 	h1ReceivedAssert(t, c, 0)
@@ -644,14 +681,17 @@ func TestH1ReceivedBodyPanicCompletion(t *testing.T) {
 			w.server.computeFastDispatch()
 			h1ReceivedInput(t, c, "POST /body HTTP/1.1\r\nHost: body.test\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello")
 			out, step := c.serveH1(w.server, nil)
+			if inline {
+				if step != h1StepDispatched {
+					t.Fatal("inline panic was not queued")
+				}
+				h1ReceivedRunInline(t, w)
+				out = c.writeBuf
+			}
 			if h1ReceivedAwait(t, entered) != "hello" {
 				t.Fatal("panicking handler did not receive body")
 			}
-			if inline {
-				if step != h1StepClose {
-					t.Fatal("inline panic did not finish")
-				}
-			} else {
+			if !inline {
 				if step != h1StepDispatched {
 					t.Fatal("async panic did not dispatch")
 				}

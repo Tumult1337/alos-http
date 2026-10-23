@@ -80,7 +80,10 @@ type Cookie struct {
 const maxCookiePairs = 1000
 
 func parseCookieHeader(header string) []Cookie {
-	var cookies []Cookie
+	return appendCookieHeader(nil, header, maxCookiePairs)
+}
+
+func appendCookieHeader(cookies []Cookie, header string, limit int) []Cookie {
 	for len(header) > 0 {
 		var pair string
 		idx := strings.IndexByte(header, ';')
@@ -95,7 +98,7 @@ func parseCookieHeader(header string) []Cookie {
 		if pair == "" {
 			continue
 		}
-		if len(cookies) >= maxCookiePairs {
+		if len(cookies) >= limit {
 			break
 		}
 		eq := strings.IndexByte(pair, '=')

@@ -92,7 +92,7 @@ type CacheRule struct {
 //
 //	Example: PreCompress: true.
 //
-// CompressLevel is the gzip level used when PreCompress is set; values outside 1-9 default to 6.
+// CompressLevel is the gzip level used when PreCompress is set; values outside 1-9 default to 2.
 //
 //	Example: CompressLevel: 9.
 //
@@ -114,7 +114,7 @@ type ProxyCacheConfig struct {
 
 // DefaultProxyCacheConfig returns a ProxyCacheConfig with sensible defaults:
 // 4 MB max entry, 5 minute TTL, 256 MB total, 10k entries, gzip compression
-// at level 6 for responses >= 512 bytes.
+// at level 2 for responses >= 512 bytes.
 func DefaultProxyCacheConfig() ProxyCacheConfig {
 	return ProxyCacheConfig{
 		MaxEntrySize:   4 << 20,
@@ -122,7 +122,7 @@ func DefaultProxyCacheConfig() ProxyCacheConfig {
 		MaxTotalBytes:  256 << 20,
 		MaxEntries:     10000,
 		PreCompress:    true,
-		CompressLevel:  6,
+		CompressLevel:  defaultCompressLevel,
 		CompressMinLen: 512,
 	}
 }
@@ -209,7 +209,7 @@ type ProxyCache struct {
 	purges       atomic.Uint64
 	widePurgedAt atomic.Uint64
 	keyPurgedAt  [cachePurgeStripes]atomic.Uint64
-	gzipPool     sync.Pool
+	gzipLevel    int
 }
 
 // NewProxyCache creates a ProxyCache configured with cfg, normalizing zero-valued
@@ -217,7 +217,7 @@ type ProxyCache struct {
 // their defaults, and starts a background goroutine that periodically evicts expired entries.
 func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
-		cfg.CompressLevel = 6
+		cfg.CompressLevel = defaultCompressLevel
 	}
 	if cfg.CompressMinLen <= 0 {
 		cfg.CompressMinLen = 512
@@ -233,15 +233,9 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	}
 
 	pc := &ProxyCache{
-		entries: alosmap.NewTypedSized[string, *cacheEntry](10000, 0).Prealloc(256),
-		stopCh:  make(chan struct{}),
-	}
-	level := cfg.CompressLevel
-	pc.gzipPool = sync.Pool{
-		New: func() any {
-			w, _ := gzip.NewWriterLevel(io.Discard, level)
-			return w
-		},
+		entries:   alosmap.NewTypedSized[string, *cacheEntry](10000, 0).Prealloc(256),
+		stopCh:    make(chan struct{}),
+		gzipLevel: cfg.CompressLevel,
 	}
 	pc.config.Store(&cfg)
 	go pc.evictLoop()
@@ -254,7 +248,7 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 // Existing entries are left as-is.
 func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
-		cfg.CompressLevel = 6
+		cfg.CompressLevel = defaultCompressLevel
 	}
 	if cfg.CompressMinLen <= 0 {
 		cfg.CompressMinLen = 512
@@ -809,29 +803,21 @@ func (pc *ProxyCache) ServeCached(entry *cacheEntry, req *Request, resp *Respons
 	resp.SetHeaderUnsafe("x-cache-hits", string(appendUint(hitBuf[:0], int64(entry.hits.Load()))))
 
 	if entry.gzipLen == 0 {
-		resp.SetBody(entry.body)
+		resp.referenceBody(entry.body)
 		return
 	}
 	if negotiateEncoding(req.Header("accept-encoding"), offerGzip) == encodingGzip {
 		resp.SetHeaderUnsafe("content-encoding", contentEncodingNames[encodingGzip])
-		resp.SetBody(entry.gzipBody)
+		resp.referenceBody(entry.gzipBody)
 	} else {
-		resp.SetBody(entry.body)
+		resp.referenceBody(entry.body)
 	}
 	addVaryAcceptEncoding(resp)
 }
 
 func (pc *ProxyCache) compressGzip(data []byte) []byte {
 	bp := LargeBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	w := newBytesWriter(&buf)
-	gw := pc.gzipPool.Get().(*gzip.Writer)
-	gw.Reset(w)
-	gw.Write(data)
-	gw.Close()
-	pc.gzipPool.Put(gw)
-	w.buf = nil
-	bytesWriterPool.Put(w)
+	buf := appendCompressed((*bp)[:0], data, encodingGzip, pc.gzipLevel)
 	result := make([]byte, len(buf))
 	copy(result, buf)
 	*bp = buf
