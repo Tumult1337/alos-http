@@ -288,6 +288,8 @@ type QUICConn struct {
 	rxFrom        netip.AddrPort
 	rxLen         int
 	rxNonProbing  bool
+	pathResponses []byte
+	offPath       quicOffPathBudget
 
 	maxDataLocal    uint64
 	maxDataRemote   uint64
@@ -658,6 +660,7 @@ func (qc *QUICConn) discardKeys(space int) {
 
 func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	qc.rxNonProbing = false
+	qc.pathResponses = qc.pathResponses[:0]
 	if int64(pn) > qc.recvLargest[space] {
 		qc.recvLargest[space] = int64(pn)
 	}
@@ -789,6 +792,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	if qc.closed.Load() {
 		return
 	}
+	qc.flushPathResponses()
 	if lossCheck {
 		qc.recoverLostPackets(space)
 	}
@@ -1311,7 +1315,7 @@ func (qc *QUICConn) sendFramesLocked(space int, frames []byte, ackEliciting bool
 	qc.sendFramesToLocked(space, frames, ackEliciting, nil)
 }
 
-func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bool, probeAddr *net.UDPAddr) {
+func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bool, offPath *quicOffPathBudget) {
 	keys := qc.sendKeys[space]
 	if keys == nil || !keys.valid {
 		keys = qc.keys[space]
@@ -1320,7 +1324,7 @@ func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bo
 		return
 	}
 
-	if len(qc.pendingAck[space]) > 0 && probeAddr == nil {
+	if len(qc.pendingAck[space]) > 0 && offPath == nil {
 		qc.combineScratch = append(qc.combineScratch[:0], qc.pendingAck[space]...)
 		qc.combineScratch = append(qc.combineScratch, frames...)
 		frames = qc.combineScratch
@@ -1358,9 +1362,11 @@ func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bo
 
 	if len(packet) > 0 {
 		dst, dstAddr := qc.udpAddr, qc.remoteAddr
-		blocked := false
-		if probeAddr != nil {
+		var blocked bool
+		if offPath != nil {
+			probeAddr := net.UDPAddrFromAddrPort(offPath.addr)
 			dst, dstAddr = probeAddr, probeAddr
+			blocked = !offPath.allows(len(packet))
 		} else {
 			blocked = !qc.addressValidated.Load() && qc.bytesSent.Load()+uint64(len(packet)) > quicAmplificationFactor*qc.bytesReceived.Load()
 		}
@@ -1380,7 +1386,11 @@ func (qc *QUICConn) sendFramesToLocked(space int, frames []byte, ackEliciting bo
 		case pbuf != nil:
 			quicPktBufPool.Put(pbuf)
 		}
-		if !blocked && probeAddr == nil && !qc.addressValidated.Load() {
+		switch {
+		case blocked:
+		case offPath != nil:
+			offPath.sent += uint64(len(packet))
+		case !qc.addressValidated.Load():
 			qc.bytesSent.Add(uint64(len(packet)))
 		}
 		if debugFlag.Load() {
