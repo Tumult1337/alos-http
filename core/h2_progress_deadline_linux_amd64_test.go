@@ -223,3 +223,41 @@ func TestH2StreamedBodyHasReadDeadline(t *testing.T) {
 		t.Fatal("handler read did not return after the connection closed")
 	}
 }
+
+func TestH2StreamedBodyProgressKeepsUploadAlive(t *testing.T) {
+	w, c, peer := h2DeadlineFixture(t)
+	w.readTO = int64(h2ProgressTimeout)
+	w.streamBodyAbove = 1
+	entered := make(chan struct{})
+	w.server.Router.POST("/up", func(r *Request, resp *Response) {
+		close(entered)
+		_, _ = io.Copy(io.Discard, r.BodyStream())
+		resp.Status(200).String("ok")
+	})
+	w.server.Router.Build()
+	w.server.computeFastDispatch()
+	t.Cleanup(func() {
+		if c.fd >= 0 {
+			w.closeConn(c)
+		}
+		for c.inFlight > 0 {
+			h2DeadlineTask(t, w)
+		}
+	})
+	frames := appendH2Frame(nil, H2FrameHeaders, H2FlagEndHeaders, 1, h2FixRequestBlock("POST", "/up"))
+	h2ProgressOpen(t, w, c, peer, nil, frames)
+	select {
+	case <-entered:
+	case <-time.After(h2FixCeiling):
+		t.Fatal("streaming handler did not start")
+	}
+	elapsed := h2ProgressRun(t, w, c, peer, func() []byte {
+		return appendH2Frame(nil, H2FrameData, 0, 1, []byte("x"))
+	})
+	if elapsed < 2*h2ProgressTimeout {
+		t.Fatalf("test ran %v, want at least %v", elapsed, 2*h2ProgressTimeout)
+	}
+	if c.fd < 0 {
+		t.Fatal("a streamed upload that sends body bytes was closed")
+	}
+}

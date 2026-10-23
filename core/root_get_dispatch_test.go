@@ -129,3 +129,43 @@ func TestH2HalfClosedPeerIsClosedAfterAsyncResponse(t *testing.T) {
 		t.Fatalf("response body missing from %d bytes", len(out))
 	}
 }
+
+func TestH2PeerEOFDuringHandlerStillGetsResponse(t *testing.T) {
+	entered, release := make(chan struct{}), make(chan struct{})
+	addr := startH2FixServer(t, nil, func(srv *Server) {
+		srv.Router.GET("/held", func(req *Request, resp *Response) {
+			close(entered)
+			<-release
+			resp.Status(200).String("held-body")
+		})
+	})
+	conn, err := net.DialTimeout("tcp", addr, h2FixCeiling)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(wallDeadline(h2FixCeiling))
+	hello := append([]byte(nil), H2ClientPreface[:]...)
+	hello = appendH2Frame(hello, H2FrameSettings, 0, 0, nil)
+	hello = appendH2Frame(hello, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 1, h2FixRequestBlock("GET", "/held"))
+	if _, err := conn.Write(hello); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(h2FixCeiling):
+		t.Fatal("handler did not start")
+	}
+	if err := conn.(*net.TCPConn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(h2FixQuietWindow)
+	close(release)
+	out, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read after half-close: %d bytes, %v", len(out), err)
+	}
+	if !bytes.Contains(out, []byte("held-body")) {
+		t.Fatalf("response of the in-flight stream was dropped at peer EOF: got %d bytes", len(out))
+	}
+}
