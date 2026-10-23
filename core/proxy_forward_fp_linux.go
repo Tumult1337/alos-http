@@ -118,14 +118,13 @@ func fpAttemptError(err error, wroteRequest, gotResponse bool) *proxyAttemptErro
 
 // forwardRequestFP is the epoll backed replacement for forwardRequest. It
 // keeps the same signature so the call site can switch between them.
-func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend, cfg *DomainConfig) error {
+func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend, cfg *DomainConfig, cachePath string) error {
 	client, err := proxyUpstreamClient()
 	if err != nil {
 		return err
 	}
 
 	host := stripPort(req.Host)
-	cachePath := fpProxyPath(req)
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	autoCacheAllowed := cacheableMethod && proxyCacheRequestAllowed(req)
 	cache := pe.activeCache()

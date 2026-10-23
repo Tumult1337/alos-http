@@ -197,6 +197,10 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 		cachePath = proxyRequestTarget(req)
 		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
 			admission.release(w.server)
+			if r := w.cacheHitRefusal(pe, ds, req); r.status != 0 {
+				r.answer(&c.resp)
+				return proxyStartServed
+			}
 			w.serveProxyCacheHit(pe, ds, cache, entry, req, &c.resp)
 			return proxyStartServed
 		}
@@ -433,6 +437,22 @@ func (w *epollWorker) guardUserHook(req *Request, call func()) (completed bool) 
 	}()
 	call()
 	return true
+}
+
+func (w *epollWorker) cacheHitRefusal(pe *ProxyEngine, ds *domainState, req *Request) proxyRefusal {
+	onRequest := pe.requestHook()
+	if onRequest == nil {
+		return proxyRefusal{}
+	}
+	pr := cacheHitProxyRequest(ds, req)
+	allowed := false
+	if !w.guardUserHook(req, func() { allowed = onRequest(pr) }) {
+		return proxyRefusedHookFailed
+	}
+	if !allowed {
+		return proxyRefusedByHook
+	}
+	return proxyRefusal{}
 }
 
 func (w *epollWorker) serveProxyCacheHit(pe *ProxyEngine, ds *domainState, cache *ProxyCache, entry *cacheEntry, req *Request, resp *Response) {

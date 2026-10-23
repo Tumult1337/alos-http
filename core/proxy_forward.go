@@ -32,13 +32,14 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, resp *Response) {
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	cache := pe.activeCache()
+	cachePath := fpProxyPath(req)
 	if cache != nil && cacheableMethod {
-		cachePath := req.Path
-		if req.Query != "" {
-			cachePath = req.Path + "?" + req.Query
-		}
 		entry, hit := cache.Get(req.Method, host, cachePath, req)
 		if hit {
+			if onRequest := pe.requestHook(); onRequest != nil && !onRequest(cacheHitProxyRequest(ds, req)) {
+				resp.Status(502).String("Request blocked by interceptor")
+				return
+			}
 			cache.ServeCached(entry, req, resp)
 			if onResponse := pe.responseHook(); onResponse != nil {
 				pr := newCacheHitHookResponse(ds, entry, req, resp)
@@ -99,7 +100,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 		cfgCopy.HostHeader = hostOverride
 
 		b.ActiveConns.Add(1)
-		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy)
+		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy, cachePath)
 		adoptAttemptTakeover(req, &attemptReq)
 		b.ActiveConns.Add(-1)
 
@@ -179,6 +180,19 @@ func isProxyFilteredHeaderFold(name string) bool {
 }
 
 const upgradeAnswerHeadHint = 512
+
+func cacheHitProxyRequest(ds *domainState, req *Request) *ProxyRequest {
+	hook := &proxyHookRequest{}
+	pr := &hook.ProxyRequest
+	pr.Domain = ds.config.Domain
+	pr.Backend = proxyCacheBackend
+	pr.ClientAddr = req.RemoteAddr
+	pr.Method = req.Method
+	pr.Path = req.Path
+	pr.Headers = append(hook.headers[:0], req.Headers...)
+	pr.Host = ds.config.HostHeader
+	return pr
+}
 
 func adoptAttemptTakeover(req, attempt *Request) {
 	if !attempt.hijacked && !attempt.connTakenOver {

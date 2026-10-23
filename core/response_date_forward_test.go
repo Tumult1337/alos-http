@@ -61,7 +61,7 @@ func TestResponseDateFallbackProxyAndCache(t *testing.T) {
 	domain := engine.Lookup(proxyFixDomain)
 	request := &Request{Method: "GET", Path: "/receipt", Host: proxyFixDomain, RemoteAddr: "127.0.0.1:1"}
 	response := &Response{StatusCode: 200}
-	if err := engine.forwardRequestFP(request, response, domain.backends[0], &domain.config); err != nil {
+	if err := engine.forwardRequestFP(request, response, domain.backends[0], &domain.config, fpProxyPath(request)); err != nil {
 		t.Fatal(err)
 	}
 	dateRequireCurrent(t, response.Headers)

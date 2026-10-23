@@ -84,7 +84,7 @@ func TestFPProxyBufferedResponseLimit(t *testing.T) {
 			err := engine.forwardRequestFP(req, resp, &backend{Addr: origin}, &DomainConfig{
 				ConnectTimeout: time.Second,
 				ReadTimeout:    5 * time.Second,
-			})
+			}, fpProxyPath(req))
 			if !withWriter && size == 67108865 {
 				if !errors.Is(err, errFPBodyTooLarge) {
 					t.Fatalf("oversized buffered response: err=%v, body=%d bytes; want errFPBodyTooLarge", err, resp.BodyLen())

@@ -407,7 +407,7 @@ func (s *Server) proxyHTTPRoute(conn net.Conn, raw []byte, ds *domainState) {
 	resp.lazyReq = req
 
 	b := ds.backends[0]
-	err := httpRouteEngine.forwardRequestFP(req, resp, b, &ds.config)
+	err := httpRouteEngine.forwardRequestFP(req, resp, b, &ds.config, fpProxyPath(req))
 	if sw := req.StreamWriter; sw != nil {
 		releaseStreamWriter(sw)
 		return
