@@ -5,6 +5,8 @@ package core
 import (
 	"net/http"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -242,5 +244,67 @@ func TestCache_ApparentAgeOverridesSmallerAgeHeader(t *testing.T) {
 	}
 	if age, err := strconv.Atoi(ages[0]); err != nil || age < 100 || age > 102 {
 		t.Fatalf("hit Age %v, want the apparent age of about 100", ages)
+	}
+}
+
+func TestCache_SweepCompactsExpiredOrderRefs(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 100})
+	defer rc.Stop()
+	for i := range 100 {
+		rc.handle(cacheFreshHandler(), cReq("GET", "x", "/e", strconv.Itoa(i)), cResp())
+	}
+	past := turbo.UnixNano() - 1
+	rc.store.Range(func(key string, ent *cachedResponse) bool {
+		ent.expiresAtNs = past
+		return true
+	})
+	rc.sweep()
+	rc.orderMu.Lock()
+	queued := len(rc.order)
+	rc.orderMu.Unlock()
+	if queued != 0 || rc.Len() != 0 || rc.entries.Load() != 0 {
+		t.Fatalf("after the sweep: %d refs, %d stored, %d counted", queued, rc.Len(), rc.entries.Load())
+	}
+}
+
+func TestCache_ConcurrentStoresNeverExceedMaxEntries(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 10, Gzip: true, GzipMinBytes: 10})
+	defer rc.Stop()
+	h := func(req *Request, resp *Response) { resp.Status(200).String(bigBody(300)) }
+	var over atomic.Int64
+	var writers sync.WaitGroup
+	stop := make(chan struct{})
+	watcher := make(chan struct{})
+	go func() {
+		defer close(watcher)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			rc.orderMu.Lock()
+			if n := int64(rc.Len()); n > 10 {
+				over.Store(n)
+			}
+			rc.orderMu.Unlock()
+			rc.sweep()
+		}
+	}()
+	for w := range 16 {
+		writers.Go(func() {
+			for i := range 500 {
+				rc.handle(h, cReq("GET", "x", "/c", strconv.Itoa(w*1000+i%40), gzHdr()), cResp())
+			}
+		})
+	}
+	writers.Wait()
+	close(stop)
+	<-watcher
+	if n := over.Load(); n != 0 {
+		t.Fatalf("store held %d entries, MaxEntries 10", n)
+	}
+	if got, counted := rc.Len(), rc.entries.Load(); int64(got) != counted || got > 10 {
+		t.Fatalf("store holds %d entries, counter says %d", got, counted)
 	}
 }

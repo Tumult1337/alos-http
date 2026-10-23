@@ -3,8 +3,6 @@
 package core
 
 import (
-	"cmp"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -453,10 +451,18 @@ func (rc *ResponseCache) sweepLoop() {
 		case <-rc.stop:
 			return
 		case <-ticker.C:
-			rc.evictExpired()
-			rc.evictOverflow()
+			rc.sweep()
 		}
 	}
+}
+
+func (rc *ResponseCache) sweep() {
+	rc.evictExpired()
+	rc.orderMu.Lock()
+	if int64(len(rc.order)) > 2*rc.entries.Load() {
+		rc.compactOrderLocked()
+	}
+	rc.orderMu.Unlock()
 }
 
 func (rc *ResponseCache) crossRaceSeam() {
@@ -480,28 +486,6 @@ func (rc *ResponseCache) evictExpired() {
 		}
 		return true
 	})
-}
-
-func (rc *ResponseCache) evictOverflow() {
-	over := rc.store.Len() - rc.cfg.MaxEntries
-	if over <= 0 {
-		return
-	}
-	type aged struct {
-		key string
-		ent *cachedResponse
-		ts  int64
-	}
-	victims := make([]aged, 0, over*2)
-	rc.store.Range(func(key string, ent *cachedResponse) bool {
-		victims = append(victims, aged{key, ent, ent.storedAtNs})
-		return true
-	})
-	slices.SortFunc(victims, func(a, b aged) int { return cmp.Compare(a.ts, b.ts) })
-	rc.crossRaceSeam()
-	for i := 0; i < over && i < len(victims); i++ {
-		rc.evictEntry(victims[i].key, victims[i].ent)
-	}
 }
 
 func cacheableHeaders(headers [][2]string) bool {

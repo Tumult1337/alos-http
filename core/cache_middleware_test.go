@@ -551,25 +551,6 @@ func TestCache_MaxEntries_Bounded(t *testing.T) {
 	}
 }
 
-func TestCache_EvictOverflow_OldestRemoved(t *testing.T) {
-	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 5})
-	defer rc.Stop()
-	now := turbo.UnixNano()
-	for i := 0; i < 20; i++ {
-		rc.store.Store("k"+string(rune('A'+i)), &cachedResponse{storedAtNs: now + int64(i), expiresAtNs: now + int64(time.Hour)})
-	}
-	rc.evictOverflow()
-	if rc.Len() != 5 {
-		t.Fatalf("after evictOverflow Len=%d want 5", rc.Len())
-	}
-	if _, ok := rc.store.Load("kA"); ok {
-		t.Fatal("oldest entry kA should have been evicted")
-	}
-	if _, ok := rc.store.Load("kT"); !ok {
-		t.Fatal("newest entry kT should survive")
-	}
-}
-
 func TestCache_EvictExpired_BySweep(t *testing.T) {
 	rc := NewResponseCache(CacheConfig{TTL: time.Minute})
 	defer rc.Stop()
@@ -899,20 +880,6 @@ func TestCache_EvictExpired_KeepsReplacedEntry(t *testing.T) {
 	rc.evictExpired()
 	if cur, ok := rc.store.Load("k"); !ok || cur != fresh {
 		t.Fatal("evictExpired removed the entry that replaced the stale one")
-	}
-}
-
-func TestCache_EvictOverflow_KeepsReplacedEntry(t *testing.T) {
-	rc := NewResponseCache(CacheConfig{TTL: time.Minute, MaxEntries: 1})
-	defer rc.Stop()
-	now := turbo.UnixNano()
-	rc.store.Store("old", &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now - 10})
-	rc.store.Store("new", &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now})
-	fresh := &cachedResponse{expiresAtNs: now + int64(time.Hour), storedAtNs: now + 1}
-	replaceOnce(rc, "old", fresh)
-	rc.evictOverflow()
-	if cur, ok := rc.store.Load("old"); !ok || cur != fresh {
-		t.Fatal("evictOverflow removed the entry that replaced the victim")
 	}
 }
 
