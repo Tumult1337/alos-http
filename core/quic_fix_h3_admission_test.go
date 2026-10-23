@@ -235,3 +235,91 @@ func TestQUICFixH3StallResetOnTheTimerAdmitsTheWaitingRequest(t *testing.T) {
 	p.tickAt(now)
 	awaitQUICFix(t, "the waiting request to start after the stall reset", func() bool { return fast.Load() == 1 })
 }
+
+func TestQUICFixH3WaitingRequestsStartInArrivalOrder(t *testing.T) {
+	big := make([]byte, quicFixAdmitBigBody)
+	var mu sync.Mutex
+	var order []string
+	p := newQUICFixAdmissionPeer(t, Config{MaxPendingWriteBytes: quicFixAdmitPendingCap, H2MaxRunningHandlers: 1}, func(r *Router) {
+		r.GET("/big", func(req *Request, resp *Response) { resp.Status(200).BytesNoCopy(big) })
+		r.GET("/order", func(req *Request, resp *Response) {
+			mu.Lock()
+			order = append(order, req.Query)
+			mu.Unlock()
+			resp.Status(200).String("ok")
+		})
+	})
+	p.qc.writeMu.Lock()
+	p.qc.maxDataRemote = quicFixUnlimitedFlowLimit
+	p.qc.peerStreamWindow = quicFixUnlimitedFlowLimit
+	p.qc.writeMu.Unlock()
+	quicFixSendRequest(p, 0, h3AppendHeadersFrame(nil, quicFixGET("/big")))
+	awaitQUICFix(t, "the big response to be held back", func() bool { return p.qc.stalledSendBytes.Load() >= quicFixAdmitPendingCap })
+	p.awaitAdmissionSettled()
+	quicFixSendRequest(p, 4, h3AppendHeadersFrame(nil, quicFixGET("/order?first")))
+	held := p.qc.acquireStream(0)
+	if held == nil {
+		t.Fatal("the held response stream is gone")
+	}
+	p.qc.resetStreamSend(held, h3ErrRequestRejected)
+	p.qc.releaseStream(held)
+	if pending := p.qc.pendingWriteBytes(); pending >= quicFixAdmitPendingCap {
+		t.Fatalf("fixture still holds %d pending bytes after the reset", pending)
+	}
+	quicFixSendRequest(p, 8, h3AppendHeadersFrame(nil, quicFixGET("/order?second")))
+	p.qc.admitWaiting()
+	awaitQUICFix(t, "both waiting requests to run", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(order) == 2
+	})
+	if order[0] != "first" || order[1] != "second" {
+		t.Fatalf("waiting requests started in order %v, want [first second]", order)
+	}
+}
+
+func TestQUICFixH3StopSendingOfAWaitingStreamReleasesIt(t *testing.T) {
+	routes := newQUICFixBlockingRoutes()
+	t.Cleanup(routes.open)
+	p := newQUICFixAdmissionPeer(t, Config{H2MaxRunningHandlers: 1}, func(r *Router) { r.GET("/block", routes.handler) })
+	quicFixSendRequest(p, 0, h3AppendHeadersFrame(nil, quicFixGET("/block")))
+	awaitQUICFix(t, "the first handler to start", func() bool { return routes.running.Load() == 1 })
+	quicFixSendRequest(p, 4, h3AppendHeadersFrame(nil, quicFixGET("/block")))
+	if !p.hasStream(4) || p.qc.activeReqStreams.Load() != 2 {
+		t.Fatalf("fixture stream 4 is not waiting: tracked %v, slots %d", p.hasStream(4), p.qc.activeReqStreams.Load())
+	}
+	p.send(quicAppendStopSendingFrame(nil, 4, h3ErrRequestRejected))
+	awaitQUICFix(t, "the stopped waiting stream to be released", func() bool {
+		return !p.hasStream(4) && p.qc.activeReqStreams.Load() == 1
+	})
+	routes.open()
+	p.awaitFin(0)
+	p.awaitHandlersIdle()
+	if started := routes.started.Load(); started != 1 {
+		t.Fatalf("%d handlers ran; the stopped waiting request must not run", started)
+	}
+}
+
+func TestQUICFixH3StreamAdmittedAfterCloseGivesBackItsSlot(t *testing.T) {
+	p := newQUICTestPeer(t, nil)
+	const id = 400
+	s := getPooledStream(id, p.qc)
+	s.refCount.Store(1)
+	p.qc.streamsMu.Lock()
+	p.qc.streams[id] = s
+	p.qc.streamsMu.Unlock()
+	p.qc.activeReqStreams.Add(1)
+	s.dispatched.Store(true)
+	s.refCount.Add(1)
+	p.qc.close()
+	p.qc.admitRequestStream(s)
+	p.qc.admitMu.Lock()
+	waiting := len(p.qc.waitingReqs)
+	p.qc.admitMu.Unlock()
+	if active := p.qc.activeReqStreams.Load(); active != 0 || waiting != 0 {
+		t.Fatalf("a stream dispatched after close holds %d request slots and sits in a queue of %d", active, waiting)
+	}
+	if s.conn != nil {
+		t.Fatal("the stream dispatched after close kept its dispatch reference")
+	}
+}

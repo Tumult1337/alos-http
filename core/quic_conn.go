@@ -1205,7 +1205,6 @@ func (qc *QUICConn) handleResetStream(f quicResetStreamFrame) {
 		}
 		qc.retireStream(s, 1)
 	}
-	qc.admitWaiting()
 }
 
 func (qc *QUICConn) acquirePeerUniStreams() []*QUICStream {
