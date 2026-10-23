@@ -143,10 +143,8 @@ func TestPerfH1DirectBodyPipelinedInOrder(t *testing.T) {
 
 func TestPerfH1DirectBodySlowReaderIntact(t *testing.T) {
 	ts := perfH1DirectServer(t, false)
-	conn := perfH1DirectDial(t, ts.addr)
-	if tc, ok := conn.(*net.TCPConn); ok {
-		_ = tc.SetReadBuffer(perfH1DirectRecvBuf)
-	}
+	conn := dialTCPRecvBuf(t, ts.addr, perfH1IODeadline, perfH1DirectRecvBuf)
+	_ = conn.SetDeadline(wallDeadline(perfH1IODeadline))
 	if _, err := conn.Write(perfH1Get("/sized/"+strconv.Itoa(perfH1DirectMaxBody), "Connection: close\r\n")); err != nil {
 		t.Fatalf("write: %v", err)
 	}

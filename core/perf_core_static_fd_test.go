@@ -184,10 +184,7 @@ func TestPerfCoreStaticFDSurvivesRetireMidBody(t *testing.T) {
 	if resp, _ := rig.get(t, c, br, "/s/big.bin", ""); resp.StatusCode != 200 {
 		t.Fatalf("warm: %d", resp.StatusCode)
 	}
-	slow := rig.ts.dial(t)
-	if tcp, ok := slow.(*net.TCPConn); ok {
-		_ = tcp.SetReadBuffer(16 << 10)
-	}
+	slow := rig.ts.dialRecvBuf(t, 16<<10)
 	writeAll(t, slow, "GET /s/big.bin HTTP/1.1\r\nHost: "+rig.ts.domain+"\r\n\r\n")
 	time.Sleep(perfCoreSendfilePause)
 	e := rig.entry(t, "big.bin")

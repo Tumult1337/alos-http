@@ -8,10 +8,12 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/guno1928/turbo"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -92,13 +94,44 @@ func (ts *testServer) client(t *testing.T, alpn string) *http.Client {
 	return &http.Client{Transport: tr, Timeout: harnessIOTimeout}
 }
 
+func recvBufDialer(timeout time.Duration, recvBuf int) *net.Dialer {
+	return &net.Dialer{Timeout: timeout, Control: func(_, _ string, raw syscall.RawConn) error {
+		var setErr error
+		if err := raw.Control(func(fd uintptr) {
+			setErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, recvBuf)
+		}); err != nil {
+			return err
+		}
+		return setErr
+	}}
+}
+
+func dialTCPRecvBuf(tb testing.TB, addr string, timeout time.Duration, recvBuf int) net.Conn {
+	tb.Helper()
+	conn, err := recvBufDialer(timeout, recvBuf).Dial("tcp4", addr)
+	if err != nil {
+		tb.Fatalf("dial %s: %v", addr, err)
+	}
+	tb.Cleanup(func() { _ = conn.Close() })
+	return conn
+}
+
 func (ts *testServer) dial(t *testing.T) net.Conn {
+	t.Helper()
+	return ts.dialWith(t, &net.Dialer{Timeout: harnessIOTimeout})
+}
+
+func (ts *testServer) dialRecvBuf(t *testing.T, recvBuf int) net.Conn {
+	t.Helper()
+	return ts.dialWith(t, recvBufDialer(harnessIOTimeout, recvBuf))
+}
+
+func (ts *testServer) dialWith(t *testing.T, dialer *net.Dialer) net.Conn {
 	t.Helper()
 	var (
 		c   net.Conn
 		err error
 	)
-	dialer := &net.Dialer{Timeout: harnessIOTimeout}
 	if ts.tls {
 		c, err = tls.DialWithDialer(dialer, "tcp4", ts.addr, ts.tlsConfig("http/1.1"))
 	} else {
