@@ -393,8 +393,4 @@ func TestH2ResponseHeaderFragmentationAltSvcAndTLS(t *testing.T) {
 	if !bytes.Equal(plain, wire) {
 		t.Fatal("TLS flight altered fragmented response")
 	}
-	small := newH2RootFastResponse(block[:64], []byte("body"))
-	if len(small.tlsInner) != len(small.framed)+1 || small.tlsInner[len(small.tlsInner)-1] != 0x17 || !bytes.Equal(small.tlsInner[:len(small.tlsInner)-1], small.framed) {
-		t.Fatal("existing small TLS-inner template changed")
-	}
 }

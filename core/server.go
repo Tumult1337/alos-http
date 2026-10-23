@@ -695,14 +695,12 @@ type ipReqCounter struct {
 }
 
 type plainRootFastResponse struct {
-	getKeepAlive    []byte
-	getClose        []byte
-	getKeepAliveTLS []byte
-	getCloseTLS     []byte
-	handlerAltSvc   bool
-	refreshDate     bool
-	tlsKeepAlive    []byte
-	tlsClose        []byte
+	getKeepAlive  []byte
+	getClose      []byte
+	handlerAltSvc bool
+	refreshDate   bool
+	tlsKeepAlive  []byte
+	tlsClose      []byte
 }
 
 type h2RootFastResponse struct {
@@ -710,9 +708,6 @@ type h2RootFastResponse struct {
 	body          []byte
 	framed        []byte
 	dataFrameOff  int
-	tlsInner      []byte
-	headerIDOff   int
-	dataIDOff     int
 	handlerAltSvc bool
 	refreshDate   bool
 	withAltSvc    *h2RootFastResponse
@@ -1582,19 +1577,11 @@ func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
 	if len(keepAlive) == 0 || len(closeResp) == 0 {
 		return nil
 	}
-	keepAliveTLS := make([]byte, len(keepAlive)+1)
-	copy(keepAliveTLS, keepAlive)
-	keepAliveTLS[len(keepAlive)] = 0x17
-	closeTLS := make([]byte, len(closeResp)+1)
-	copy(closeTLS, closeResp)
-	closeTLS[len(closeResp)] = 0x17
 	return &plainRootFastResponse{
-		getKeepAlive:    keepAlive,
-		getClose:        closeResp,
-		getKeepAliveTLS: keepAliveTLS,
-		getCloseTLS:     closeTLS,
-		handlerAltSvc:   headersHaveFold(resp.Headers, altSvcHeaderName),
-		refreshDate:     dateEligible(resp.StatusCode, resp.Headers),
+		getKeepAlive:  keepAlive,
+		getClose:      closeResp,
+		handlerAltSvc: headersHaveFold(resp.Headers, altSvcHeaderName),
+		refreshDate:   dateEligible(resp.StatusCode, resp.Headers),
 	}
 }
 
@@ -1653,16 +1640,6 @@ func newH2RootFastResponse(headerPayload, body []byte) *h2RootFastResponse {
 			framed = appendH2Frame(framed, H2FrameData, H2FlagEndStream, 0, body)
 		}
 		fastResp.framed = framed
-		if len(framed)+1 <= MaxRecordPayload {
-			fastResp.tlsInner = make([]byte, len(framed)+1)
-			copy(fastResp.tlsInner, framed)
-			fastResp.tlsInner[len(framed)] = 0x17
-			fastResp.headerIDOff = 5
-			fastResp.dataIDOff = -1
-			if fastResp.dataFrameOff >= 0 {
-				fastResp.dataIDOff = fastResp.dataFrameOff + 5
-			}
-		}
 	}
 	return fastResp
 }
