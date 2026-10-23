@@ -404,7 +404,11 @@ func (c *epollConn) finishH1TakenOver() {
 
 func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) {
 	c.req.finishContext()
-	if c.h1EndBodyStream() || w.server.shuttingDown.Load() {
+	mustClose, rejectStatus := c.h1EndBodyStream()
+	if body := c.req.bodyStream; body != nil {
+		body.abort(ErrBodyStreamAborted)
+	}
+	if mustClose || w.server.shuttingDown.Load() {
 		reqClose = true
 	}
 	sw, _ := c.resp.sw.(*epollH1StreamWriter)
@@ -445,6 +449,17 @@ func (c *epollConn) finishH1Dispatch(w *epollWorker, gen uint32, reqClose bool) 
 		return
 	}
 	c.dispatching = false
+	if rejectStatus != 0 && !c.req.hijacked && (sw == nil || !sw.headerReady) {
+		if sw != nil {
+			sw.release()
+		}
+		c.resp.Reset()
+		c.resp.Status(rejectStatus).String(h1RejectText(rejectStatus))
+		c.h1WriteResponse(false)
+		c.closeAfter = true
+		w.markFlush(c)
+		return
+	}
 	if sw != nil {
 		if sw.headerReady && !c.req.hijacked {
 			c.h1FinishStreamed(w, sw, !reqClose)

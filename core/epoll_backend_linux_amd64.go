@@ -123,6 +123,7 @@ type epollConn struct {
 
 	reqBodyCopy     []byte
 	h1BodyAccounted int64
+	h1BodyReserved  atomic.Int64
 	h1BodyDeadline  int64
 	h2BodyDeadline  int64
 	h2SendDeadline  int64
