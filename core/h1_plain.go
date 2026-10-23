@@ -94,13 +94,13 @@ func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
 var rootPrefix16 = [16]byte{'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/', '1', '.', '1', '\r', '\n'}
 var rootPrefixBytes = rootPrefix16[:]
 
-func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, bool, bool) {
+func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, bool, bool, bool) {
 	fast := s.plainRootFast.Load()
 	if fast == nil {
-		return nil, 0, false, false
+		return nil, 0, false, false, false
 	}
 	if len(data) < len(rootPrefixBytes)+4 || !equalPrefix16(data, &rootPrefix16) {
-		return nil, 0, false, false
+		return nil, 0, false, false, false
 	}
 	maxHeaderBytes := s.limits.Load().MaxHeaderSize
 	if maxHeaderBytes <= 0 {
@@ -108,12 +108,12 @@ func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, 
 	}
 	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes, s.config.MaxHeaderCount)
 	if needRead {
-		return nil, 0, false, false
+		return nil, 0, false, false, false
 	}
 	if !ok {
-		return nil, 0, false, false
+		return nil, 0, false, false, false
 	}
-	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true
+	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true, fast.refreshDate
 }
 
 const rootScalarScanMaxBytes = 96

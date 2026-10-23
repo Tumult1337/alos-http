@@ -75,6 +75,7 @@ func TestH2MemoizedRootResponseRefreshesDate(t *testing.T) {
 	enc.encodeStaticFieldCached(hpackStaticContentType, "text/plain")
 	for _, body := range [][]byte{[]byte("ok"), make([]byte, 2*H2DefaultMaxFrameSize)} {
 		fast := newH2RootFastResponse(append([]byte(nil), enc.Buf...), body)
+		fast.refreshDate = true
 		out := appendFastH2RootResponse(nil, fast, 5, H2DefaultMaxFrameSize)
 		n := int(out[0])<<16 | int(out[1])<<8 | int(out[2])
 		perfH2AssertFreshDate(t, perfH2DecodeFields(t, out[9:9+n]))

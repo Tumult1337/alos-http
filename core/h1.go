@@ -96,6 +96,13 @@ func appendH1HeaderFields(dst []byte, headers [][2]string) []byte {
 	return dst
 }
 
+func appendRootFastResponse(dst, memo []byte, refreshDate bool) []byte {
+	if !refreshDate {
+		return append(dst, memo...)
+	}
+	return appendMemoizedResponse(dst, memo)
+}
+
 func appendMemoizedResponse(dst, memo []byte) []byte {
 	base := len(dst)
 	dst = append(dst, memo...)

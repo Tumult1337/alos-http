@@ -185,17 +185,17 @@ func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uin
 			dst[dataOff+7] = byte(streamID >> 8)
 			dst[dataOff+8] = byte(streamID)
 		}
-		refreshH2DateField(dst[off+9 : headerEnd])
+		refreshH2RootFastDate(fast, dst[off+9:headerEnd])
 		return dst
 	}
 	firstFrameEnd := min(headerEnd, off+9+maxFrame)
 	if len(fast.body) == 0 {
 		dst = appendH2ResponseHeaderBlock(dst, streamID, H2FlagEndStream, fast.headerPayload, maxFrame)
-		refreshH2DateField(dst[off+9 : firstFrameEnd])
+		refreshH2RootFastDate(fast, dst[off+9:firstFrameEnd])
 		return dst
 	}
 	dst = appendH2ResponseHeaderBlock(dst, streamID, 0, fast.headerPayload, maxFrame)
-	refreshH2DateField(dst[off+9 : firstFrameEnd])
+	refreshH2RootFastDate(fast, dst[off+9:firstFrameEnd])
 	remaining := fast.body
 	for len(remaining) > 0 {
 		chunk := remaining
@@ -421,4 +421,10 @@ func putH2FrameHeader(frame []byte, typ, flags byte, streamID uint32, pLen int) 
 	frame[6] = byte(streamID >> 16)
 	frame[7] = byte(streamID >> 8)
 	frame[8] = byte(streamID)
+}
+
+func refreshH2RootFastDate(fast *h2RootFastResponse, headerBlock []byte) {
+	if fast.refreshDate {
+		refreshH2DateField(headerBlock)
+	}
 }

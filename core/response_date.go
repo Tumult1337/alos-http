@@ -31,6 +31,10 @@ func appendProxyDate(dst []byte, status int, headers respHeaders) []byte {
 	return appendH1Date(dst, currentHTTPDate().text)
 }
 
+func (p *h1Parser) wantsReceiptDate() bool {
+	return p.status == 101 || (p.status >= 200 && p.status < 600)
+}
+
 func (p *h1Parser) addReceiptDate() {
 	for _, header := range p.hdr {
 		if headerNameIsBytes(header[0], "date") {

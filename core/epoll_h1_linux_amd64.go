@@ -179,11 +179,11 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			continue
 		}
 		if !proxyActive && !srv.shuttingDown.Load() {
-			if resp, consumed, closeConn, ok := srv.matchPlainRootFastRequest(data, c.tls); ok {
+			if resp, consumed, closeConn, ok, refreshDate := srv.matchPlainRootFastRequest(data, c.tls); ok {
 				c.worker.reqs++
 				if srv.tryAcquireRequestSlot() {
 					srv.releaseRequestSlot()
-					out = appendMemoizedResponse(out, resp)
+					out = appendRootFastResponse(out, resp, refreshDate)
 				} else {
 					out = c.h1ServiceUnavailable(out, !closeConn)
 				}
