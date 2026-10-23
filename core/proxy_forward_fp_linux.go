@@ -119,7 +119,7 @@ func fpAttemptError(err error, wroteRequest, gotResponse bool) *proxyAttemptErro
 
 // forwardRequestFP is the epoll backed replacement for forwardRequest. It
 // keeps the same signature so the call site can switch between them.
-func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend, cfg *DomainConfig, cachePath string) error {
+func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend, cfg *DomainConfig, target proxyCacheTarget) error {
 	client, err := proxyUpstreamClient()
 	if err != nil {
 		return err
@@ -127,7 +127,7 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 
 	host := stripPort(req.Host)
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
-	autoCacheAllowed := cacheableMethod && proxyCacheRequestAllowed(req)
+	autoCacheAllowed := target.storable && cacheableMethod && proxyCacheRequestAllowed(req)
 	cache := pe.activeCache()
 	cacheGen := cache.purgeGeneration()
 
@@ -192,7 +192,7 @@ func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend
 	}
 
 	if autoCacheAllowed && cache != nil && proxyCacheResponseAllowed(respHeaders) {
-		cache.put(req.Method, host, cachePath, status, respHeaders, contentType, buffered, cachePutOptions{generation: cacheGen})
+		cache.put(req.Method, host, target.path, status, respHeaders, contentType, buffered, cachePutOptions{generation: cacheGen})
 	}
 	return nil
 }

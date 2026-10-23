@@ -196,13 +196,17 @@ func (w *epollWorker) beginProxy(pe *ProxyEngine, ds *domainState, c *epollConn,
 		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath = proxyRequestTarget(req)
 		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			admission.release(w.server)
-			if r := w.cacheHitRefusal(pe, ds, req); r.status != 0 {
-				r.answer(&c.resp)
+			refusal, serve := w.cacheHitVerdict(pe, ds, req)
+			if refusal.status != 0 {
+				admission.release(w.server)
+				refusal.answer(&c.resp)
 				return proxyStartServed
 			}
-			w.serveProxyCacheHit(pe, ds, cache, entry, req, &c.resp)
-			return proxyStartServed
+			if serve {
+				admission.release(w.server)
+				w.serveProxyCacheHit(pe, ds, cache, entry, req, &c.resp)
+				return proxyStartServed
+			}
 		}
 	}
 
@@ -439,20 +443,20 @@ func (w *epollWorker) guardUserHook(req *Request, call func()) (completed bool) 
 	return true
 }
 
-func (w *epollWorker) cacheHitRefusal(pe *ProxyEngine, ds *domainState, req *Request) proxyRefusal {
+func (w *epollWorker) cacheHitVerdict(pe *ProxyEngine, ds *domainState, req *Request) (proxyRefusal, bool) {
 	onRequest := pe.requestHook()
 	if onRequest == nil {
-		return proxyRefusal{}
+		return proxyRefusal{}, true
 	}
 	pr := cacheHitProxyRequest(ds, req)
 	allowed := false
 	if !w.guardUserHook(req, func() { allowed = onRequest(pr) }) {
-		return proxyRefusedHookFailed
+		return proxyRefusedHookFailed, false
 	}
 	if !allowed {
-		return proxyRefusedByHook
+		return proxyRefusedByHook, false
 	}
-	return proxyRefusal{}
+	return proxyRefusal{}, !proxyHookChangedRequest(pr, req, ds.config.HostHeader)
 }
 
 func (w *epollWorker) serveProxyCacheHit(pe *ProxyEngine, ds *domainState, cache *ProxyCache, entry *cacheEntry, req *Request, resp *Response) {
@@ -529,6 +533,9 @@ func (w *epollWorker) proxyStartBackend(px *proxyExchange) (proxyRefusal, error)
 		if !allowed {
 			px.b = nil
 			return proxyRefusedByHook, nil
+		}
+		if proxyHookChangedRequest(pr, req, hostHdr) {
+			px.mayCache = false
 		}
 		if pr.Path != originalPath {
 			// The serialiser prefers RawPath so escaped targets survive; a hook
@@ -633,7 +640,7 @@ func appendChunkFrame(dst []byte, data []byte) []byte {
 // OnResponse hook decided: DontCache suppresses the store outright, CacheThis
 // overrides the configured rules with an explicit TTL.
 func (w *epollWorker) proxyMaybeCache(px *proxyExchange, status int, headers respHeaders, body []byte, hooked *ProxyResponse) {
-	if px.method != "GET" && px.method != "HEAD" {
+	if px.method != "GET" && px.method != "HEAD" || !px.mayCache {
 		return
 	}
 	if hooked != nil && hooked.cacheSuppressed {

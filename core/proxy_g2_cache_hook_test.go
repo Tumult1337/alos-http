@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -93,7 +94,7 @@ func TestProxyCacheHitRunsRequestHook(t *testing.T) {
 	}
 }
 
-func TestProxyCacheKeysByOriginalPath(t *testing.T) {
+func TestProxyCacheDoesNotStoreHookRewrittenRequests(t *testing.T) {
 	for _, p := range proxyG2CachePaths {
 		t.Run(p.name, func(t *testing.T) {
 			var served atomic.Int64
@@ -106,12 +107,92 @@ func TestProxyCacheKeysByOriginalPath(t *testing.T) {
 			if r := proxyG2Get(t, p, addr, "/public"); r.body != "origin:/internal" {
 				t.Fatalf("rewrite did not reach the origin: %+v", r)
 			}
-			if r := proxyG2Get(t, p, addr, "/internal"); r.status != http.StatusOK || served.Load() != 2 {
-				t.Fatalf("a direct request for the rewritten path was served from the entry of /public: %+v, origin served %d", r, served.Load())
+			if r := proxyG2Get(t, p, addr, "/internal"); r.body != "origin:/internal" || served.Load() != 2 {
+				t.Fatalf("a direct request was served from the entry of a rewritten request: %+v, origin served %d", r, served.Load())
 			}
-			if r := proxyG2Get(t, p, addr, "/public"); r.body != "origin:/internal" || served.Load() != 2 {
-				t.Fatalf("a repeat of the original path missed the cache: %+v, origin served %d", r, served.Load())
+			if r := proxyG2Get(t, p, addr, "/public"); r.body != "origin:/internal" || served.Load() != 3 {
+				t.Fatalf("a rewritten request was answered from the cache: %+v, origin served %d", r, served.Load())
 			}
 		})
+	}
+}
+
+func proxyG2TenantOrigin(t *testing.T) string {
+	t.Helper()
+	o := newInloopOrigin(t, func(req *http.Request, conn net.Conn, _ *bufio.Reader) {
+		body := "path=" + req.URL.Path + " user=" + req.Header.Get("X-User") + " tenant=" + req.Header.Get("X-Tenant") + " host=" + req.Host
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nCache-Control: max-age=600\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", len(body), body)
+	})
+	return o.addr()
+}
+
+func proxyG2TenantOf(pr *ProxyRequest) string {
+	for _, h := range pr.Headers {
+		if strings.EqualFold(h[0], "x-tenant") {
+			return h[1]
+		}
+	}
+	return ""
+}
+
+func proxyG2GetAs(t *testing.T, p proxyG2CachePath, addr, path, tenant string) proxyG2Reply {
+	t.Helper()
+	if p.h2 {
+		c := proxyFixH2cDial(t, addr)
+		defer c.Close()
+		block := proxyFixAppendHPACKLiteral(nil, proxyFixHpackStaticMethod, "GET")
+		block = append(block, proxyFixHpackStaticSchemeHTTP)
+		block = proxyFixAppendHPACKLiteral(block, proxyFixHpackStaticPath, path)
+		block = proxyFixAppendHPACKLiteral(block, proxyFixHpackStaticAuthority, proxyFixDomain)
+		block = append(block, 0x00, byte(len("x-tenant")))
+		block = append(block, "x-tenant"...)
+		block = append(block, byte(len(tenant)))
+		block = append(block, tenant...)
+		if _, err := c.Write(proxyFixAppendH2Frame(nil, h2FrameHeaders, h2FlagEndStream|h2FlagEndHeaders, 1, block)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		r := c.collect(t, 1)[1]
+		status := 0
+		fmt.Sscan(r.status, &status)
+		return proxyG2Reply{status: status, body: string(r.body)}
+	}
+	resp, body := proxyFixRoundTrip(t, addr, proxyFixGet(proxyFixDomain, path, "X-Tenant: "+tenant))
+	return proxyG2Reply{status: resp.StatusCode, body: body, cache: resp.Header.Get("X-Cache")}
+}
+
+func TestProxyCacheNeverCrossesTenantsRewrittenByHook(t *testing.T) {
+	rewrites := map[string]func(pr *ProxyRequest, tenant string){
+		"path":    func(pr *ProxyRequest, tenant string) { pr.Path = "/t/" + tenant },
+		"header":  func(pr *ProxyRequest, tenant string) { pr.Headers = append(pr.Headers, [2]string{"X-User", tenant}) },
+		"removal": func(pr *ProxyRequest, tenant string) { pr.Headers = pr.Headers[:0] },
+		"host":    func(pr *ProxyRequest, tenant string) { pr.Host = tenant + ".internal" },
+	}
+	for _, p := range proxyG2CachePaths {
+		for name, rewrite := range rewrites {
+			t.Run(p.name+"/"+name, func(t *testing.T) {
+				addr := proxyG2CacheStart(t, p, proxyG2TenantOrigin(t), func(pr *ProxyRequest) bool {
+					tenant := proxyG2TenantOf(pr)
+					if tenant == "" || name == "removal" && tenant == "a" {
+						return true
+					}
+					rewrite(pr, tenant)
+					return true
+				})
+				first := proxyG2GetAs(t, p, addr, "/data", "a")
+				second := proxyG2GetAs(t, p, addr, "/data", "b")
+				if first.status != http.StatusOK || second.status != http.StatusOK {
+					t.Fatalf("statuses %d and %d", first.status, second.status)
+				}
+				if second.body == first.body {
+					t.Fatalf("tenant b received tenant a's cached body %q", second.body)
+				}
+				if name == "removal" {
+					return
+				}
+				if anonymous := proxyG2GetAs(t, p, addr, "/data", ""); anonymous.body == first.body || anonymous.body == second.body {
+					t.Fatalf("a request the hook left unchanged received a rewritten tenant body %q", anonymous.body)
+				}
+			})
+		}
 	}
 }

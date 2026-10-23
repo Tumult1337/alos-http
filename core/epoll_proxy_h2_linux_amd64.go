@@ -37,13 +37,17 @@ func (w *epollWorker) beginProxyH2(pe *ProxyEngine, ds *domainState, c *epollCon
 		reqCacheOK = proxyCacheRequestAllowed(req)
 		cachePath = proxyRequestTarget(req)
 		if entry, hit := cache.GetFP(req.Method, host, cachePath, reqCacheOK); hit {
-			admission.release(w.server)
-			if r := w.cacheHitRefusal(pe, ds, req); r.status != 0 {
-				r.answer(&stream.resp)
+			refusal, serve := w.cacheHitVerdict(pe, ds, req)
+			if refusal.status != 0 {
+				admission.release(w.server)
+				refusal.answer(&stream.resp)
 				return proxyStartServed
 			}
-			w.serveProxyCacheHit(pe, ds, cache, entry, req, &stream.resp)
-			return proxyStartServed
+			if serve {
+				admission.release(w.server)
+				w.serveProxyCacheHit(pe, ds, cache, entry, req, &stream.resp)
+				return proxyStartServed
+			}
 		}
 	}
 

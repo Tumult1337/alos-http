@@ -59,7 +59,7 @@ func proxyG2Forward(origin string, path string, sw StreamWriter) (*Response, err
 	err := (&ProxyEngine{}).forwardRequestFP(req, resp, &backend{Addr: origin}, &DomainConfig{
 		ConnectTimeout: time.Second,
 		ReadTimeout:    10 * time.Second,
-	}, fpProxyPath(req))
+	}, proxyCacheTarget{path: fpProxyPath(req), storable: true})
 	return resp, err
 }
 

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -36,17 +37,20 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 	if cache != nil && cacheableMethod {
 		entry, hit := cache.Get(req.Method, host, cachePath, req)
 		if hit {
-			if onRequest := pe.requestHook(); onRequest != nil && !onRequest(cacheHitProxyRequest(ds, req)) {
+			allowed, serve := pe.cacheHitVerdict(ds, req)
+			if !allowed {
 				resp.Status(502).String("Request blocked by interceptor")
 				return
 			}
-			cache.ServeCached(entry, req, resp)
-			if onResponse := pe.responseHook(); onResponse != nil {
-				pr := newCacheHitHookResponse(ds, entry, req, resp)
-				onResponse(pr)
-				adoptHookResponse(resp, pr)
+			if serve {
+				cache.ServeCached(entry, req, resp)
+				if onResponse := pe.responseHook(); onResponse != nil {
+					pr := newCacheHitHookResponse(ds, entry, req, resp)
+					onResponse(pr)
+					adoptHookResponse(resp, pr)
+				}
+				return
 			}
-			return
 		}
 	}
 
@@ -76,6 +80,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 		attemptReq := *req
 
 		hostOverride := ds.config.HostHeader
+		storable := true
 		if onRequest := pe.requestHook(); onRequest != nil {
 			attemptReq.Headers = append(make([][2]string, 0, len(req.Headers)), req.Headers...)
 			pr := &ProxyRequest{
@@ -91,6 +96,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 				resp.Status(502).String("Request blocked by interceptor")
 				return
 			}
+			storable = !proxyHookChangedRequest(pr, req, hostOverride)
 			attemptReq.Path = pr.Path
 			attemptReq.Headers = pr.Headers
 			hostOverride = pr.Host
@@ -100,7 +106,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 		cfgCopy.HostHeader = hostOverride
 
 		b.ActiveConns.Add(1)
-		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy, cachePath)
+		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy, proxyCacheTarget{path: cachePath, storable: storable})
 		adoptAttemptTakeover(req, &attemptReq)
 		b.ActiveConns.Add(-1)
 
@@ -180,6 +186,27 @@ func isProxyFilteredHeaderFold(name string) bool {
 }
 
 const upgradeAnswerHeadHint = 512
+
+type proxyCacheTarget struct {
+	path     string
+	storable bool
+}
+
+func proxyHookChangedRequest(pr *ProxyRequest, req *Request, host string) bool {
+	return pr.Path != req.Path || pr.Host != host || !slices.Equal(pr.Headers, req.Headers)
+}
+
+func (pe *ProxyEngine) cacheHitVerdict(ds *domainState, req *Request) (allowed, serve bool) {
+	onRequest := pe.requestHook()
+	if onRequest == nil {
+		return true, true
+	}
+	pr := cacheHitProxyRequest(ds, req)
+	if !onRequest(pr) {
+		return false, false
+	}
+	return true, !proxyHookChangedRequest(pr, req, ds.config.HostHeader)
+}
 
 func cacheHitProxyRequest(ds *domainState, req *Request) *ProxyRequest {
 	hook := &proxyHookRequest{}
