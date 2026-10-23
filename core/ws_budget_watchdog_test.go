@@ -4,6 +4,7 @@ package core
 
 import (
 	"bytes"
+	"crypto/tls"
 	"io"
 	"net"
 	"sync"
@@ -526,4 +527,154 @@ func TestWSEventsShutdownWaitsForPendingCallback(t *testing.T) {
 	waitFor(t, wsEvCloseWait, func() bool { return probe.closes.Load() == 1 })
 	<-stopped
 	wsAwaitInFlight(t, ts.srv, "budget must return after shutdown", func(n int64) bool { return n == 0 })
+}
+
+func TestWSBlockingEventsControlFramesHoldNoBudget(t *testing.T) {
+	p, srv := wsBudgetPipe(t, WSUpgradeOptions{})
+	payload := bytes.Repeat([]byte("m"), 100)
+	var held atomic.Int64
+	called := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		serveWSEventsBlocking(srv, p.server, WSEventHandler{OnMessage: func(ws *WSConn, op byte, msg []byte) {
+			held.Store(srv.inFlightBodyBytes.Load())
+			called <- struct{}{}
+		}})
+		close(done)
+	}()
+	pong := wsClientFrame(0x80|wsOpPong, bytes.Repeat([]byte("p"), wsMaxControlPayload))
+	frames := bytes.Repeat(pong, 40)
+	frames = append(frames, wsClientFrame(0x80|wsOpBinary, payload)...)
+	p.send(t, frames)
+	select {
+	case <-called:
+	case <-time.After(wsBudgetStallLimit):
+		t.Fatal("OnMessage was not called after 40 pongs")
+	}
+	if got := held.Load(); got != int64(len(payload)) {
+		t.Fatalf("budget during OnMessage after 40 pongs = %d, want %d", got, len(payload))
+	}
+	_ = p.client.Close()
+	<-done
+}
+
+func TestWSBlockingEventsReleaseOnDisconnectMidFragment(t *testing.T) {
+	p, srv := wsBudgetPipe(t, WSUpgradeOptions{})
+	done := make(chan struct{})
+	go func() {
+		serveWSEventsBlocking(srv, p.server, WSEventHandler{})
+		close(done)
+	}()
+	p.send(t, wsClientFrame(wsOpBinary, bytes.Repeat([]byte("q"), 1000)))
+	wsAwaitInFlight(t, srv, "partial fragment must be reserved", func(n int64) bool { return n == 1000 })
+	_ = p.client.Close()
+	<-done
+	if n := srv.inFlightBodyBytes.Load(); n != 0 {
+		t.Fatalf("budget after disconnect mid-fragment = %d", n)
+	}
+}
+
+func TestWSEventsSplitControlFrameHoldsNoBudget(t *testing.T) {
+	probe := newWSProbe(0)
+	ts := wsProbeServer(t, false, probe, WSUpgradeOptions{}, nil)
+	c, br, _ := wsEvDial(t, ts, "/probe")
+	ping := wsClientFrame(0x80|wsOpPing, bytes.Repeat([]byte("i"), 100))
+	if _, err := c.Write(ping[:20]); err != nil {
+		t.Fatal(err)
+	}
+	turbo.Sleep(wsBudgetSettle)
+	if _, err := c.Write(ping[20:]); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := wsReadServerFrame(br); err != nil || f.opcode() != wsOpPong || len(f.payload) != 100 {
+		t.Fatalf("pong op %#x len %d err %v", f.opcode(), len(f.payload), err)
+	}
+	if n := ts.srv.inFlightBodyBytes.Load(); n != 0 {
+		t.Fatalf("a split ping holds %d budget bytes", n)
+	}
+}
+
+func TestWSEventsTLSCloseNotifyDuringCallbackKeepsReply(t *testing.T) {
+	probe := newWSProbe(1)
+	ts := wsProbeServer(t, true, probe, WSUpgradeOptions{}, nil)
+	c, br, _ := wsEvDial(t, ts, "/probe")
+	payload := bytes.Repeat([]byte("N"), 1000)
+	if _, err := c.Write(wsClientFrame(0x80|wsOpBinary, payload)); err != nil {
+		t.Fatal(err)
+	}
+	probe.awaitEntered(t)
+	if err := c.(*tls.Conn).CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	turbo.Sleep(wsBudgetSettle)
+	if probe.closes.Load() != 0 {
+		t.Fatal("close_notify tore the connection down while OnMessage was pending")
+	}
+	close(probe.release)
+	f, err := wsReadServerFrame(br)
+	if err != nil || !bytes.Equal(f.payload, payload) {
+		t.Fatalf("reply after close_notify: len %d err %v", len(f.payload), err)
+	}
+	waitFor(t, wsEvCloseWait, func() bool { return probe.closes.Load() == 1 })
+	wsAwaitInFlight(t, ts.srv, "budget must return after close", func(n int64) bool { return n == 0 })
+}
+
+func TestWSEventsHandedOffCallbackWritesStayFramed(t *testing.T) {
+	const writesPerSide = 200
+	const frameSize = 8 << 10
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	ts := newTestServer(t, testServerOptions{
+		Config: func(cfg *Config) { cfg.PlainHTTP = true; cfg.WebSocketOriginMode = WSOriginOff },
+		Routes: func(r *Router) {
+			r.GET("/probe", func(req *Request, resp *Response) {
+				ServeWebSocketEvents(req, resp, WSUpgradeOptions{}, WSEventHandler{
+					OnMessage: func(ws *WSConn, op byte, msg []byte) {
+						entered <- struct{}{}
+						<-release
+						other := make(chan struct{})
+						go func() {
+							defer close(other)
+							side := bytes.Repeat([]byte("G"), frameSize)
+							for range writesPerSide {
+								if ws.WriteMessage(wsOpBinary, side) != nil {
+									return
+								}
+							}
+						}()
+						own := bytes.Repeat([]byte("C"), frameSize)
+						for range writesPerSide {
+							if ws.WriteMessage(wsOpBinary, own) != nil {
+								break
+							}
+						}
+						<-other
+					},
+				})
+			})
+		},
+	})
+	c, br, _ := wsEvDial(t, ts, "/probe")
+	_ = c.SetDeadline(wallDeadline(4 * wsEvCloseWait))
+	handoffs := inlineHandoffs.Load()
+	if _, err := c.Write(wsClientFrame(0x80|wsOpBinary, []byte("x"))); err != nil {
+		t.Fatal(err)
+	}
+	<-entered
+	waitFor(t, wsBudgetStallLimit, func() bool { return inlineHandoffs.Load() != handoffs })
+	close(release)
+	counts := map[byte]int{}
+	for i := 0; i < 2*writesPerSide; i++ {
+		f, err := wsReadServerFrame(br)
+		if err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+		if f.first != 0x80|wsOpBinary || len(f.payload) != frameSize || bytes.Count(f.payload, f.payload[:1]) != frameSize {
+			t.Fatalf("frame %d corrupt: first %#x len %d", i, f.first, len(f.payload))
+		}
+		counts[f.payload[0]]++
+	}
+	if counts['C'] != writesPerSide || counts['G'] != writesPerSide {
+		t.Fatalf("frame counts %v", counts)
+	}
 }

@@ -523,7 +523,7 @@ func (ws *WSConn) readMessageReserved(dst []byte) (byte, []byte, error) {
 		}
 
 		if opcode >= wsOpClose {
-			payload, err := ws.readFramePayload(nil, b1)
+			payload, err := ws.readFramePayload(nil, b1, false)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -548,7 +548,7 @@ func (ws *WSConn) readMessageReserved(dst []byte) (byte, []byte, error) {
 		}
 
 		var err error
-		assembled, err = ws.readFramePayload(assembled, b1)
+		assembled, err = ws.readFramePayload(assembled, b1, true)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -766,7 +766,7 @@ func (ws *WSConn) closeWithPayload(payload []byte) error {
 	return ws.conn.Close()
 }
 
-func (ws *WSConn) readFramePayload(dst []byte, secondByte byte) ([]byte, error) {
+func (ws *WSConn) readFramePayload(dst []byte, secondByte byte, buffered bool) ([]byte, error) {
 	payloadLen := int64(secondByte & 0x7F)
 
 	switch payloadLen {
@@ -798,7 +798,7 @@ func (ws *WSConn) readFramePayload(dst []byte, secondByte byte) ([]byte, error) 
 	start := len(dst)
 	for remaining := payloadLen; remaining > 0; {
 		step := int(min(remaining, max(wsFrameReadChunk, int64(len(dst)-start))))
-		if !ws.reserveMessageBytes(step) {
+		if buffered && !ws.reserveMessageBytes(step) {
 			return nil, errWSBudgetExhausted
 		}
 		dst = slices.Grow(dst, step)

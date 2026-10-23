@@ -500,6 +500,9 @@ func (c *epollConn) epollTLSApplication(srv *Server) int {
 				return act
 			}
 		}
+		if c.wsCallbackPending() {
+			return epollActionNeedRead
+		}
 		action, gotData := c.epollTLSDecryptToApp(srv)
 		if action == epollActionNeedRead || action == epollActionCloseAfterFlush {
 			return action

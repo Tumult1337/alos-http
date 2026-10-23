@@ -158,6 +158,9 @@ func (w *epollWorker) handOff(seq uint64, structural bool) {
 	if !w.inlineRun.CompareAndSwap(seq, inlineHandedOff) {
 		return
 	}
+	if ev := w.inlineWS.Load(); ev != nil {
+		ev.revokeLoop()
+	}
 	w.server.Router.demoteInline(w.inlineRoute, structural)
 	inlineHandoffs.Add(1)
 	w.resumed = true
@@ -245,6 +248,7 @@ func (w *epollWorker) runInlineQueue() bool {
 		w.inlineSeq++
 		seq := w.inlineSeq
 		w.inlineRoute = t.route
+		w.markInlineWS(t.ws)
 		w.inlineRun.Store(seq)
 		if w.server.inlineWatch.parked.Load() {
 			w.server.inlineWatch.signal()
@@ -252,21 +256,38 @@ func (w *epollWorker) runInlineQueue() bool {
 		switch {
 		case t.ws != nil:
 			t.ws.inlineSeq = seq
+			t.ws.lendLoop()
 			t.ws.runCallback(true)
 		case t.stream != nil:
+			w.inlineRan = true
 			t.stream.inlineSeq = seq
 			t.stream.run(true)
 		default:
+			w.inlineRan = true
 			t.conn.h1InlineSeq = seq
 			t.conn.runH1(true)
 		}
 		if !w.inlineRun.CompareAndSwap(seq, 0) {
+			if t.ws != nil {
+				w.pushWSDone(t.ws)
+			}
 			return false
+		}
+		if t.ws != nil {
+			w.finishWSCallback(t.ws)
 		}
 	}
 	w.inlineQ = w.inlineQ[:0]
 	w.inlineHead = 0
 	return true
+}
+
+func (w *epollWorker) markInlineWS(ev *wsLoopConn) {
+	if ev == nil && !w.inlineWSSet {
+		return
+	}
+	w.inlineWS.Store(ev)
+	w.inlineWSSet = ev != nil
 }
 
 func (w *epollWorker) spillInline(t inlineTask) {

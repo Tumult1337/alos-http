@@ -382,6 +382,8 @@ type epollWorker struct {
 	wsLive          int
 	wsCallbacks     int
 	inlineWatched   bool
+	inlineWS        atomic.Pointer[wsLoopConn]
+	inlineWSSet     bool
 	inlineRun       atomic.Uint64
 	inlineSeq       uint64
 	inlineRoute     uintptr
@@ -925,7 +927,6 @@ func (w *epollWorker) loop() error {
 				if !w.runInlineQueue() {
 					return errEpollLoopHandedOff
 				}
-				w.inlineRan = true
 			}
 			if w.taskPending.Load() {
 				w.drainTasks()
