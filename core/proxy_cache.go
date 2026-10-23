@@ -135,6 +135,8 @@ type cacheEntry struct {
 	gzipBody    []byte
 	createdAt   int64
 	expiresAt   int64
+	initialAge  time.Duration
+	noStale     bool
 	manual      bool
 	hits        atomic.Uint64
 	maxHits     uint64
@@ -500,7 +502,7 @@ func (pc *ProxyCache) lookupEntry(method, host, path string, reqAllows bool) (*c
 	now := CoarseNanotime()
 	if now > entry.expiresAt {
 		cfg := pc.config.Load()
-		if cfg.StaleWhileRev > 0 && now < entry.expiresAt+int64(cfg.StaleWhileRev) {
+		if !entry.noStale && cfg.StaleWhileRev > 0 && now < entry.expiresAt+int64(cfg.StaleWhileRev) {
 			entry.hits.Add(1)
 			pc.totalHits.Add(1)
 			return entry, true
@@ -530,6 +532,8 @@ func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][
 type cachePutOptions struct {
 	generation uint64
 	offload    bool
+	age        time.Duration
+	noStale    bool
 }
 
 func (pc *ProxyCache) purgeGeneration() uint64 {
@@ -567,6 +571,11 @@ func (pc *ProxyCache) put(method, host, path string, statusCode int, headers [][
 	if !ok {
 		return
 	}
+	fresh := parseCacheFreshness(headers, time.Unix(0, CoarseNanotime()))
+	if ttl, ok = fresh.storeTTL(ttl); !ok {
+		return
+	}
+	opts.age, opts.noStale = fresh.age, fresh.noStale
 	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1, false, opts)
 }
 
@@ -579,6 +588,8 @@ func (pc *ProxyCache) PutManual(method, host, path string, statusCode int, heade
 }
 
 func (pc *ProxyCache) putManual(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int, opts cachePutOptions) {
+	fresh := parseCacheFreshness(headers, time.Unix(0, CoarseNanotime()))
+	opts.age, opts.noStale = fresh.age, fresh.noStale
 	pc.putEntry(pc.config.Load(), method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen, true, opts)
 }
 
@@ -652,6 +663,8 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 		body:        bodyCopy,
 		createdAt:   now,
 		expiresAt:   now + int64(ttl),
+		initialAge:  opts.age,
+		noStale:     opts.noStale,
 		manual:      manual,
 		maxHits:     maxHits,
 		bodyLen:     int32(len(bodyCopy)),
@@ -798,8 +811,9 @@ func (pc *ProxyCache) ServeCached(entry *cacheEntry, req *Request, resp *Respons
 	for i := range entry.headers {
 		resp.SetHeader(entry.headers[i][0], entry.headers[i][1])
 	}
-	resp.SetHeaderUnsafe("x-cache", "HIT")
 	var hitBuf [20]byte
+	resp.SetHeaderUnsafe("age", string(appendUint(hitBuf[:0], int64(entry.currentAge(CoarseNanotime())/time.Second))))
+	resp.SetHeaderUnsafe("x-cache", "HIT")
 	resp.SetHeaderUnsafe("x-cache-hits", string(appendUint(hitBuf[:0], int64(entry.hits.Load()))))
 
 	if entry.gzipLen == 0 {
@@ -813,6 +827,10 @@ func (pc *ProxyCache) ServeCached(entry *cacheEntry, req *Request, resp *Respons
 		resp.referenceBody(entry.body)
 	}
 	addVaryAcceptEncoding(resp)
+}
+
+func (e *cacheEntry) currentAge(now int64) time.Duration {
+	return e.initialAge + time.Duration(max(0, now-e.createdAt))
 }
 
 func (pc *ProxyCache) compressGzip(data []byte) []byte {
@@ -1001,7 +1019,8 @@ func stripCacheUnsafeHeaders(headers [][2]string) [][2]string {
 	for i := range headers {
 		k := headers[i][0]
 		if EqualFoldASCII(k, "content-length") || EqualFoldASCII(k, "content-type") || EqualFoldASCII(k, "transfer-encoding") ||
-			EqualFoldASCII(k, "set-cookie") || EqualFoldASCII(k, "www-authenticate") || EqualFoldASCII(k, "proxy-authenticate") {
+			EqualFoldASCII(k, "set-cookie") || EqualFoldASCII(k, "www-authenticate") || EqualFoldASCII(k, "proxy-authenticate") ||
+			EqualFoldASCII(k, "age") {
 			continue
 		}
 		headers[n] = headers[i]

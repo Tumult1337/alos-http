@@ -359,7 +359,7 @@ func (w *epollWorker) proxiedRateLimitOutcome(clientIP string, req *Request, res
 }
 
 const (
-	proxyHookInlineHeaders      = 8
+	proxyHookInlineHeaders      = 9
 	proxyHookSmallInlineHeaders = 2
 	proxyHookMidInlineHeaders   = 4
 	proxyCacheBackend           = "cache"
