@@ -187,6 +187,8 @@ func (l *beLoop) idlePut(c *backendConn) {
 	if idleTimeout <= 0 {
 		idleTimeout = l.cfg.IdleTimeout.Nanoseconds()
 	}
+	c.rbuf.releaseLarge()
+	c.wbuf.releaseLarge()
 	l.resumeBackendRead(c)
 	c.inIdle = true
 	c.reused = false
@@ -279,7 +281,7 @@ func (l *beLoop) sweepConn(c *backendConn, now int64) {
 		l.sweepH2(c, now)
 		return
 	}
-	if c.cur != nil && now > c.cur.deadline {
+	if c.cur != nil && (!c.readPaused || !c.cur.req.consumerBoundsPause) && now > c.cur.deadline {
 		l.closeConn(c, errFPTimeout)
 		return
 	}

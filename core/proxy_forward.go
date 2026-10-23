@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
+	"slices"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/guno1928/turbo"
@@ -31,20 +33,24 @@ func (pe *ProxyEngine) Handle(req *Request, resp *Response) bool {
 func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, resp *Response) {
 	cacheableMethod := req.Method == "GET" || req.Method == "HEAD"
 	cache := pe.activeCache()
+	cachePath := fpProxyPath(req)
 	if cache != nil && cacheableMethod {
-		cachePath := req.Path
-		if req.Query != "" {
-			cachePath = req.Path + "?" + req.Query
-		}
 		entry, hit := cache.Get(req.Method, host, cachePath, req)
 		if hit {
-			cache.ServeCached(entry, req, resp)
-			if onResponse := pe.responseHook(); onResponse != nil {
-				pr := newCacheHitHookResponse(ds, entry, req, resp)
-				onResponse(pr)
-				adoptHookResponse(resp, pr)
+			allowed, serve := pe.cacheHitVerdict(ds, req)
+			if !allowed {
+				resp.Status(502).String("Request blocked by interceptor")
+				return
 			}
-			return
+			if serve {
+				cache.ServeCached(entry, req, resp)
+				if onResponse := pe.responseHook(); onResponse != nil {
+					pr := newCacheHitHookResponse(ds, entry, req, resp)
+					onResponse(pr)
+					adoptHookResponse(resp, pr)
+				}
+				return
+			}
 		}
 	}
 
@@ -74,6 +80,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 		attemptReq := *req
 
 		hostOverride := ds.config.HostHeader
+		storable := true
 		if onRequest := pe.requestHook(); onRequest != nil {
 			attemptReq.Headers = append(make([][2]string, 0, len(req.Headers)), req.Headers...)
 			pr := &ProxyRequest{
@@ -89,6 +96,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 				resp.Status(502).String("Request blocked by interceptor")
 				return
 			}
+			storable = !proxyHookChangedRequest(pr, req, hostOverride)
 			attemptReq.Path = pr.Path
 			attemptReq.Headers = pr.Headers
 			hostOverride = pr.Host
@@ -98,7 +106,7 @@ func (pe *ProxyEngine) serveDomain(ds *domainState, host string, req *Request, r
 		cfgCopy.HostHeader = hostOverride
 
 		b.ActiveConns.Add(1)
-		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy)
+		err := pe.forwardRequest(&attemptReq, resp, b, &cfgCopy, proxyCacheTarget{path: cachePath, storable: storable})
 		adoptAttemptTakeover(req, &attemptReq)
 		b.ActiveConns.Add(-1)
 
@@ -179,6 +187,40 @@ func isProxyFilteredHeaderFold(name string) bool {
 
 const upgradeAnswerHeadHint = 512
 
+type proxyCacheTarget struct {
+	path     string
+	storable bool
+}
+
+func proxyHookChangedRequest(pr *ProxyRequest, req *Request, host string) bool {
+	return pr.Path != req.Path || pr.Host != host || !slices.Equal(pr.Headers, req.Headers)
+}
+
+func (pe *ProxyEngine) cacheHitVerdict(ds *domainState, req *Request) (allowed, serve bool) {
+	onRequest := pe.requestHook()
+	if onRequest == nil {
+		return true, true
+	}
+	pr := cacheHitProxyRequest(ds, req)
+	if !onRequest(pr) {
+		return false, false
+	}
+	return true, !proxyHookChangedRequest(pr, req, ds.config.HostHeader)
+}
+
+func cacheHitProxyRequest(ds *domainState, req *Request) *ProxyRequest {
+	hook := &proxyHookRequest{}
+	pr := &hook.ProxyRequest
+	pr.Domain = ds.config.Domain
+	pr.Backend = proxyCacheBackend
+	pr.ClientAddr = req.RemoteAddr
+	pr.Method = req.Method
+	pr.Path = req.Path
+	pr.Headers = append(hook.headers[:0], req.Headers...)
+	pr.Host = ds.config.HostHeader
+	return pr
+}
+
 func adoptAttemptTakeover(req, attempt *Request) {
 	if !attempt.hijacked && !attempt.connTakenOver {
 		return
@@ -257,7 +299,7 @@ func (pe *ProxyEngine) forwardUpgrade(req *Request, resp *Response, b *backend, 
 		resp.SetStreamer(req.StreamWriter)
 	}
 	_ = backendConn.SetReadDeadline(time.Time{})
-	go pipeUpgradeTunnel(clientConn, backendConn)
+	go pipeUpgradeTunnel(clientConn, backendConn, req.server.tunnelIdleTimeout())
 	return nil
 }
 
@@ -266,7 +308,10 @@ func readUpgradeAnswer(conn net.Conn, p *h1Parser, method string, readTimeout ti
 		return false, -1, err
 	}
 	head := make([]byte, 0, upgradeAnswerHeadHint)
-	for {
+	for interim := 0; ; interim++ {
+		if interim > upstreamMaxInterimResponses {
+			return false, -1, answeredUpgradeError(ErrProxyBadResponse)
+		}
 		head, err = readResponseHead(conn, head[:0])
 		if err != nil {
 			return false, -1, err
@@ -371,11 +416,23 @@ func relayDeclinedUpgrade(conn net.Conn, p *h1Parser, chunked bool, contentLen i
 	return sw.Close()
 }
 
-func pipeUpgradeTunnel(clientConn, backendConn net.Conn) {
+func pipeUpgradeTunnel(clientConn, backendConn net.Conn, idle time.Duration) {
 	done := make(chan struct{}, 2)
+	activity := &tunnelActivity{start: time.Now()}
+	if idle > 0 {
+		stop := activity.watch(idle, func() {
+			_ = clientConn.Close()
+			_ = backendConn.Close()
+		})
+		defer close(stop)
+	}
 	copyBuf := func(dst, src net.Conn) {
 		buf := LargeBufPool.Get().(*[]byte)
-		io.CopyBuffer(dst, src, (*buf)[:cap(*buf)])
+		if idle > 0 {
+			activity.copy(dst, src, (*buf)[:cap(*buf)])
+		} else {
+			_, _ = io.CopyBuffer(dst, src, (*buf)[:cap(*buf)])
+		}
 		putBoxedBufCapped(&LargeBufPool, buf, largeBufPoolMaxCap)
 		done <- struct{}{}
 	}
@@ -386,6 +443,63 @@ func pipeUpgradeTunnel(clientConn, backendConn net.Conn) {
 	backendConn.Close()
 	clientConn.Close()
 	<-done
+}
+
+func (s *Server) writeTimeoutBounded() bool {
+	return s != nil && s.limits.Load().WriteTimeout > 0
+}
+
+func (s *Server) tunnelIdleTimeout() time.Duration {
+	if s == nil {
+		return limitDefaultIdleTimeout
+	}
+	return s.limits.Load().IdleTimeout
+}
+
+type tunnelActivity struct {
+	start     time.Time
+	lastMoved atomic.Int64
+}
+
+func (a *tunnelActivity) idleFor() time.Duration {
+	return time.Since(a.start) - time.Duration(a.lastMoved.Load())
+}
+
+func (a *tunnelActivity) copy(dst, src net.Conn, buf []byte) {
+	for {
+		n, err := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return
+			}
+			a.lastMoved.Store(int64(time.Since(a.start)))
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+func (a *tunnelActivity) watch(idle time.Duration, expire func()) chan<- struct{} {
+	stop := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(idle)
+		defer timer.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-timer.C:
+			}
+			quiet := a.idleFor()
+			if quiet >= idle {
+				expire()
+				return
+			}
+			timer.Reset(idle - quiet)
+		}
+	}()
+	return stop
 }
 
 func extractIP(addr string) string {

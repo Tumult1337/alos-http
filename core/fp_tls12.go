@@ -108,6 +108,9 @@ func (t *tlsTransport) handle12Handshake(c *backendConn, data []byte) error {
 			return nil
 		}
 		mlen := int(t.inHS[1])<<16 | int(t.inHS[2])<<8 | int(t.inHS[3])
+		if mlen > tlsHandshakeMessageLimit(t.inHS[0]) {
+			return errTLS
+		}
 		if len(t.inHS) < 4+mlen {
 			return nil
 		}
@@ -119,7 +122,9 @@ func (t *tlsTransport) handle12Handshake(c *backendConn, data []byte) error {
 		t.transcript = append(t.transcript, msg...)
 		switch mtype {
 		case tlsHSCertificate:
-			t.parseCertificate(msg[4:])
+			if err := t.parseCertificate(msg[4:]); err != nil {
+				return err
+			}
 		case tlsHSCertificateRequest:
 			if err := t.parseCertificateRequest12(msg[4:]); err != nil {
 				return err
