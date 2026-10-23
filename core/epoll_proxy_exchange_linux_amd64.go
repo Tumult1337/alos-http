@@ -113,8 +113,11 @@ func (w *epollWorker) pxPut(px *proxyExchange) {
 	reqRaw := px.reqRaw[:0]
 	tried := px.tried[:0]
 	h2Body := px.h2Body[:0]
-	if cap(h2Body) > proxyH2BodyKeep {
+	if cap(h2Body) > retainedBufferKeep {
 		h2Body = nil
+	}
+	if cap(reqRaw) > retainedBufferKeep {
+		reqRaw = nil
 	}
 	*px = proxyExchange{}
 	px.req = req

@@ -187,6 +187,8 @@ func (l *beLoop) idlePut(c *backendConn) {
 	if idleTimeout <= 0 {
 		idleTimeout = l.cfg.IdleTimeout.Nanoseconds()
 	}
+	c.rbuf.releaseLarge()
+	c.wbuf.releaseLarge()
 	l.resumeBackendRead(c)
 	c.inIdle = true
 	c.reused = false

@@ -170,8 +170,6 @@ var (
 	proxyH2ServerBufferBudget int64 = 512 << 20
 )
 
-const proxyH2BodyKeep = 64 << 10
-
 var (
 	proxyRefusedBufferFull = proxyRefusal{503, "Proxy response buffer exhausted"}
 	proxyRefusedTooLarge   = proxyRefusal{502, "Upstream response too large"}

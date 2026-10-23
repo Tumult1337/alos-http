@@ -115,6 +115,9 @@ func (p *h1Parser) reset() {
 	// The body buffer is kept and refilled. completeH1 hands ownership away
 	// only for callers that read it after the exchange finishes.
 	p.body = p.body[:0]
+	if cap(p.body) > retainedBufferKeep {
+		p.body = nil
+	}
 }
 
 func (p *h1Parser) emit(c *backendConn, data []byte) bool {
