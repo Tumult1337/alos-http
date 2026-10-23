@@ -15,6 +15,7 @@ type h2StreamConn struct {
 	mu     sync.Mutex
 	closed bool
 	done   chan struct{}
+	ipSlot *ipReqCounter
 }
 
 type streamAddr string
@@ -85,4 +86,8 @@ func (r *Request) waitH2Tunnel() {
 	case <-r.Context().Done():
 	}
 	t.detach()
+	if t.ipSlot != nil {
+		t.ipSlot.release()
+		t.ipSlot = nil
+	}
 }

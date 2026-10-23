@@ -1870,6 +1870,10 @@ func (s *Server) dispatch(req *Request, resp *Response) {
 		}
 		if slot != nil {
 			defer func() {
+				if req.h2Tunnel != nil {
+					req.h2Tunnel.ipSlot = slot
+					return
+				}
 				if req.connTakenOver && s.trustedProxies.active {
 					return
 				}
