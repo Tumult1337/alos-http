@@ -72,8 +72,12 @@ var timeNow = time.Now
 //	Example: MaxWriteSize: 5 << 20.
 
 // MaxInFlightBodyBytes caps aggregate request-body bytes buffered by multiplexed
-// HTTP/2 and HTTP/3 streams. 0 applies a 64 MiB default; -1 disables the budget
+// HTTP/2 and HTTP/3 streams and by streamed HTTP/1 bodies. 0 applies a 64 MiB default; -1 disables the budget
 // (unsafe on an Internet-facing server). Streams that would exceed it are reset.
+// While the server holds more than half of the budget, one HTTP/2 connection can hold at most its share,
+// max(MaxInFlightBodyBytes/8, MaxBodySize) capped at MaxInFlightBodyBytes (8 MiB at the defaults); a stream
+// above it gets RST_STREAM(REFUSED_STREAM) while its handler waits for admission and RST_STREAM(ENHANCE_YOUR_CALM) otherwise.
+// A streamed HTTP/1 body that finds no room gets 503 and the connection closes.
 //
 //	Example: MaxInFlightBodyBytes: 32 << 20.
 //
