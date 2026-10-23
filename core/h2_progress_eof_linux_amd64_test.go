@@ -209,6 +209,8 @@ func TestH2TrailersAfterServerResetDoNotKillConnection(t *testing.T) {
 	trailers := hpackBlock([2]string{"x-checksum", "abc"})
 	p.send(appendH2Frame(nil, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 1, trailers))
 	p.send(appendH2Frame(nil, H2FrameData, H2FlagEndStream, 1, []byte("late")))
+	p.send(appendH2Frame(nil, H2FrameWindowUpdate, 0, 1, h2FixWindowIncrement(1024)))
+	p.send(appendH2Frame(nil, H2FramePriority, 0, 1, []byte{0, 0, 0, 0, 16}))
 	if p.c.fd < 0 {
 		t.Fatal("frames the peer sent before it saw RST_STREAM closed the connection")
 	}
