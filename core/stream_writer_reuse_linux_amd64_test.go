@@ -5,6 +5,7 @@ package core
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -133,12 +134,9 @@ func TestH2StaleStreamWriterCannotWriteIntoNextResponse(t *testing.T) {
 }
 
 func TestH1StreamWriterWritesAfterHandlerReturnStayIsolated(t *testing.T) {
-	stop := make(chan struct{})
 	var spinners sync.WaitGroup
-	t.Cleanup(func() {
-		close(stop)
-		spinners.Wait()
-	})
+	var spinMu sync.Mutex
+	var spinErrs []error
 	addr := startH2FixServer(t, nil, func(srv *Server) {
 		srv.Router.GET("/spin", func(req *Request, resp *Response) {
 			sw := resp.EnsureStreamWriter()
@@ -148,12 +146,12 @@ func TestH1StreamWriterWritesAfterHandlerReturnStayIsolated(t *testing.T) {
 			go func() {
 				defer spinners.Done()
 				for {
-					select {
-					case <-stop:
+					if err := sw.WriteChunk([]byte(swReuseInjected)); err != nil {
+						spinMu.Lock()
+						spinErrs = append(spinErrs, err)
+						spinMu.Unlock()
 						return
-					default:
 					}
-					_ = sw.WriteChunk([]byte(swReuseInjected))
 				}
 			}()
 		})
@@ -185,6 +183,17 @@ func TestH1StreamWriterWritesAfterHandlerReturnStayIsolated(t *testing.T) {
 			if path == "/next" && string(body) != "second" {
 				t.Fatalf("round %d: /next body = %q, want only its own bytes", round, body)
 			}
+		}
+	}
+	spinners.Wait()
+	spinMu.Lock()
+	defer spinMu.Unlock()
+	if len(spinErrs) != swReuseRounds {
+		t.Fatalf("%d of %d spinners stopped", len(spinErrs), swReuseRounds)
+	}
+	for i, err := range spinErrs {
+		if !errors.Is(err, ErrStreamClosed) {
+			t.Fatalf("spinner %d stopped with %v, want ErrStreamClosed", i, err)
 		}
 	}
 }
