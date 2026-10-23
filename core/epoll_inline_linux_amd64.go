@@ -249,6 +249,7 @@ func (w *epollWorker) runInlineQueue() bool {
 		seq := w.inlineSeq
 		w.inlineRoute = t.route
 		w.markInlineWS(t.ws)
+		w.inlineRan = w.inlineRan || t.ws == nil
 		w.inlineRun.Store(seq)
 		if w.server.inlineWatch.parked.Load() {
 			w.server.inlineWatch.signal()
@@ -259,11 +260,9 @@ func (w *epollWorker) runInlineQueue() bool {
 			t.ws.lendLoop()
 			t.ws.runCallback(true)
 		case t.stream != nil:
-			w.inlineRan = true
 			t.stream.inlineSeq = seq
 			t.stream.run(true)
 		default:
-			w.inlineRan = true
 			t.conn.h1InlineSeq = seq
 			t.conn.runH1(true)
 		}
