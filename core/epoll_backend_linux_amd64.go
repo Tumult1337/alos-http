@@ -369,7 +369,6 @@ type epollWorker struct {
 	beScratch       []byte
 	hdrStrings      [][2]string
 	sendIov         [2]unix.Iovec
-	sendMsg         unix.Msghdr
 	acceptAddr      unix.RawSockaddrAny
 	acceptAddrLen   uint32
 	sockoptInherit  uint8
@@ -390,6 +389,7 @@ type epollWorker struct {
 	inlineQ         []inlineTask
 	inlineHead      int
 	inlineDeadline  int64
+	inlineBatch     time.Duration
 	inlineSeen      uint64
 	inlineAll       bool
 	inlineRan       bool
@@ -600,14 +600,6 @@ func (s *Server) epollScavenger() {
 	}
 }
 
-func newEpollWorker(s *Server, addr string, minPrealloc int) (*epollWorker, error) {
-	listenerFD, err := epollListen(addr)
-	if err != nil {
-		return nil, fmt.Errorf("epoll listen %s: %w", addr, err)
-	}
-	return newEpollWorkerFromFD(s, listenerFD, minPrealloc)
-}
-
 func newEpollWorkerFromFD(s *Server, lfd int, minPrealloc int) (*epollWorker, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -634,16 +626,17 @@ func newEpollWorkerFromFD(s *Server, lfd int, minPrealloc int) (*epollWorker, er
 		return nil, fmt.Errorf("epoll add wake: %w", err)
 	}
 	w := &epollWorker{
-		server:     s,
-		epfd:       epfd,
-		listenerFD: lfd,
-		wakeFd:     wfd,
-		conns:      make([]*epollConn, 1024),
-		events:     make([]unix.EpollEvent, epollEventBatch),
-		taskCh:     make(chan func(*epollWorker), epollTaskQueueSize),
-		handlers:   newHandlerPool(handlerPoolWorkersPerLoop),
-		flushList:  make([]*epollConn, 0, 64),
-		inlineAll:  s.inlineDispatchEnabled(),
+		server:      s,
+		epfd:        epfd,
+		listenerFD:  lfd,
+		wakeFd:      wfd,
+		conns:       make([]*epollConn, 1024),
+		events:      make([]unix.EpollEvent, epollEventBatch),
+		taskCh:      make(chan func(*epollWorker), epollTaskQueueSize),
+		handlers:    newHandlerPool(handlerPoolWorkersPerLoop),
+		flushList:   make([]*epollConn, 0, 64),
+		inlineAll:   s.inlineDispatchEnabled(),
+		inlineBatch: s.inlineBatchOrDefault(),
 	}
 	w.pool.server = s
 	w.pool.batchSize = s.preallocBatch()
@@ -821,18 +814,6 @@ func epollBind(addr string) (int, error) {
 	return fd, nil
 }
 
-func epollListen(addr string) (int, error) {
-	fd, err := epollBind(addr)
-	if err != nil {
-		return -1, err
-	}
-	if err := unix.Listen(fd, epollListenBacklog); err != nil {
-		_ = unix.Close(fd)
-		return -1, err
-	}
-	return fd, nil
-}
-
 func (w *epollWorker) run() error {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -888,7 +869,7 @@ func (w *epollWorker) loop() error {
 		}
 		resumed = false
 		w.refreshLimits()
-		w.inlineDeadline = turbo.Now() + int64(inlineBatchBudget)
+		w.inlineDeadline = w.inlineBatchDeadline(turbo.Now())
 		tasksPending := false
 		for i := 0; i < n; i++ {
 			fd := int(w.events[i].Fd)
@@ -1852,15 +1833,8 @@ func (w *epollWorker) sendWithBody(c *epollConn) (int, error) {
 	if len(head) == 0 {
 		return socketSend(c.fd, c.bodyOut)
 	}
-	w.sendIov[0].Base = &head[0]
-	w.sendIov[0].SetLen(len(head))
-	w.sendIov[1].Base = &c.bodyOut[0]
-	w.sendIov[1].SetLen(len(c.bodyOut))
-	w.sendMsg.Iov = &w.sendIov[0]
-	w.sendMsg.SetIovlen(len(w.sendIov))
-	n, err := socketSendmsg(c.fd, &w.sendMsg)
-	w.sendIov[0].Base, w.sendIov[1].Base = nil, nil
-	return n, err
+	iov := appendIovec(appendIovec(w.sendIov[:0], head), c.bodyOut)
+	return socketSendIovecs(c.fd, iov)
 }
 
 func (c *epollConn) advanceSent(n int) {

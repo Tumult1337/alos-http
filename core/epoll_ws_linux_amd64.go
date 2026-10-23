@@ -387,15 +387,15 @@ func (ev *wsLoopConn) sendDirect(opcode byte, data []byte) bool {
 }
 
 func wsSendFrame(fd int, hdr, payload []byte) (int, error) {
-	var iov [2]unix.Iovec
-	iov[0].Base = &hdr[0]
-	iov[0].SetLen(len(hdr))
-	iov[1].Base = &payload[0]
-	iov[1].SetLen(len(payload))
-	var msg unix.Msghdr
-	msg.Iov = &iov[0]
-	msg.SetIovlen(len(iov))
-	return socketSendmsg(fd, &msg)
+	var backing [2]unix.Iovec
+	count := 0
+	for _, seg := range [2][]byte{hdr, payload} {
+		if len(seg) > 0 {
+			backing[count] = iovecOf(seg)
+			count++
+		}
+	}
+	return socketSendIovecs(fd, backing[:count])
 }
 
 func (ev *wsLoopConn) holdWakes(c *epollConn, out []byte) {

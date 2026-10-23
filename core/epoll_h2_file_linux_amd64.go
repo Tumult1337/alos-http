@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"slices"
-	"unsafe"
 
 	"github.com/guno1928/turbo"
 	"golang.org/x/sys/unix"
@@ -72,9 +71,10 @@ func (sw *epollH2StreamWriter) waitFileLocked() error {
 	sw.armFileStallLocked()
 	mark := sw.file.off
 	for sw.err == nil && sw.file.left > 0 {
-		sw.space.Wait()
 		if sw.file.needIO {
 			sw.warmFileLocked()
+		} else {
+			sw.space.Wait()
 		}
 		if !sw.file.stallFired {
 			continue
@@ -154,17 +154,14 @@ func (c *epollConn) h2PumpFile(dst []byte, sw *epollH2StreamWriter, room, frameL
 		dst = dst[:len(dst)+n]
 		left -= n
 	}
-	got, err := preadvFull(sw.file.fd, iov, sw.file.off)
+	got, err := preadvAll(sw.file.fd, iov, sw.file.off, unix.RWF_NOWAIT)
 	clear(iov)
 	d.iov = iov[:0]
-	if err == unix.EAGAIN || (err == nil && got > 0 && int64(got) < avail) {
+	if err == unix.EAGAIN || (err == io.ErrUnexpectedEOF && got > 0) {
 		sw.file.needIO = true
 		return dst[:base]
 	}
-	if err != nil || int64(got) != avail {
-		if err == nil {
-			err = io.ErrUnexpectedEOF
-		}
+	if err != nil {
 		sw.err, sw.sendRST, sw.file.left = err, true, 0
 		return dst[:base]
 	}
@@ -173,28 +170,4 @@ func (c *epollConn) h2PumpFile(dst []byte, sw *epollH2StreamWriter, room, frameL
 	st.connWindow -= avail
 	sw.stream.Window.Add(-avail)
 	return dst
-}
-
-func preadvFull(fd int, iov []unix.Iovec, off int64) (int, error) {
-	total := 0
-	for len(iov) > 0 {
-		n, err := preadvFlags(fd, iov, off, unix.RWF_NOWAIT)
-		if err != nil {
-			return total, err
-		}
-		if n == 0 {
-			return total, nil
-		}
-		total += n
-		off += int64(n)
-		for len(iov) > 0 && n >= int(iov[0].Len) {
-			n -= int(iov[0].Len)
-			iov = iov[1:]
-		}
-		if n > 0 {
-			iov[0].Base = (*byte)(unsafe.Add(unsafe.Pointer(iov[0].Base), n))
-			iov[0].SetLen(int(iov[0].Len) - n)
-		}
-	}
-	return total, nil
 }

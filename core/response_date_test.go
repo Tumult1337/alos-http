@@ -67,7 +67,7 @@ func TestResponseDateWireHeads(t *testing.T) {
 					return dateH1Fields(t, appendH1StreamHead(nil, status, nil, "", false, true, "ALOS", nil))
 				},
 				"h2-buffered": func() [][2]string {
-					wire := appendH2ResponseHeadersFrame(nil, 1, response, true, H2DefaultMaxFrameSize)
+					wire := appendH2ResponseHeadersFrameIndexed(nil, 1, response, true, nil, respServerName(response), H2DefaultMaxFrameSize)
 					fields, err := newHpackDecoder(4096).Decode(wire[9:])
 					if err != nil {
 						t.Fatal(err)
@@ -84,7 +84,7 @@ func TestResponseDateWireHeads(t *testing.T) {
 					return fields
 				},
 				"h2-error": func() [][2]string {
-					wire := appendH2StatusOnlyResponse(nil, 1, status, "ALOS", H2DefaultMaxFrameSize)
+					wire := appendH2StatusOnlyResponseIndexed(nil, 1, status, "ALOS", nil, H2DefaultMaxFrameSize)
 					fields, err := newHpackDecoder(4096).Decode(wire[9:])
 					if err != nil {
 						t.Fatal(err)

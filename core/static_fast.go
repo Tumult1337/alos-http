@@ -520,15 +520,13 @@ func staticCacheEntryCost(rel string, size int64) int64 {
 
 func preadFull(fd int, size int64) ([]byte, bool) {
 	data := make([]byte, size)
-	for off := 0; off < len(data); {
-		n, err := unix.Pread(fd, data[off:], int64(off))
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil || n <= 0 {
-			return nil, false
-		}
-		off += n
+	if size == 0 {
+		return data, true
+	}
+	iov := [1]unix.Iovec{{Base: &data[0]}}
+	iov[0].SetLen(len(data))
+	if _, err := preadvAll(fd, iov[:], 0, 0); err != nil {
+		return nil, false
 	}
 	return data, true
 }

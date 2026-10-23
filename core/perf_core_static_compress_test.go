@@ -667,7 +667,7 @@ func TestPerfCoreCompressOnceWindowFitsBody(t *testing.T) {
 			t.Fatalf("gzip of %d bytes failed", n)
 		}
 	}
-	if out := compressOnce(serveContentPattern(4096), encodingBrotli, staticBrotliLevel); out != nil && len(out) >= 4096 {
+	if out := compressOnce(serveContentPattern(4096), encodingBrotli, staticBrotliLevel); len(out) >= 4096 {
 		t.Fatalf("an incompressible body must not yield a larger variant (%d bytes)", len(out))
 	}
 }

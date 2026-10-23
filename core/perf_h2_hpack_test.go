@@ -216,10 +216,10 @@ func BenchmarkPerfH2ResponseHeadersFrame(b *testing.B) {
 				resp.SetHeader(h[0], h[1])
 			}
 			dst := make([]byte, 0, perfH2HpackHeaderSpare)
-			dst = appendH2ResponseHeadersFrame(dst, perfH2HpackStreamID, &resp, false, 0)
+			dst = appendH2ResponseHeadersFrameIndexed(dst, perfH2HpackStreamID, &resp, false, nil, respServerName(&resp), 0)
 			b.ReportAllocs()
 			for b.Loop() {
-				dst = appendH2ResponseHeadersFrame(dst[:0], perfH2HpackStreamID, &resp, false, 0)
+				dst = appendH2ResponseHeadersFrameIndexed(dst[:0], perfH2HpackStreamID, &resp, false, nil, respServerName(&resp), 0)
 			}
 		})
 	}
