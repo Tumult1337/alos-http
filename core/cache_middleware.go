@@ -61,7 +61,7 @@ import (
 //
 //	Example: GzipLevel: 9.
 //
-// SweepInterval is how often expired and overflow entries are reaped; 0 defaults
+// SweepInterval is how often expired entries are reaped; 0 defaults
 // to 15s.
 //
 //	Example: SweepInterval: 30 * time.Second.
