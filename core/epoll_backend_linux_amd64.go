@@ -867,7 +867,7 @@ func (w *epollWorker) loop() error {
 		}
 		resumed = false
 		w.refreshLimits()
-		w.inlineDeadline = turbo.Now() + int64(w.inlineBatch)
+		w.inlineDeadline = w.inlineBatchDeadline(turbo.Now())
 		tasksPending := false
 		for i := 0; i < n; i++ {
 			fd := int(w.events[i].Fd)

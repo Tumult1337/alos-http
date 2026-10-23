@@ -18,8 +18,12 @@ const (
 	inlineHandedOff      = ^uint64(0)
 )
 
+func (w *epollWorker) inlineBatchDeadline(now int64) int64 {
+	return now + int64(w.inlineBatch)
+}
+
 func (s *Server) inlineBatchOrDefault() time.Duration {
-	if s.inlineBatch > 0 {
+	if s.inlineBatch != 0 {
 		return s.inlineBatch
 	}
 	return inlineBatchBudget

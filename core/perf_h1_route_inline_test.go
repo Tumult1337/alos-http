@@ -38,6 +38,11 @@ func reportDispatchMode(resp *Response, body string) {
 
 func startRouteInlineServer(t *testing.T, useTLS bool) string {
 	t.Helper()
+	return startRouteInlineServerBatch(t, useTLS, time.Minute)
+}
+
+func startRouteInlineServerBatch(t *testing.T, useTLS bool, batch time.Duration) string {
+	t.Helper()
 	addr := reserveLocalAddr(t)
 	cfg := Config{
 		Addr:            addr,
@@ -55,7 +60,7 @@ func startRouteInlineServer(t *testing.T, useTLS bool) string {
 		cfg.PlainHTTP = true
 	}
 	s := New(cfg)
-	s.inlineBatch = time.Minute
+	s.inlineBatch = batch
 	s.Router.GET("/in", func(req *Request, resp *Response) { reportDispatchMode(resp, "in") }).Inline()
 	s.Router.GET("/out", func(req *Request, resp *Response) { reportDispatchMode(resp, "out") })
 	s.Router.GET("/p/:id", func(req *Request, resp *Response) { reportDispatchMode(resp, req.ParamValue("id")) }).Inline()
@@ -165,5 +170,43 @@ func TestInlineBatchBudgetDefaultAndOverride(t *testing.T) {
 	}
 	if inlineBatchBudget != 2*time.Millisecond {
 		t.Fatalf("production budget %v", inlineBatchBudget)
+	}
+}
+
+func TestInlineBatchBudgetExhaustedSpillsToPool(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		batch time.Duration
+		want  string
+	}{
+		{"exhausted", -time.Hour, "async:in"},
+		{"ample", time.Hour, "inline:in"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := startRouteInlineServerBatch(t, false, tc.batch)
+			conn, err := inlineDial(addr, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			fmt.Fprint(conn, "GET /in HTTP/1.1\r\nHost: inline.test\r\n\r\n")
+			resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "GET"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if string(body) != tc.want {
+				t.Fatalf("body %q, want %q", body, tc.want)
+			}
+		})
+	}
+}
+
+func TestInlineBatchDeadlineAddsWorkerBudget(t *testing.T) {
+	w := &epollWorker{inlineBatch: 3 * time.Millisecond}
+	if got := w.inlineBatchDeadline(1000); got != 1000+int64(3*time.Millisecond) {
+		t.Fatalf("deadline %d", got)
 	}
 }

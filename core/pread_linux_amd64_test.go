@@ -5,7 +5,9 @@ package core
 import (
 	"bytes"
 	"io"
+	"net/http"
 	"os"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -114,5 +116,52 @@ func TestWarmFileRangeTruncatedAfterSizeSnapshotFails(t *testing.T) {
 	}
 	if err := warmFileRange(int(f.Fd()), 0, 8192); err != io.ErrUnexpectedEOF {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestPreadFullZeroSizeReturnsEmpty(t *testing.T) {
+	f, _ := preadTestFile(t, 0)
+	data, ok := preadFull(int(f.Fd()), 0)
+	if !ok || len(data) != 0 {
+		t.Fatalf("ok=%v len=%d", ok, len(data))
+	}
+}
+
+func TestStaticEmptyFileServedOverH1TLSAndH2(t *testing.T) {
+	perfCoreSettleStaticFiles(t)
+	for _, tc := range []struct {
+		name  string
+		tls   bool
+		alpn  string
+		proto int
+	}{
+		{"h1-tls", true, "http/1.1", 1},
+		{"h2-tls", true, "h2", 2},
+		{"h2c", false, "", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			perfCoreWriteStatic(t, filepath.Join(root, "empty.txt"), nil)
+			ts := newTestServer(t, testServerOptions{TLS: tc.tls, Domain: perfCoreH2FileDomain, Routes: func(r *Router) {
+				r.GET("/s/*filepath", Static("/s", StaticConfig{Root: root}))
+			}})
+			var cl *http.Client
+			switch {
+			case tc.tls:
+				cl = ts.client(t, tc.alpn)
+			default:
+				cl = h2cClient()
+				t.Cleanup(cl.CloseIdleConnections)
+			}
+			for i := 0; i < 3; i++ {
+				resp, body, err := perfCoreH2FileGet(cl, ts.url("/s/empty.txt"), "")
+				if err != nil {
+					t.Fatalf("request %d: %v", i, err)
+				}
+				if resp.StatusCode != 200 || resp.ProtoMajor != tc.proto || len(body) != 0 || resp.Header.Get("Content-Length") != "0" {
+					t.Fatalf("request %d: status %d proto %d len %d cl %q", i, resp.StatusCode, resp.ProtoMajor, len(body), resp.Header.Get("Content-Length"))
+				}
+			}
+		})
 	}
 }
