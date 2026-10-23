@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -147,5 +148,98 @@ func TestFPProxyBlockedClientPausesBackendAndSparesOtherExchanges(t *testing.T) 
 	time.Sleep(500 * time.Millisecond)
 	if got := written.Load(); got >= proxyG2FloodBound {
 		t.Fatalf("backend wrote %d MiB for a client that reads nothing; reads were not paused", got>>20)
+	}
+}
+
+const (
+	proxyG2SlowBody        = 4 << 20
+	proxyG2SlowReadTimeout = 500 * time.Millisecond
+	proxyG2SlowChunkDelay  = 20 * time.Millisecond
+	proxyG2InLoopSlowBody  = 1 << 20
+)
+
+type proxyG2SlowWriter struct{ n atomic.Int64 }
+
+func (w *proxyG2SlowWriter) WriteHeader(int, [][2]string, string) error { return nil }
+func (w *proxyG2SlowWriter) WriteChunk(d []byte) error {
+	time.Sleep(proxyG2SlowChunkDelay)
+	w.n.Add(int64(len(d)))
+	return nil
+}
+func (w *proxyG2SlowWriter) Flush() error { return nil }
+func (w *proxyG2SlowWriter) Close() error { return nil }
+
+func proxyG2BurstOrigin(t *testing.T, size, stallAfter int) string {
+	t.Helper()
+	return rawOrigin(t, func(conn net.Conn) {
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n", size)
+		if stallAfter > 0 {
+			_, _ = conn.Write(bytes.Repeat([]byte("s"), stallAfter))
+			time.Sleep(10 * proxyG2SlowReadTimeout)
+			return
+		}
+		_, _ = conn.Write(bytes.Repeat([]byte("s"), size))
+	})
+}
+
+func TestFPProxySlowSteadyClientIsNotCutByBackendReadTimeout(t *testing.T) {
+	w := &proxyG2SlowWriter{}
+	req := &Request{Method: "GET", Host: "origin.test", Path: "/big", StreamWriter: w}
+	err := (&ProxyEngine{}).forwardRequestFP(req, &Response{}, &backend{Addr: proxyG2BurstOrigin(t, proxyG2SlowBody, 0)}, &DomainConfig{
+		ConnectTimeout: time.Second, ReadTimeout: proxyG2SlowReadTimeout,
+	}, proxyCacheTarget{path: "/big", storable: true})
+	if err != nil || w.n.Load() != proxyG2SlowBody {
+		t.Fatalf("slow but steady client: err=%v relayed %d of %d", err, w.n.Load(), proxyG2SlowBody)
+	}
+}
+
+func TestFPProxyStalledBackendStillTimesOut(t *testing.T) {
+	w := &proxyG2SlowWriter{}
+	req := &Request{Method: "GET", Host: "origin.test", Path: "/big", StreamWriter: w}
+	start := time.Now()
+	err := (&ProxyEngine{}).forwardRequestFP(req, &Response{}, &backend{Addr: proxyG2BurstOrigin(t, proxyG2SlowBody, 64<<10)}, &DomainConfig{
+		ConnectTimeout: time.Second, ReadTimeout: proxyG2SlowReadTimeout,
+	}, proxyCacheTarget{path: "/big", storable: true})
+	if err == nil {
+		t.Fatalf("a backend that stopped sending was not timed out")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("the stalled backend took %v to time out", elapsed)
+	}
+}
+
+func TestProxyInLoopSlowSteadyClientIsNotCutByBackendReadTimeout(t *testing.T) {
+	origin := proxyG2BurstOrigin(t, proxyG2InLoopSlowBody, 0)
+	_, addr := proxyFixStart(t, Config{}, []DomainConfig{{Domain: proxyFixDomain, ReadTimeout: proxyG2SlowReadTimeout, Backends: []BackendConfig{{Addr: origin}}}}, nil)
+	dialer := net.Dialer{Timeout: proxyFixIOTimeout, Control: func(_, _ string, rc syscall.RawConn) error {
+		var serr error
+		if err := rc.Control(func(fd uintptr) {
+			serr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4<<10)
+		}); err != nil {
+			return err
+		}
+		return serr
+	}}
+	c, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Write([]byte(proxyFixGet(proxyFixDomain, "/big"))); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	_ = c.SetReadDeadline(time.Now().Add(30 * time.Second))
+	buf := make([]byte, 32<<10)
+	total := 0
+	for {
+		n, err := c.Read(buf)
+		total += n
+		if err != nil {
+			break
+		}
+		time.Sleep(proxyG2SlowChunkDelay)
+	}
+	if want := proxyG2InLoopSlowBody; total < want {
+		t.Fatalf("slow but steady in-loop client got %d bytes, want the head plus %d body bytes", total, want)
 	}
 }

@@ -313,6 +313,9 @@ func (l *beLoop) resumeBackendRead(c *backendConn) {
 		return
 	}
 	c.readPaused = false
+	if ex := c.cur; ex != nil && ex.readTimeoutNano > 0 {
+		ex.deadline = l.nowNano() + ex.readTimeoutNano
+	}
 	ev := unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP | unix.EPOLLET,
 		Fd:     int32(c.fd),

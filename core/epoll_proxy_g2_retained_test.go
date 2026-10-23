@@ -92,3 +92,38 @@ func TestByteBufferReleaseKeepsUnreadBytes(t *testing.T) {
 		t.Fatalf("a small buffer was dropped: cap %d", cap(small.b))
 	}
 }
+
+func TestUpstreamResumeReadRearmsTheReadDeadline(t *testing.T) {
+	ep, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
+	if err != nil {
+		t.Fatalf("epoll_create: %v", err)
+	}
+	defer unix.Close(ep)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	l := &beLoop{}
+	l.init(ep, &fpConfig{MaxIdlePerBackend: 4, IdleTimeout: time.Second, MaxResponseBody: 1 << 20}, nil)
+	c := &backendConn{fd: fds[0], be: l, state: connReady, transport: &plainTransport{}, proto: &l.h1proto}
+	l.ensureFD(c.fd)
+	l.conns[c.fd] = c
+	l.liveConns++
+	readTimeout := 500 * time.Millisecond
+	c.cur = &Exchange{req: &fpRequest{Method: "GET"}, readTimeoutNano: int64(readTimeout), deadline: l.nowNano() - int64(time.Second)}
+	c.readPaused = true
+	l.sweepConn(c, l.nowNano())
+	if c.state == connClosed {
+		t.Fatalf("a connection paused by its consumer was timed out")
+	}
+	l.resumeBackendRead(c)
+	if remaining := c.cur.deadline - l.nowNano(); remaining < int64(readTimeout)/2 {
+		t.Fatalf("resume left %v until the read deadline, want about %v", time.Duration(remaining), readTimeout)
+	}
+	l.sweepConn(c, l.nowNano())
+	if c.state == connClosed {
+		t.Fatalf("a resumed connection was timed out on the deadline from before the pause")
+	}
+}
