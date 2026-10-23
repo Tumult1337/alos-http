@@ -334,6 +334,7 @@ type QUICConn struct {
 	bidiStreamsRetired atomic.Uint64
 	uniStreamsRetired  atomic.Uint64
 	timerWork          atomic.Bool
+	congestionBlocked  atomic.Bool
 }
 
 func newQUICConn(server *Server, udpConn net.PacketConn, remoteAddr net.Addr, dcid, scid []byte) *QUICConn {
@@ -677,6 +678,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	}
 	needsAck := false
 	lossCheck := false
+	acked := false
 
 	visitor := &quicFrameVisitor{
 		onACK: func(f quicAckFrame) {
@@ -694,6 +696,7 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 				return
 			}
 			lossCheck = lossCheck || lossPossible
+			acked = true
 		},
 		onCrypto: func(f quicCryptoFrame) {
 			needsAck = true
@@ -796,6 +799,9 @@ func (qc *QUICConn) processFrames(space int, pn uint64, frames []byte) {
 	qc.flushPathResponses()
 	if lossCheck {
 		qc.recoverLostPackets(space)
+	}
+	if acked {
+		qc.resumeCongestionBlocked()
 	}
 
 	if needsAck && (space != quicSpaceInitial || qc.handshakeDone.Load()) {
@@ -1455,6 +1461,13 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 			return
 		}
 
+		if qc.loss.sendRoom() <= len(qc.coalesceBuf)-qc.coalesceStart {
+			if !s.sendBufDrained() {
+				qc.congestionBlocked.Store(true)
+			}
+			return
+		}
+
 		data, offset, fin := s.drainSendBuf(int(allowed))
 		if len(data) == 0 && !fin {
 			return
@@ -1469,6 +1482,14 @@ func (qc *QUICConn) sendStreamData(s *QUICStream) {
 			return
 		}
 	}
+}
+
+func (qc *QUICConn) resumeCongestionBlocked() {
+	if !qc.congestionBlocked.Load() || qc.loss.sendRoom() == 0 {
+		return
+	}
+	qc.congestionBlocked.Store(false)
+	qc.resumeBlockedStreams()
 }
 
 func (qc *QUICConn) queueStreamFrameLocked(frame []byte) {

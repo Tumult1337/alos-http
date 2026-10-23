@@ -154,6 +154,9 @@ func (qc *QUICConn) tick(now int64, checkIdle bool) {
 	if len(qc.coalesceEnds) > 0 {
 		qc.drainCoalescedLocked()
 	}
+	qc.writeMu.Unlock()
+	qc.resumeCongestionBlocked()
+	qc.writeMu.Lock()
 	pending := len(qc.pendingAck[quicSpaceAppData]) > 0 || len(qc.coalesceEnds) > 0
 	qc.writeMu.Unlock()
 	if pending || qc.loss.hasSentPackets(quicSpaceAppData) {

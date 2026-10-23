@@ -380,6 +380,15 @@ func (ls *quicLossState) canSend() bool {
 	return uint64(ls.bytesInFlight) < ls.cwnd && len(ls.sent[quicSpaceAppData]) < quicMaxTrackedSent
 }
 
+func (ls *quicLossState) sendRoom() int {
+	ls.mu.Lock()
+	defer ls.mu.Unlock()
+	if len(ls.sent[quicSpaceAppData]) >= quicMaxTrackedSent {
+		return 0
+	}
+	return max(int(ls.cwnd)-ls.bytesInFlight, 0)
+}
+
 func (ls *quicLossState) largestAckedPN(space int) int64 {
 	ls.mu.Lock()
 	v := ls.largestAcked[space]

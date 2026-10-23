@@ -138,8 +138,13 @@ func TestQUICManySequentialRequestsOnOneConnection(t *testing.T) {
 			if turbo.Until(deadline) <= 0 {
 				t.Fatalf("streams are not being retired (%d tracked)", p.streamCount())
 			}
+			p.ackEverySent()
 			turbo.Sleep(time.Millisecond)
 		}
+	}
+	for p.streamCount() > 0 && turbo.Until(deadline) > 0 {
+		p.ackEverySent()
+		turbo.Sleep(time.Millisecond)
 	}
 	p.awaitStreamCount(0)
 	if got := p.sent(); len(got.closes) != 0 {
