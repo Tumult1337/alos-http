@@ -117,8 +117,7 @@ func fpAttemptError(err error, wroteRequest, gotResponse bool) *proxyAttemptErro
 	}
 }
 
-// forwardRequestFP is the epoll backed replacement for forwardRequest. It
-// keeps the same signature so the call site can switch between them.
+// forwardRequestFP sends req to b through the shared upstream client and reads the response on the calling goroutine, which relays a large or unknown-length body to the stream writer and otherwise buffers it into resp and stores it when target permits.
 func (pe *ProxyEngine) forwardRequestFP(req *Request, resp *Response, b *backend, cfg *DomainConfig, target proxyCacheTarget) error {
 	client, err := proxyUpstreamClient()
 	if err != nil {
