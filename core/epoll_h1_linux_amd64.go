@@ -59,13 +59,6 @@ func (c *epollConn) h1Reject(out []byte, status int, msg string) []byte {
 	return appendPlainResponseClose(&c.resp, out)
 }
 
-func (c *epollConn) h1ServiceUnavailable(out []byte, keepAlive bool) []byte {
-	statsBlocked()
-	c.resp.Reset()
-	c.resp.Status(503).String("Service Unavailable")
-	return appendPlainResponseMode(&c.resp, out, keepAlive, true)
-}
-
 func (c *epollConn) h1BodyReadDeadline() int64 {
 	if c.h1BodyDeadline == 0 {
 		c.h1BodyDeadline = deadlineFrom(c.worker.readTO)
@@ -162,7 +155,6 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 		return c.wsServe(out)
 	}
 	maxRead := srv.effectiveReadCap()
-	proxyActive := srv.httpRouter.Load() != nil
 	if c.h1In != nil {
 		c.h1FeedBody(c.worker)
 	}
@@ -178,23 +170,6 @@ func (c *epollConn) serveH1(srv *Server, out []byte) ([]byte, int) {
 			c.h1Advance(2)
 			continue
 		}
-		if !proxyActive && !srv.shuttingDown.Load() {
-			if resp, consumed, closeConn, ok, refreshDate := srv.matchPlainRootFastRequest(data, c.tls); ok {
-				c.worker.reqs++
-				if srv.tryAcquireRequestSlot() {
-					srv.releaseRequestSlot()
-					out = appendRootFastResponse(out, resp, refreshDate)
-				} else {
-					out = c.h1ServiceUnavailable(out, !closeConn)
-				}
-				c.h1Advance(consumed)
-				if closeConn {
-					return out, h1StepClose
-				}
-				continue
-			}
-		}
-
 		c.req.resetFastH1()
 		headerEnd, contentLength, hasContentLength, closeConn, reject, chunked, tooLarge, ok := parseH1RequestHead(data, &c.req, c.worker.maxHeaderSize, srv.config.MaxHeaderCount)
 		if tooLarge {

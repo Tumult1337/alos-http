@@ -43,8 +43,6 @@ func TestPerfAtomicsLayoutReport(t *testing.T) {
 		{"activeReqs", unsafe.Offsetof(s.activeReqs), unsafe.Sizeof(s.activeReqs)},
 		{"inFlightBodyBytes", unsafe.Offsetof(s.inFlightBodyBytes), unsafe.Sizeof(s.inFlightBodyBytes)},
 		{"fastDispatch", unsafe.Offsetof(s.fastDispatch), unsafe.Sizeof(s.fastDispatch)},
-		{"plainRootFast", unsafe.Offsetof(s.plainRootFast), unsafe.Sizeof(s.plainRootFast)},
-		{"h2RootFast", unsafe.Offsetof(s.h2RootFast), unsafe.Sizeof(s.h2RootFast)},
 		{"altSvc", unsafe.Offsetof(s.altSvc), unsafe.Sizeof(s.altSvc)},
 		{"trustedProxies", unsafe.Offsetof(s.trustedProxies), unsafe.Sizeof(s.trustedProxies)},
 		{"perIPLimiter", unsafe.Offsetof(s.perIPLimiter), unsafe.Sizeof(s.perIPLimiter)},

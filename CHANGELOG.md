@@ -162,5 +162,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Removed
 
+- The precomputed `GET /` response on HTTP/1 and HTTP/2. The server ran the `/` handler once at startup and sent its bytes for each later `GET /`. The `/` handler now runs for each request like every other route, and HTTP/2 `GET /` responses obey the peer's flow-control window.
 - Unused `createQUICListeners` on linux/amd64 and unused `prepareAcceptedFD` on non-linux builds.
 - `Server.ServeH2` and `Server.ServeH2Plain`, the goroutine-per-connection HTTP/2 servers that the epoll server replaced; no listener called them. With them go the types and helpers only they used: `H2Conn`, `H2StreamWriter`, `Server.NewH2StreamWriter`, `WriteRequest`, `H2StreamWriterPool`, `H2FrameBufPool` and `ErrChanPool`. Since nothing called them, how connections are served does not change.

@@ -1027,7 +1027,7 @@ func (w *epollWorker) goAwayForShutdown(c *epollConn) {
 
 func (c *epollConn) refuseH2StreamGoingAway(streamID uint32, headerBlock []byte) bool {
 	st := &c.h2
-	headers, _, _, err := st.decoder.DecodeRequest(st.headersBuf[:0], headerBlock)
+	headers, _, err := st.decoder.DecodeRequest(st.headersBuf[:0], headerBlock)
 	st.headersBuf = headers[:0]
 	if err != nil && err != errH2MalformedRequest && err != errH2HeaderListTooLarge {
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrCompression)

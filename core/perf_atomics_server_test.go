@@ -31,18 +31,16 @@ func perfKeepParallel(hit bool, sum int64, s string) {
 }
 
 type perfServerHotPadded struct {
-	_             [CacheLineSize]byte
-	activeConns   atomic.Int64
-	_             [CacheLineSize - 8]byte
-	_             atomic.Int64
-	_             [CacheLineSize - 8]byte
-	shuttingDown  atomic.Bool
-	fastDispatch  atomic.Bool
-	plainRootFast atomic.Pointer[plainRootFastResponse]
-	h2RootFast    atomic.Pointer[h2RootFastResponse]
-	altSvc        atomic.Pointer[altSvcHeader]
-	_             atomic.Pointer[Limits]
-	_             [CacheLineSize]byte
+	_            [CacheLineSize]byte
+	activeConns  atomic.Int64
+	_            [CacheLineSize - 8]byte
+	_            atomic.Int64
+	_            [CacheLineSize - 8]byte
+	shuttingDown atomic.Bool
+	fastDispatch atomic.Bool
+	altSvc       atomic.Pointer[altSvcHeader]
+	_            atomic.Pointer[Limits]
+	_            [CacheLineSize]byte
 }
 
 func TestPerfAtomicsServerHotPaddedLayoutIsPinned(t *testing.T) {
@@ -52,11 +50,9 @@ func TestPerfAtomicsServerHotPaddedLayoutIsPinned(t *testing.T) {
 		unsafe.Offsetof(p.activeConns),
 		unsafe.Offsetof(p.shuttingDown),
 		unsafe.Offsetof(p.fastDispatch),
-		unsafe.Offsetof(p.plainRootFast),
-		unsafe.Offsetof(p.h2RootFast),
 		unsafe.Offsetof(p.altSvc),
 	}
-	want := []uintptr{296, 64, 192, 196, 200, 208, 216}
+	want := []uintptr{280, 64, 192, 196, 200}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("layout[%d]=%d want %d", i, got[i], want[i])
@@ -65,13 +61,11 @@ func TestPerfAtomicsServerHotPaddedLayoutIsPinned(t *testing.T) {
 }
 
 func perfReadHotConfig(s *Server) bool {
-	return s.shuttingDown.Load() || s.fastDispatch.Load() || s.h2RootFast.Load() != nil ||
-		s.plainRootFast.Load() != nil || s.altSvc.Load() != nil
+	return s.shuttingDown.Load() || s.fastDispatch.Load() || s.altSvc.Load() != nil
 }
 
 func perfReadHotConfigPadded(p *perfServerHotPadded) bool {
-	return p.shuttingDown.Load() || p.fastDispatch.Load() || p.h2RootFast.Load() != nil ||
-		p.plainRootFast.Load() != nil || p.altSvc.Load() != nil
+	return p.shuttingDown.Load() || p.fastDispatch.Load() || p.altSvc.Load() != nil
 }
 
 func BenchmarkPerfAtomicsServerFalseSharing(b *testing.B) {

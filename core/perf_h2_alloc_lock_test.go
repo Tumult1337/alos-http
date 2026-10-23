@@ -25,7 +25,7 @@ func TestPerfH2AllocLockHpackDecodeMemoHit(t *testing.T) {
 		var headers [][2]string
 		perfH2AssertZeroAllocs(t, wl.name, func() {
 			var err error
-			headers, _, _, err = d.DecodeRequest(headers[:0], block)
+			headers, _, err = d.DecodeRequest(headers[:0], block)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -45,24 +45,6 @@ func TestPerfH2AllocLockHpackDecodeSteadyHuffman(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestPerfH2AllocLockMemoizedRootMatch(t *testing.T) {
-	d, block := perfH2WarmDecoder(t, perfH2W1r, "https")
-	if _, _, isRoot, err := d.DecodeRequest(nil, block); err != nil || !isRoot {
-		t.Fatalf("root block did not decode as root: root=%v err=%v", isRoot, err)
-	}
-	perfH2AssertZeroAllocs(t, "MemoizedRootRequest", func() {
-		if !d.MemoizedRootRequest(block) {
-			t.Fatal("memoized root block did not match")
-		}
-	})
-	indexed := []byte{0x82, 0x84, 0x87}
-	perfH2AssertZeroAllocs(t, "matchIndexedH2FastRootHeaderBlock", func() {
-		if !matchIndexedH2FastRootHeaderBlock(indexed) {
-			t.Fatal("indexed root block did not match")
-		}
-	})
 }
 
 func TestPerfH2AllocLockResponseHeaderEncode(t *testing.T) {
@@ -98,8 +80,6 @@ func TestPerfH2AllocLockFrameBuilders(t *testing.T) {
 	data := make([]byte, perfH2LockDataFrame)
 	var ping [8]byte
 	srv := New(Config{PlainHTTP: true, HTTPAddr: "-"})
-	small := newH2RootFastResponse([]byte{0x88}, []byte(perfH2PlaintextBody))
-	large := newH2RootFastResponse([]byte{0x88}, perfH2Bytes64kBody)
 	builders := []struct {
 		name string
 		fn   func()
@@ -114,8 +94,6 @@ func TestPerfH2AllocLockFrameBuilders(t *testing.T) {
 		{"appendH2StatusOnlyResponse", func() {
 			dst = appendH2StatusOnlyResponseIndexed(dst[:0], 1, h2StatusHeaderListTooLarge, "ALOS", nil, 0)
 		}},
-		{"appendFastH2RootResponse/framed", func() { dst = appendFastH2RootResponse(dst[:0], small, 3, H2DefaultMaxFrameSize) }},
-		{"appendFastH2RootResponse/split64k", func() { dst = appendFastH2RootResponse(dst[:0], large, 3, H2DefaultMaxFrameSize) }},
 	}
 	for _, b := range builders {
 		perfH2AssertZeroAllocs(t, b.name, b.fn)

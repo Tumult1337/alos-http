@@ -36,7 +36,7 @@ func TestPerfAtomicsServerHotCountersOwnLines(t *testing.T) {
 	perfRequireOwnLine(t, budget, []perfHotWord{
 		{"globalLimiter", unsafe.Offsetof(s.globalLimiter), unsafe.Sizeof(s.globalLimiter)},
 		{"fastDispatch", unsafe.Offsetof(s.fastDispatch), unsafe.Sizeof(s.fastDispatch)},
-		{"plainRootFast", unsafe.Offsetof(s.plainRootFast), unsafe.Sizeof(s.plainRootFast)},
+		{"altSvc", unsafe.Offsetof(s.altSvc), unsafe.Sizeof(s.altSvc)},
 	})
 	if size := unsafe.Sizeof(ipReqCounter{}); size < CacheLineSize {
 		t.Errorf("ipReqCounter is %d bytes, want a full %d-byte line", size, CacheLineSize)

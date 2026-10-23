@@ -181,35 +181,3 @@ func TestSplitAbsoluteForm(t *testing.T) {
 		}
 	}
 }
-
-func TestParsePlainFastRootRequestDefersAnythingUnusual(t *testing.T) {
-	accept := []string{
-		"GET / HTTP/1.1\r\nHost: a\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n",
-		"GET / HTTP/1.1\r\nUser-Agent: x\r\nhost:a\r\nAccept: */*\r\n\r\n",
-	}
-	for _, raw := range accept {
-		if _, _, ok, needRead := parsePlainFastRootRequest([]byte(raw), len(rootPrefixBytes), 8192, 128); !ok || needRead {
-			t.Errorf("fast path refused a clean request %q", raw)
-		}
-	}
-	deferred := []string{
-		"GET / HTTP/1.1\r\nX-A: 1\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a@b\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nX Y: 1\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nX-A: \x01\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nX-A: a\nb\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\n folded\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nNoColon\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nExpect: 100-continue\r\n\r\n",
-		"GET / HTTP/1.1\r\nHost: a\r\nexpect: foo\r\n\r\n",
-	}
-	for _, raw := range deferred {
-		if _, _, ok, _ := parsePlainFastRootRequest([]byte(raw), len(rootPrefixBytes), 8192, 128); ok {
-			t.Errorf("fast path accepted %q instead of deferring to the strict parser", raw)
-		}
-	}
-}

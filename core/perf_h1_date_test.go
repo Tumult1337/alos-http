@@ -5,7 +5,6 @@ package core
 import (
 	"bufio"
 	"net/http"
-	"strings"
 	"testing"
 	"time"
 
@@ -74,23 +73,5 @@ func TestPerfH1ResponsesCarryOneCurrentDate(t *testing.T) {
 		if !inline {
 			perfH1AssertFreshDate(t, "/stream", perfH1Fetch(t, ts, "/stream").Header.Values("Date"))
 		}
-	}
-}
-
-func TestPerfH1MemoizedResponseDateIsRefreshed(t *testing.T) {
-	memo := []byte(perfH1MemoStatusLine + perfH1StaleDateLine + "Content-Length: 0\r\n\r\n")
-	out := appendMemoizedResponse([]byte("prior"), memo)
-	if !strings.HasPrefix(string(memo), perfH1MemoStatusLine+perfH1StaleDateLine) {
-		t.Fatalf("the memoized bytes were modified in place: %q", memo)
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(strings.NewReader(string(out[len("prior"):]))), nil)
-	if err != nil {
-		t.Fatalf("read refreshed response: %v", err)
-	}
-	perfH1AssertFreshDate(t, "memo", resp.Header.Values("Date"))
-
-	odd := []byte(perfH1MemoStatusLine + "Date: custom\r\nContent-Length: 0\r\n\r\n")
-	if got := appendMemoizedResponse(nil, odd); string(got) != string(odd) {
-		t.Fatalf("a non-standard Date line was rewritten: %q", got)
 	}
 }

@@ -679,9 +679,6 @@ type Server struct {
 	inFlightBodyBytes atomic.Int64
 	_                 [CacheLineSize - 8]byte
 	fastDispatch      atomic.Bool
-	plainRootFast     atomic.Pointer[plainRootFastResponse]
-	h2RootFast        atomic.Pointer[h2RootFastResponse]
-	rootFastMu        sync.Mutex
 	altSvc            atomic.Pointer[altSvcHeader]
 	trustedProxies    trustedProxyMatcher
 	perIPLimiter      *perIPRequestLimiter
@@ -711,25 +708,6 @@ type trackedHandoffConn struct {
 type ipReqCounter struct {
 	n atomic.Int64
 	_ [CacheLineSize - 8]byte
-}
-
-type plainRootFastResponse struct {
-	getKeepAlive  []byte
-	getClose      []byte
-	handlerAltSvc bool
-	refreshDate   bool
-	tlsKeepAlive  []byte
-	tlsClose      []byte
-}
-
-type h2RootFastResponse struct {
-	headerPayload []byte
-	body          []byte
-	framed        []byte
-	dataFrameOff  int
-	handlerAltSvc bool
-	refreshDate   bool
-	withAltSvc    *h2RootFastResponse
 }
 
 // New creates a Server from the given Config, applying defaults to zero-valued fields; called with no arguments it uses DefaultConfig. The returned server is ready for route registration.
@@ -1435,7 +1413,7 @@ func (s *Server) NewPlainH1StreamWriter(conn net.Conn) *PlainH1StreamWriter {
 	return w
 }
 
-func (s *Server) rootFastEligible() bool {
+func (s *Server) fastDispatchEligible() bool {
 	if s.rateLimitEngine.Load() != nil ||
 		s.corsEngine.Load() != nil ||
 		s.config.EnableCompress ||
@@ -1540,140 +1518,7 @@ func (s *Server) releaseConnBodyBytes(connReserved *atomic.Int64, n int64) {
 }
 
 func (s *Server) computeFastDispatch() {
-	if !s.Router.built.Load() {
-		s.fastDispatch.Store(false)
-		s.plainRootFast.Store(nil)
-		s.h2RootFast.Store(nil)
-		return
-	}
-	rootFast := s.rootFastEligible()
-	fast := rootFast && s.config.MaxConcurrentReqs <= 0
-	s.fastDispatch.Store(fast)
-	memoizeRoot := rootFast && !s.clientAuthConfigured()
-	s.computePlainRootFastResponse(memoizeRoot)
-	s.computeH2RootFastResponse(memoizeRoot)
-}
-
-func (s *Server) computePlainRootFastResponse(fast bool) {
-	s.rootFastMu.Lock()
-	s.plainRootFast.Store(s.attachPlainAltSvc(s.buildPlainRootFastResponse(fast)))
-	s.rootFastMu.Unlock()
-}
-
-func (s *Server) buildPlainRootFastResponse(fast bool) *plainRootFastResponse {
-	if !fast || len(s.Router.globalMiddleware) != 0 {
-		return nil
-	}
-	handler := s.lookupStaticHandler(methodGET, "/")
-	if handler == nil {
-		return nil
-	}
-	req := Request{Method: "GET", Path: "/", Proto: "HTTP/1.1", server: s}
-	resp := Response{
-		StatusCode: 200,
-		Headers:    make([][2]string, 0, 8),
-		body:       make([]byte, 0, 4096),
-	}
-	resp.lazyReq = &req
-	handler(&req, &resp)
-	if req.hijacked || resp.IsStreamed() {
-		return nil
-	}
-	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
-		return nil
-	}
-	keepAlive := appendPlainResponseMode(&resp, make([]byte, 0, resp.BodyLen()+128), true, true)
-	closeResp := appendPlainResponseMode(&resp, make([]byte, 0, len(keepAlive)), false, true)
-	if len(keepAlive) == 0 || len(closeResp) == 0 {
-		return nil
-	}
-	return &plainRootFastResponse{
-		getKeepAlive:  keepAlive,
-		getClose:      closeResp,
-		handlerAltSvc: headersHaveFold(resp.Headers, altSvcHeaderName),
-		refreshDate:   dateEligible(resp.StatusCode, resp.Headers),
-	}
-}
-
-func (s *Server) computeH2RootFastResponse(fast bool) {
-	s.rootFastMu.Lock()
-	s.h2RootFast.Store(s.attachAltSvc(s.buildH2RootFastResponse(fast)))
-	s.rootFastMu.Unlock()
-}
-
-func (s *Server) buildH2RootFastResponse(fast bool) *h2RootFastResponse {
-	if !fast || !s.http2Enabled() || len(s.Router.globalMiddleware) != 0 {
-		return nil
-	}
-	handler := s.lookupStaticHandler(methodGET, "/")
-	if handler == nil {
-		return nil
-	}
-	req := Request{Method: "GET", Path: "/", Proto: "HTTP/2"}
-	resp := Response{
-		StatusCode: 200,
-		Headers:    make([][2]string, 0, 8),
-		body:       make([]byte, 0, 4096),
-	}
-	handler(&req, &resp)
-	if req.hijacked || resp.IsStreamed() {
-		return nil
-	}
-	if s.config.MaxWriteSize > 0 && int64(resp.transmittedBodyLen()) > s.config.MaxWriteSize {
-		return nil
-	}
-
-	enc := HpackEncoder{}
-	headerPayload := make([]byte, 0, resp.BodyLen()+128)
-	enc.Reset(headerPayload)
-	encodeH2ResponseHeaders(&enc, resp.StatusCode, resp.ContentType, int64(resp.headerContentLength()), resp.Headers, s.config.ServerName)
-
-	fastResp := newH2RootFastResponse(append([]byte(nil), enc.Buf...), append([]byte(nil), resp.transmittedBodyBytes()...))
-	fastResp.handlerAltSvc = headersHaveFold(resp.Headers, altSvcHeaderName)
-	fastResp.refreshDate = dateEligible(resp.StatusCode, resp.Headers)
-	return fastResp
-}
-
-func newH2RootFastResponse(headerPayload, body []byte) *h2RootFastResponse {
-	fastResp := &h2RootFastResponse{
-		headerPayload: headerPayload,
-		body:          body,
-	}
-	if len(headerPayload) <= H2DefaultMaxFrameSize && len(body) <= int(H2DefaultMaxFrameSize) {
-		framed := make([]byte, 0, len(fastResp.headerPayload)+len(body)+18)
-		if len(body) == 0 {
-			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, 0, fastResp.headerPayload)
-			fastResp.dataFrameOff = -1
-		} else {
-			framed = appendH2Frame(framed, H2FrameHeaders, H2FlagEndHeaders, 0, fastResp.headerPayload)
-			fastResp.dataFrameOff = len(framed)
-			framed = appendH2Frame(framed, H2FrameData, H2FlagEndStream, 0, body)
-		}
-		fastResp.framed = framed
-	}
-	return fastResp
-}
-
-func (s *Server) lookupStaticHandler(methodIdx int, path string) HandlerFunc {
-	if methodIdx < 0 || methodIdx >= len(s.Router.staticPaths) {
-		return nil
-	}
-	paths := s.Router.staticPaths[methodIdx]
-	if len(paths) == 0 {
-		return nil
-	}
-	hashes := s.Router.staticHashes[methodIdx]
-	handlers := s.Router.staticHandlers[methodIdx]
-	mask := s.Router.staticMask[methodIdx]
-	h := pathQuickHash(path)
-	idx := h & mask
-	for hashes[idx] != 0 {
-		if hashes[idx] == h && paths[idx] == path {
-			return handlers[idx]
-		}
-		idx = (idx + 1) & mask
-	}
-	return nil
+	s.fastDispatch.Store(s.Router.built.Load() && s.fastDispatchEligible() && s.config.MaxConcurrentReqs <= 0)
 }
 
 // SetProxy installs a reverse-proxy engine, replacing any existing one.

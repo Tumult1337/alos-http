@@ -171,50 +171,6 @@ func appendH2ServerSettingsFlight(dst []byte, s *Server) []byte {
 	return appendH2WindowUpdateFrame(dst, 0, uint32(H2ConnectionWindowSize-H2DefaultWindowSize))
 }
 
-func appendFastH2RootResponse(dst []byte, fast *h2RootFastResponse, streamID uint32, maxFrame int) []byte {
-	maxFrame = h2ResponseFrameLimit(maxFrame)
-	off := len(dst)
-	headerEnd := off + 9 + len(fast.headerPayload)
-	if len(fast.framed) > 0 {
-		dst = append(dst, fast.framed...)
-		dst[off+5] = byte(streamID >> 24)
-		dst[off+6] = byte(streamID >> 16)
-		dst[off+7] = byte(streamID >> 8)
-		dst[off+8] = byte(streamID)
-		if fast.dataFrameOff >= 0 {
-			dataOff := off + fast.dataFrameOff
-			dst[dataOff+5] = byte(streamID >> 24)
-			dst[dataOff+6] = byte(streamID >> 16)
-			dst[dataOff+7] = byte(streamID >> 8)
-			dst[dataOff+8] = byte(streamID)
-		}
-		refreshH2RootFastDate(fast, dst[off+9:headerEnd])
-		return dst
-	}
-	firstFrameEnd := min(headerEnd, off+9+maxFrame)
-	if len(fast.body) == 0 {
-		dst = appendH2ResponseHeaderBlock(dst, streamID, H2FlagEndStream, fast.headerPayload, maxFrame)
-		refreshH2RootFastDate(fast, dst[off+9:firstFrameEnd])
-		return dst
-	}
-	dst = appendH2ResponseHeaderBlock(dst, streamID, 0, fast.headerPayload, maxFrame)
-	refreshH2RootFastDate(fast, dst[off+9:firstFrameEnd])
-	remaining := fast.body
-	for len(remaining) > 0 {
-		chunk := remaining
-		if len(chunk) > maxFrame {
-			chunk = chunk[:maxFrame]
-		}
-		flags := byte(0)
-		if len(chunk) == len(remaining) {
-			flags = H2FlagEndStream
-		}
-		dst = appendH2Frame(dst, H2FrameData, flags, streamID, chunk)
-		remaining = remaining[len(chunk):]
-	}
-	return dst
-}
-
 func appendH2StatusOnlyResponseIndexed(dst []byte, streamID uint32, status int, serverName string, tbl *hpackEncTable, maxFrame int) []byte {
 	off := len(dst)
 	enc := HpackEncoder{Buf: appendH2Frame(dst, H2FrameHeaders, H2FlagEndHeaders|H2FlagEndStream, streamID, nil)}
@@ -444,10 +400,4 @@ func putH2FrameHeader(frame []byte, typ, flags byte, streamID uint32, pLen int) 
 	frame[6] = byte(streamID >> 16)
 	frame[7] = byte(streamID >> 8)
 	frame[8] = byte(streamID)
-}
-
-func refreshH2RootFastDate(fast *h2RootFastResponse, headerBlock []byte) {
-	if fast.refreshDate {
-		refreshH2DateField(headerBlock)
-	}
 }

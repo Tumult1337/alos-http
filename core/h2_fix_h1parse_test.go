@@ -60,7 +60,7 @@ func TestH2FixH1ConnectionCloseTokenList(t *testing.T) {
 	}
 }
 
-func TestH2FixH1RootFastPathConnectionCloseTokenList(t *testing.T) {
+func TestH2FixH1RootConnectionCloseTokenList(t *testing.T) {
 	for _, tc := range []struct {
 		name, head    string
 		wantKeepAlive bool
@@ -71,9 +71,9 @@ func TestH2FixH1RootFastPathConnectionCloseTokenList(t *testing.T) {
 		{"none", "GET / HTTP/1.1\r\nHost: x\r\n\r\n", true},
 		{"long-close-list", "GET / HTTP/1.1\r\nHost: x\r\nUser-Agent: " + strings.Repeat("u", 120) + "\r\nConnection: close, te\r\nAccept: */*\r\n\r\n", false},
 	} {
-		_, keepAlive, ok, _ := parsePlainFastRootRequest([]byte(tc.head), len(rootPrefixBytes), 8192, 128)
-		if !ok || keepAlive != tc.wantKeepAlive {
-			t.Errorf("%s: root fast path keepAlive=%v ok=%v, want keepAlive=%v", tc.name, keepAlive, ok, tc.wantKeepAlive)
+		_, _, _, closeConn, reject, _, _, ok := parseH1RequestHead([]byte(tc.head), &Request{}, 8192, 128)
+		if !ok || reject != h1RejectNone || closeConn == tc.wantKeepAlive {
+			t.Errorf("%s: closeConn=%v ok=%v reject=%v, want keepAlive=%v", tc.name, closeConn, ok, reject, tc.wantKeepAlive)
 		}
 	}
 }

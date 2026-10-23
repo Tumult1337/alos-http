@@ -28,49 +28,49 @@ func plainResp(s *Server, method string, status int) *Response {
 	return resp
 }
 
-func TestRootFastEligible(t *testing.T) {
+func TestFastDispatchEligible(t *testing.T) {
 	t.Run("baseline-eligible", func(t *testing.T) {
-		if !New(Config{}).rootFastEligible() {
+		if !New(Config{}).fastDispatchEligible() {
 			t.Fatal("clean server should be fast-eligible")
 		}
 	})
 	t.Run("onRequest-hook-disables", func(t *testing.T) {
 		s := New(Config{})
 		s.OnRequest(func(*Request, *Response) bool { return true })
-		if s.rootFastEligible() {
+		if s.fastDispatchEligible() {
 			t.Fatal("OnRequest hook must disable fast path")
 		}
 	})
 	t.Run("onResponse-hook-disables", func(t *testing.T) {
 		s := New(Config{})
 		s.OnResponse(func(*Request, *Response) {})
-		if s.rootFastEligible() {
+		if s.fastDispatchEligible() {
 			t.Fatal("OnResponse hook must disable fast path")
 		}
 	})
 	t.Run("ratelimit-disables", func(t *testing.T) {
 		s := New(Config{})
 		s.rateLimitEngine.Store(&RateLimitEngine{})
-		if s.rootFastEligible() {
+		if s.fastDispatchEligible() {
 			t.Fatal("RateLimit must disable fast path")
 		}
 	})
 	t.Run("cors-disables", func(t *testing.T) {
 		s := New(Config{})
 		s.corsEngine.Store(&CORSEngine{})
-		if s.rootFastEligible() {
+		if s.fastDispatchEligible() {
 			t.Fatal("CORS must disable fast path")
 		}
 	})
 	t.Run("compress-disables", func(t *testing.T) {
-		if New(Config{EnableCompress: true}).rootFastEligible() {
+		if New(Config{EnableCompress: true}).fastDispatchEligible() {
 			t.Fatal("compression must disable fast path")
 		}
 	})
 	t.Run("perip-disables", func(t *testing.T) {
 		s := New(Config{})
 		s.perIPLimiter = &perIPRequestLimiter{}
-		if s.rootFastEligible() {
+		if s.fastDispatchEligible() {
 			t.Fatal("perIP limiter must disable fast path")
 		}
 	})
@@ -168,27 +168,6 @@ func TestBuildH1ResponseServerName(t *testing.T) {
 	if !strings.Contains(got, "Server: Zed\r\n") {
 		t.Fatalf("BuildH1Response missing custom Server:\n%s", got)
 	}
-}
-
-func TestRootFastServerName(t *testing.T) {
-	t.Run("custom", func(t *testing.T) {
-		s := New(Config{ServerName: "Zed"})
-		s.Router.GET("/", func(req *Request, resp *Response) { resp.String("ok") })
-		s.Router.Build()
-		s.computePlainRootFastResponse(true)
-		if fast := s.plainRootFast.Load(); fast == nil || !strings.Contains(string(fast.getKeepAlive), "Server: Zed\r\n") {
-			t.Fatalf("root fast custom name failed")
-		}
-	})
-	t.Run("default", func(t *testing.T) {
-		s := New(Config{})
-		s.Router.GET("/", func(req *Request, resp *Response) { resp.String("ok") })
-		s.Router.Build()
-		s.computePlainRootFastResponse(true)
-		if fast := s.plainRootFast.Load(); fast == nil || !strings.Contains(string(fast.getKeepAlive), "Server: ALOS\r\n") {
-			t.Fatalf("root fast default name failed")
-		}
-	})
 }
 
 func TestStreamPlainEmitsServer(t *testing.T) {

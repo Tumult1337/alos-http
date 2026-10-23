@@ -275,28 +275,7 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 		return c.refuseH2StreamGoingAway(streamID, headerBlock)
 	}
 	st.lastStreamID = streamID
-	h2Fast := srv.h2RootFast.Load()
-	fastRoot := h2Fast != nil && srv.httpRouter.Load() == nil && !st.encTable.pendingUpdate
-
-	if endStream && fastRoot && matchIndexedH2FastRootHeaderBlock(headerBlock) {
-		if srv.tryAcquireRequestSlot() {
-			c.worker.reqs++
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast.forConn(c.tls), streamID, int(st.maxFrameSize))
-			srv.releaseRequestSlot()
-			return false
-		}
-	}
-
-	if endStream && fastRoot && st.decoder.MemoizedRootRequest(headerBlock) {
-		if srv.tryAcquireRequestSlot() {
-			c.worker.reqs++
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast.forConn(c.tls), streamID, int(st.maxFrameSize))
-			srv.releaseRequestSlot()
-			return false
-		}
-	}
-
-	headers, meta, isRoot, err := st.decoder.DecodeRequest(st.headersBuf[:0], headerBlock)
+	headers, meta, err := st.decoder.DecodeRequest(st.headersBuf[:0], headerBlock)
 	st.headersBuf = headers[:0]
 	if err == errH2MalformedRequest {
 		return c.resetMalformedH2Stream(streamID)
@@ -307,14 +286,6 @@ func (c *epollConn) epollH2DecodedHeaders(srv *Server, streamID uint32, headerBl
 	if err != nil {
 		c.writeBuf = appendH2GoAwayFrame(c.writeBuf, st.lastStreamID, H2ErrCompression)
 		return true
-	}
-	if endStream && fastRoot && isRoot {
-		if srv.tryAcquireRequestSlot() {
-			c.worker.reqs++
-			c.writeBuf = appendFastH2RootResponse(c.writeBuf, h2Fast.forConn(c.tls), streamID, int(st.maxFrameSize))
-			srv.releaseRequestSlot()
-			return false
-		}
 	}
 	if len(headers) > h2MaxRequestFields {
 		return c.refuseH2Stream(streamID, H2ErrEnhanceYourCalm)
@@ -1271,24 +1242,4 @@ func epollReleaseH2Stream(st *tlsWorkerH2State, streamID uint32) {
 	delete(st.streams, streamID)
 	stream.Reset()
 	StreamPool.Put(stream)
-}
-
-func matchIndexedH2FastRootHeaderBlock(headerBlock []byte) bool {
-	if len(headerBlock) != 3 {
-		return false
-	}
-	var seen uint8
-	for i := range headerBlock {
-		switch headerBlock[i] {
-		case 0x82:
-			seen |= 1
-		case 0x84:
-			seen |= 2
-		case 0x87:
-			seen |= 4
-		default:
-			return false
-		}
-	}
-	return seen == 7
 }
