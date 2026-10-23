@@ -8,7 +8,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -290,5 +292,53 @@ func TestProxyTunnelIdleAfterClientBytesUsesIdleTimeout(t *testing.T) {
 			t.Fatalf("ReadHeaderTimeout %v: tunnel idle after a client byte was not closed within %v: %v", headerTimeout, proxyG2TunnelReap, err)
 		}
 		_ = c.Close()
+	}
+}
+
+func proxyG2ProcessCPU() time.Duration {
+	var ru syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &ru)
+	return time.Duration(ru.Utime.Nano() + ru.Stime.Nano())
+}
+
+const proxyG2SilentCPUBound = 500 * time.Millisecond
+
+func TestProxyTLSTunnelSilentClientStaysUsable(t *testing.T) {
+	for _, v := range []struct {
+		name string
+		max  uint16
+	}{{"tls12", tls.VersionTLS12}, {"tls13", tls.VersionTLS13}} {
+		t.Run(v.name, func(t *testing.T) {
+			o := newProxyG2TunnelOrigin(t, true)
+			_, httpsAddr, _ := proxyFixStartTLS(t, Config{MaxConnsPerIP: -1, IdleTimeout: proxyG2TunnelIdle}, func(s *Server) {
+				s.AddProxyDomain(DomainConfig{Domain: proxyFixTLSDomain, Backends: []BackendConfig{{Addr: o.ln.Addr().String()}}})
+			})
+			c, err := tls.DialWithDialer(&net.Dialer{Timeout: proxyFixIOTimeout}, "tcp", httpsAddr, &tls.Config{
+				InsecureSkipVerify: true, ServerName: proxyFixTLSDomain, NextProtos: []string{"http/1.1"}, MaxVersion: v.max,
+			})
+			if err != nil {
+				t.Fatalf("tls dial: %v", err)
+			}
+			defer c.Close()
+			if _, err := io.WriteString(c, proxyFix4TLSUpgrade("/ws")); err != nil {
+				t.Fatalf("write upgrade: %v", err)
+			}
+			br := bufio.NewReader(c)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+				t.Fatalf("upgrade: %v", err)
+			}
+			go func() { _, _ = io.Copy(io.Discard, br) }()
+			before := proxyG2ProcessCPU()
+			time.Sleep(4 * proxyG2TunnelIdle)
+			spent := proxyG2ProcessCPU() - before
+			if spent > proxyG2SilentCPUBound {
+				t.Fatalf("the proxy used %v of CPU in %v while the client was silent", spent, 4*proxyG2TunnelIdle)
+			}
+			if _, err := io.WriteString(c, "hello"); err != nil {
+				t.Fatalf("write after silence: %v", err)
+			}
+			proxyFixEventually(t, "client bytes after a silence reach the backend", func() bool { return o.received.Load() == 5 })
+		})
 	}
 }

@@ -418,11 +418,18 @@ func relayDeclinedUpgrade(conn net.Conn, p *h1Parser, chunked bool, contentLen i
 
 func pipeUpgradeTunnel(clientConn, backendConn net.Conn, idle time.Duration) {
 	done := make(chan struct{}, 2)
-	activity := tunnelActivity{start: time.Now()}
+	activity := &tunnelActivity{start: time.Now()}
+	if idle > 0 {
+		stop := activity.watch(idle, func() {
+			_ = clientConn.Close()
+			_ = backendConn.Close()
+		})
+		defer close(stop)
+	}
 	copyBuf := func(dst, src net.Conn) {
 		buf := LargeBufPool.Get().(*[]byte)
 		if idle > 0 {
-			activity.copy(dst, src, (*buf)[:cap(*buf)], idle)
+			activity.copy(dst, src, (*buf)[:cap(*buf)])
 		} else {
 			_, _ = io.CopyBuffer(dst, src, (*buf)[:cap(*buf)])
 		}
@@ -454,29 +461,41 @@ func (a *tunnelActivity) idleFor() time.Duration {
 	return time.Since(a.start) - time.Duration(a.lastMoved.Load())
 }
 
-func (a *tunnelActivity) copy(dst, src net.Conn, buf []byte, idle time.Duration) {
+func (a *tunnelActivity) copy(dst, src net.Conn, buf []byte) {
 	for {
-		if src.SetReadDeadline(time.Now().Add(idle)) != nil {
-			return
-		}
 		n, err := src.Read(buf)
 		if n > 0 {
-			if dst.SetWriteDeadline(time.Now().Add(idle)) != nil {
-				return
-			}
 			if _, werr := dst.Write(buf[:n]); werr != nil {
 				return
 			}
 			a.lastMoved.Store(int64(time.Since(a.start)))
 		}
-		if err == nil {
-			continue
-		}
-		var netErr net.Error
-		if !errors.As(err, &netErr) || !netErr.Timeout() || a.idleFor() >= idle {
+		if err != nil {
 			return
 		}
 	}
+}
+
+func (a *tunnelActivity) watch(idle time.Duration, expire func()) chan<- struct{} {
+	stop := make(chan struct{})
+	go func() {
+		timer := time.NewTimer(idle)
+		defer timer.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-timer.C:
+			}
+			quiet := a.idleFor()
+			if quiet >= idle {
+				expire()
+				return
+			}
+			timer.Reset(idle - quiet)
+		}
+	}()
+	return stop
 }
 
 func extractIP(addr string) string {
