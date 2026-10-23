@@ -693,6 +693,6 @@ func (e *staticCacheEntry) writeFDHeaders(req *Request, resp *Response, sw *epol
 	if err := sw.WriteHeader(p.status, resp.Headers, e.contentType); err != nil {
 		return p, false
 	}
-	resp.SetStreamer(sw)
+	resp.SetStreamer(resp.ensureSW())
 	return p, true
 }
