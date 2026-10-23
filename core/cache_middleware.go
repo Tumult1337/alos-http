@@ -252,15 +252,6 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 	}
 	ownedKey := strings.Clone(key)
 	compress := (rc.cfg.Gzip || rc.cfg.Brotli) && len(body) >= rc.cfg.GzipMinBytes && compressibleType(resp.ContentType)
-	if compress {
-		if _, busy := rc.filling.LoadOrStore(ownedKey, struct{}{}); busy {
-			return nil
-		}
-		defer rc.filling.Delete(ownedKey)
-		if cur, ok := rc.store.Load(ownedKey); ok && turbo.UnixNano() <= cur.expiresAtNs {
-			return cur
-		}
-	}
 	now := turbo.UnixNano()
 	ent := &cachedResponse{
 		status:      status,
@@ -269,6 +260,19 @@ func (rc *ResponseCache) captureAndStore(key, method string, resp *Response) *ca
 		body:        cloneBytes(body),
 		expiresAtNs: now + rc.ttlNs,
 		storedAtNs:  now,
+	}
+	if compress {
+		if _, busy := rc.filling.LoadOrStore(ownedKey, struct{}{}); busy {
+			stored, _ := rc.store.LoadOrStore(ownedKey, ent)
+			if turbo.UnixNano() > stored.expiresAtNs {
+				return nil
+			}
+			return stored
+		}
+		defer rc.filling.Delete(ownedKey)
+		if cur, ok := rc.store.Load(ownedKey); ok && cur.encodings != 0 && turbo.UnixNano() <= cur.expiresAtNs {
+			return cur
+		}
 	}
 	if compress {
 		rc.builds.Add(1)

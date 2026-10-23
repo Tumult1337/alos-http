@@ -638,6 +638,48 @@ func TestCache_Concurrent_RaceFree(t *testing.T) {
 	if got := calls.Load(); got < paths || got > goroutines*paths {
 		t.Fatalf("handler ran %d times, want between %d and %d: each goroutine may miss each path at most once", got, paths, goroutines*paths)
 	}
+	rc.store.Range(func(key string, ent *cachedResponse) bool {
+		if ent.encodings == 0 {
+			t.Errorf("entry %q ended identity-only, want compressed", key)
+		}
+		return true
+	})
+}
+
+func TestCache_Fill_IgnoresIdentityEntryAtPreCheck(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, Gzip: true, GzipMinBytes: 10})
+	defer rc.Stop()
+	now := turbo.UnixNano()
+	rc.store.Store("k", &cachedResponse{status: 200, expiresAtNs: now + int64(time.Hour), storedAtNs: now})
+	resp := cResp()
+	resp.Status(200).String(bigBody(300))
+	got := rc.captureAndStore("k", "GET", resp)
+	if got == nil || got.encodings == 0 {
+		t.Fatalf("filler returned %+v, want compressed entry", got)
+	}
+	if cur, _ := rc.store.Load("k"); cur != got {
+		t.Fatal("store still holds the identity entry")
+	}
+}
+
+func TestCache_BusyFill_StoresIdentityEntryOnce(t *testing.T) {
+	rc := NewResponseCache(CacheConfig{TTL: time.Minute, Gzip: true, GzipMinBytes: 10})
+	defer rc.Stop()
+	rc.filling.Store("k", struct{}{})
+	first := cResp()
+	first.Status(200).String(bigBody(300))
+	ent := rc.captureAndStore("k", "GET", first)
+	if ent == nil || ent.encodings != 0 {
+		t.Fatalf("busy request returned %+v, want identity entry", ent)
+	}
+	if cur, _ := rc.store.Load("k"); cur != ent {
+		t.Fatal("identity entry not in store")
+	}
+	second := cResp()
+	second.Status(200).String(bigBody(300))
+	if again := rc.captureAndStore("k", "GET", second); again != ent {
+		t.Fatal("second busy request replaced the stored entry")
+	}
 }
 
 func appFixCheckCachedBody(resp *Response, want string) error {
