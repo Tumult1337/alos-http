@@ -5,9 +5,15 @@ package core
 import (
 	"bytes"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,15 +88,22 @@ func TestLegacyCertificateFilesLoadManualChain(t *testing.T) {
 	if entry.Source != CertManual {
 		t.Fatal("configured files were not registered as a manual certificate")
 	}
+	leaf, _, err := LoadOrGenerateCert(certFile, keyFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(leaf, fixture.leafCert.Raw) {
+		t.Fatal("LoadOrGenerateCert did not return the configured leaf certificate")
+	}
 }
 
 func TestConfiguredCertificateFilesRejectInvalidPairsWithoutReplacement(t *testing.T) {
-	t.Chdir(t.TempDir())
 	fixture := newOCSPFixture(t, false)
 	other := newOCSPFixture(t, false)
-	for _, mode := range []string{"inferred", "manual", "legacy"} {
+	for _, mode := range []string{"inferred", "manual", "legacy", "exported"} {
 		for _, invalid := range []string{"missing certificate", "missing key", "malformed certificate", "malformed key", "mismatched key", "certificate only", "key only"} {
 			t.Run(mode+"/"+invalid, func(t *testing.T) {
+				t.Chdir(t.TempDir())
 				certFile, keyFile := fixture.writeFiles(t)
 				switch invalid {
 				case "missing certificate":
@@ -114,12 +127,12 @@ func TestConfiguredCertificateFilesRejectInvalidPairsWithoutReplacement(t *testi
 						t.Fatal(err)
 					}
 				}
-				for _, file := range []string{certFile, keyFile} {
+				for _, file := range []string{certFile, keyFile, defaultCertFile, defaultKeyFile} {
 					before, beforeErr := os.ReadFile(file)
 					t.Cleanup(func() {
 						after, afterErr := os.ReadFile(file)
 						if (beforeErr == nil) != (afterErr == nil) || !bytes.Equal(before, after) {
-							t.Error("configured file was created, removed, or replaced")
+							t.Errorf("certificate file %s was created, removed, or replaced", file)
 						}
 					})
 				}
@@ -128,6 +141,12 @@ func TestConfiguredCertificateFilesRejectInvalidPairsWithoutReplacement(t *testi
 				}
 				if invalid == "key only" {
 					certFile = ""
+				}
+				if mode == "exported" {
+					if _, _, err := LoadOrGenerateCert(certFile, keyFile); err == nil {
+						t.Error("invalid configured certificate pair was accepted")
+					}
+					return
 				}
 				var cfg Config
 				if mode == "legacy" {
@@ -169,6 +188,9 @@ func TestLegacyCertificateFilesRejectExpiredWithoutReplacement(t *testing.T) {
 	}
 	if server.certStore.Lookup("") != nil {
 		t.Error("expired legacy certificate installed a replacement")
+	}
+	if _, _, err := LoadOrGenerateCert(certFile, keyFile); err == nil {
+		t.Error("LoadOrGenerateCert accepted an expired configured certificate")
 	}
 	for file, expected := range map[string][]byte{certFile: fixture.chainPEM, keyFile: fixture.keyPEM} {
 		actual, err := os.ReadFile(file)
@@ -214,15 +236,25 @@ func TestCertificateLoadingWithoutFilesKeepsSelfSignedBehavior(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	certFile, keyFile := filepath.Join(t.TempDir(), "generated-cert.pem"), filepath.Join(t.TempDir(), "generated-key.pem")
-	if _, _, err := LoadOrGenerateCert(certFile, keyFile); err != nil {
-		t.Fatalf("exported generation API rejected absent files: %v", err)
+	generated, err := os.ReadFile(defaultCertFile)
+	if err != nil {
+		t.Fatalf("development certificate was not saved: %v", err)
 	}
-	if _, err := os.Stat(certFile); err != nil {
+	server := &Server{certStore: NewCertStore()}
+	if err := server.loadCerts(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(keyFile); err != nil {
-		t.Fatal(err)
+	if entry := server.certStore.Lookup("localhost"); entry == nil || !bytes.Equal(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: entry.ChainDER[0]}), generated) {
+		t.Fatal("saved development certificate was not reused")
+	}
+	certFile, keyFile := filepath.Join(t.TempDir(), "absent-cert.pem"), filepath.Join(t.TempDir(), "absent-key.pem")
+	if _, _, err := LoadOrGenerateCert(certFile, keyFile); err == nil {
+		t.Fatal("exported API generated a certificate for configured paths that do not exist")
+	}
+	for _, file := range []string{certFile, keyFile} {
+		if _, err := os.Stat(file); !os.IsNotExist(err) {
+			t.Fatalf("configured path %s was written: %v", file, err)
+		}
 	}
 }
 
@@ -267,5 +299,104 @@ func requireConfiguredChain(t *testing.T, chain [][]byte, fixture *ocspFixture) 
 	}
 	if !bytes.Equal(chain[0], fixture.leafCert.Raw) || !bytes.Equal(chain[1], fixture.ca.cert.Raw) {
 		t.Fatal("configured certificate chain identity or order changed")
+	}
+}
+
+func TestLegacyCertificateKeyFileFormsMatchConfiguredCertificates(t *testing.T) {
+	fixture := newOCSPFixture(t, false)
+	parameters := pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07}})
+	for name, keyPEM := range map[string][]byte{
+		"parameters before key":  append(bytes.Clone(parameters), fixture.keyPEM...),
+		"certificate before key": append(bytes.Clone(fixture.chainPEM), fixture.keyPEM...),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Chdir(t.TempDir())
+			certFile, keyFile := fixture.writeFiles(t)
+			if err := os.WriteFile(keyFile, keyPEM, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			server := &Server{certStore: NewCertStore()}
+			server.config.TLSCertFile, server.config.TLSKeyFile = certFile, keyFile
+			if err := server.loadCerts(); err != nil {
+				t.Fatalf("legacy certificate files rejected: %v", err)
+			}
+			if entry := server.certStore.Lookup("localhost"); entry == nil || entry.Source != CertManual {
+				t.Fatal("legacy certificate files did not install a manual certificate")
+			}
+		})
+	}
+	t.Run("no key block", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		certFile, keyFile := fixture.writeFiles(t)
+		if err := os.WriteFile(keyFile, append(bytes.Clone(parameters), fixture.chainPEM...), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := LoadOrGenerateCert(certFile, keyFile); err == nil {
+			t.Fatal("key file without a private key block was accepted")
+		}
+	})
+}
+
+func TestLegacyCertificateKeyFilesAcceptTypedPrivateKeyBlocks(t *testing.T) {
+	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ecDER, err := x509.MarshalECPrivateKey(ecKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameters := pem.EncodeToMemory(&pem.Block{Type: "EC PARAMETERS", Bytes: []byte{0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07}})
+	for _, tc := range []struct {
+		name   string
+		signer crypto.Signer
+		keyPEM []byte
+	}{
+		{"sec1 after parameters", ecKey, append(parameters, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: ecDER})...)},
+		{"pkcs1", rsaKey, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(rsaKey)})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			template := &x509.Certificate{SerialNumber: big.NewInt(1), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+			certDER, err := x509.CreateCertificate(rand.Reader, template, template, tc.signer.Public(), tc.signer)
+			if err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			certFile, keyFile := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+			if err := os.WriteFile(certFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(keyFile, tc.keyPEM, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := LoadOrGenerateCert(certFile, keyFile); err != nil {
+				t.Fatalf("typed private key block rejected: %v", err)
+			}
+		})
+	}
+}
+
+func TestDefaultCertificatePairMismatchKeepsFiles(t *testing.T) {
+	t.Chdir(t.TempDir())
+	fixture := newOCSPFixture(t, false)
+	other := newOCSPFixture(t, false)
+	if err := os.WriteFile(defaultCertFile, fixture.chainPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(defaultKeyFile, other.keyPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadOrGenerateCert("", ""); !errors.Is(err, errCertKeyMismatch) {
+		t.Fatalf("mismatched default pair: err=%v", err)
+	}
+	for file, want := range map[string][]byte{defaultCertFile: fixture.chainPEM, defaultKeyFile: other.keyPEM} {
+		got, err := os.ReadFile(file)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("default file %s was replaced: err=%v", file, err)
+		}
 	}
 }

@@ -21,6 +21,7 @@ var (
 	errFPBadAuthority   = errors.New("outbound: bad authority")
 	errFPDNSFailed      = errors.New("outbound: dns lookup failed")
 	errFPTooManyConns   = errors.New("outbound: backend connection limit reached")
+	errFPDialBlocked    = errors.New("outbound: destination address not allowed")
 )
 
 type fpRequest struct {
@@ -122,6 +123,8 @@ type fpConfig struct {
 	IdleTimeout       time.Duration
 	MaxResponseBody   int
 	MaxHeaderBytes    int
+	// AllowAddr runs on an event loop before each new backend dial with the unmapped destination address; false fails the dial with ErrUpstreamDialBlocked.
+	AllowAddr func(netip.Addr) bool
 }
 
 const (

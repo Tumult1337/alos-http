@@ -50,7 +50,8 @@ type CacheRule struct {
 }
 
 // ProxyCacheConfig controls how the reverse proxy caches backend responses. The zero
-// value is valid; NewProxyCache and UpdateConfig apply defaults to zero-valued fields.
+// value is valid; NewProxyCache applies defaults to zero-valued fields. UpdateConfig stores
+// MaxEntrySize, MaxTotalBytes, and MaxEntries as given and applies defaults to the other fields.
 //
 // Rules lists path-specific caching rules, consulted in order; the first rule whose
 // PathPrefix, Methods, and StatusOnly all match supplies the TTL. Only GET/HEAD
@@ -77,7 +78,8 @@ type CacheRule struct {
 //
 //	Example: MaxTotalBytes: 512 << 20.
 //
-// MaxEntries caps the number of stored entries; 0 disables the cap (DefaultProxyCacheConfig sets 10000).
+// MaxEntries caps the number of stored entries; 0 defaults to 10000 in NewProxyCache
+// and a negative value disables the cap. UpdateConfig preserves 0 as disabled.
 //
 //	Example: MaxEntries: 50000.
 //
@@ -112,6 +114,8 @@ type ProxyCacheConfig struct {
 	CompressMinLen int
 }
 
+const defaultProxyCacheMaxEntries = 10000
+
 // DefaultProxyCacheConfig returns a ProxyCacheConfig with sensible defaults:
 // 4 MB max entry, 5 minute TTL, 256 MB total, 10k entries, gzip compression
 // at level 2 for responses >= 512 bytes.
@@ -120,7 +124,7 @@ func DefaultProxyCacheConfig() ProxyCacheConfig {
 		MaxEntrySize:   4 << 20,
 		DefaultMaxAge:  5 * time.Minute,
 		MaxTotalBytes:  256 << 20,
-		MaxEntries:     10000,
+		MaxEntries:     defaultProxyCacheMaxEntries,
 		PreCompress:    true,
 		CompressLevel:  defaultCompressLevel,
 		CompressMinLen: 512,
@@ -215,8 +219,9 @@ type ProxyCache struct {
 }
 
 // NewProxyCache creates a ProxyCache configured with cfg, normalizing zero-valued
-// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, and MaxTotalBytes to
-// their defaults, and starts a background goroutine that periodically evicts expired entries.
+// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, MaxTotalBytes, and
+// MaxEntries to their defaults, and starts a background goroutine that periodically
+// evicts expired entries.
 func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
 		cfg.CompressLevel = defaultCompressLevel
@@ -233,6 +238,9 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.MaxTotalBytes <= 0 {
 		cfg.MaxTotalBytes = 256 << 20
 	}
+	if cfg.MaxEntries == 0 {
+		cfg.MaxEntries = defaultProxyCacheMaxEntries
+	}
 
 	pc := &ProxyCache{
 		entries:   alosmap.NewTypedSized[string, *cacheEntry](10000, 0).Prealloc(256),
@@ -246,7 +254,7 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 
 // UpdateConfig atomically replaces the cache's active configuration with cfg,
 // normalizing zero-valued CompressLevel, CompressMinLen, and DefaultMaxAge to their
-// defaults. Unlike NewProxyCache, MaxEntrySize and MaxTotalBytes are stored as given.
+// defaults. Unlike NewProxyCache, MaxEntrySize, MaxTotalBytes, and MaxEntries are stored as given.
 // Existing entries are left as-is.
 func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {

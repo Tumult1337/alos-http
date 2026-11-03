@@ -9,7 +9,7 @@ import (
 )
 
 func epollListen(addr string) (int, error) {
-	fd, err := epollBind(addr)
+	fd, err := epollBind(addr, true)
 	if err != nil {
 		return -1, err
 	}

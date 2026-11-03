@@ -1409,6 +1409,9 @@ func (qc *QUICConn) retireStream(s *QUICStream, refs int) {
 	for i := 0; i < refs; i++ {
 		qc.releaseStream(s)
 	}
+	if qc.closed.Load() {
+		return
+	}
 	if !quicStreamIsBidi(id) {
 		if !quicStreamIsLocal(id, true) {
 			qc.grantUniStreams(qc.uniStreamsRetired.Add(1) + quicMaxUniStreams)

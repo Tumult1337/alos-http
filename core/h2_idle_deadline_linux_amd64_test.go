@@ -621,3 +621,18 @@ func TestInputDeadlineKeepsArmedWriteDeadline(t *testing.T) {
 		})
 	}
 }
+
+func TestH2IdleConnectionReleasesBuffersAfterConsumedInput(t *testing.T) {
+	worker, conn, peer := h2DeadlineFixture(t)
+	input := appendH2Frame(append([]byte(nil), H2ClientPreface[:]...), H2FrameSettings, 0, 0, nil)
+	if _, err := unix.Write(peer, input); err != nil {
+		t.Fatal(err)
+	}
+	worker.readable(conn, false)
+	if !conn.h2Idle() || conn.deadline == 0 {
+		t.Fatalf("fixture did not reach bounded HTTP/2 idle state: idle=%v deadline=%d", conn.h2Idle(), conn.deadline)
+	}
+	if conn.readBuf != nil || conn.writeBuf != nil {
+		t.Fatalf("idle connection retains readCap=%d writeCap=%d", cap(conn.readBuf), cap(conn.writeBuf))
+	}
+}

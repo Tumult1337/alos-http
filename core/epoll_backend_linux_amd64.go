@@ -4,6 +4,7 @@ package core
 
 import (
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net"
 	"runtime"
@@ -454,7 +455,7 @@ func (s *Server) prepareEpollWorkers(addr string, tlsMode bool) ([]*epollWorker,
 			closeUnstartedEpollWorkers(workers)
 			return nil, ErrServerShutdown
 		}
-		listenerFD, err := epollBind(addr)
+		listenerFD, err := epollReserve(addr, tlsMode)
 		if err != nil {
 			closeUnstartedEpollWorkers(workers)
 			return nil, fmt.Errorf("epoll bind %s: %w", addr, err)
@@ -493,7 +494,7 @@ func (s *Server) startEpollWorkers(workers []*epollWorker) (<-chan error, error)
 			closeUnstartedEpollWorkers(workers)
 			return nil, ErrServerShutdown
 		}
-		if err := unix.Listen(worker.listenerFD, epollListenBacklog); err != nil {
+		if err := activateEpollListener(worker.listenerFD); err != nil {
 			closeUnstartedEpollWorkers(workers)
 			return nil, fmt.Errorf("epoll listen worker %d: %w", worker.coreID, err)
 		}
@@ -795,7 +796,27 @@ func (w *epollWorker) serviceConn(c *epollConn, evs uint32) {
 	}
 }
 
-func epollBind(addr string) (int, error) {
+func epollReserve(addr string, tlsMode bool) (int, error) {
+	if !tlsMode {
+		return epollBind(addr, true)
+	}
+	fd, err := epollBind(addr, false)
+	if !errors.Is(err, unix.EADDRINUSE) {
+		return fd, err
+	}
+	// TIME_WAIT or bound sockets with SO_REUSEADDR block the first bind; a live listener also blocks this retry.
+	fd, err = epollBind(addr, true)
+	if err != nil {
+		return -1, err
+	}
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 0); err != nil {
+		_ = unix.Close(fd)
+		return -1, fmt.Errorf("epoll reserve %s: %w", addr, err)
+	}
+	return fd, nil
+}
+
+func epollBind(addr string, reuseAddr bool) (int, error) {
 	tcpAddr, err := net.ResolveTCPAddr("tcp4", addr)
 	if err != nil {
 		return -1, err
@@ -804,7 +825,9 @@ func epollBind(addr string) (int, error) {
 	if err != nil {
 		return -1, err
 	}
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	if reuseAddr {
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	}
 	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
 	setConnSockopts(fd)
 	sa := &unix.SockaddrInet4{Port: tcpAddr.Port}
@@ -816,6 +839,11 @@ func epollBind(addr string) (int, error) {
 		return -1, err
 	}
 	return fd, nil
+}
+
+func activateEpollListener(fd int) error {
+	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+	return unix.Listen(fd, epollListenBacklog)
 }
 
 func (w *epollWorker) run() error {
@@ -2001,7 +2029,7 @@ func (c *epollConn) compactH2ReadBuffer(force bool) {
 	if st.appBufOff == 0 {
 		return
 	}
-	if !force && st.appBufOff <= cap(c.readBuf)/2 {
+	if !force && st.appBufOff <= cap(c.readBuf)/2 && st.appBufOff != c.readN {
 		return
 	}
 	remaining := c.readN - st.appBufOff

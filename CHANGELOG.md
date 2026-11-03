@@ -29,8 +29,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Log output changed format. The server logs through `log/slog` (see `Config.Logger`); the default output is `[INFO] certificate added domain=example.com` rather than free-form text, and the `Logger()` middleware writes `[INFO] request proto=HTTP/1.1 method=GET path=/ status=200 elapsed=…`. Programs that parse the old log lines need updating. A recovered panic is logged as `[ERROR] recovered panic panic=… stack=… method=… path=…` instead of `[PANIC] …`; handler panics on the epoll server's HTTP/1 and HTTP/2 paths used to be answered with `500` without being logged at all.
 - `JWT(...)` panics when the config has no `Secret`, `Key` or `KeyFunc`; it used to verify signatures against an empty HMAC key, which anyone can sign with. Tokens are now also rejected when `nbf` or `iat` lies in the future (beyond `JWTConfig.Leeway`), when `exp`, `nbf` or `iat` is not a number, when the header carries `crit`, and when any part uses padded or non-canonical base64url. A token whose `exp` equals the current second is expired (RFC 7519 §4.1.4).
 
+- `LoadOrGenerateCert` with a configured path no longer generates or overwrites files. When either path is set, both are required, and a missing, invalid or expired pair returns an error. `Config.TLSCertFile` now serves the full certificate chain.
+- `NewProxyCache` treats `MaxEntries: 0` as 10000 entries. A negative value disables the cap. `UpdateConfig` still stores 0 as disabled.
+- `AppendRecord` fragments a payload larger than 16384 bytes into several records. It no longer truncates the payload.
+
 ### Added
 
+- `UpstreamConfig.AllowAddr`: refuses a backend dial by destination address before the socket connects. A refused dial returns `ErrUpstreamDialBlocked`. The check receives the unmapped address, also for an IPv4-mapped AAAA answer.
 - MIT license (`LICENSE`), security policy (`SECURITY.md`) and this changelog.
 - `core.Version` constant.
 - GitHub Actions CI: vet, staticcheck (linux/windows/darwin matrix), race tests, fuzzing, govulncheck, benchmark smoke run.

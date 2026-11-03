@@ -148,9 +148,9 @@ var timeNow = time.Now
 //
 // QUICMaxUDPPayload is the largest QUIC UDP payload the server will use after peer negotiation; 0 uses the safe protocol default.
 //
-// TLSCertFile and TLSKeyFile point to a PEM certificate/key pair used when Certs and ACME are unset.
-// Both paths must be supplied together; invalid or expired pairs return an error.
-// When both paths are empty, a self-signed localhost certificate is loaded or generated.
+// TLSCertFile and TLSKeyFile point to a PEM certificate chain/key pair used when Certs and ACME are unset.
+// Both must be set together; a missing, invalid, or expired pair fails start-up and the files are never rewritten.
+// When both are empty, a self-signed localhost certificate is loaded from or generated into .alos-cert.pem/.alos-key.pem.
 //
 //	Example: TLSCertFile: "cert.pem", TLSKeyFile: "key.pem".
 //	Example: TLSCertFile: "", TLSKeyFile: "" uses a self-signed localhost certificate.
@@ -1147,7 +1147,7 @@ func (s *Server) loadCerts() error {
 				s.certStore.AddCert(NewCertEntryFromDER(cc.Domain, der, priv, CertSelfSigned))
 			case CertManual:
 				if cc.CertFile == "" || cc.KeyFile == "" {
-					return &staticError{"manual certificate requires both CertFile and KeyFile"}
+					return fmt.Errorf("certificate %q: %w", cc.Domain, errCertPairIncomplete)
 				}
 				certPEM, err := os.ReadFile(cc.CertFile)
 				if err != nil {
@@ -1204,38 +1204,15 @@ func (s *Server) loadCerts() error {
 		return nil
 	}
 
-	if s.config.TLSCertFile != "" || s.config.TLSKeyFile != "" {
-		if s.config.TLSCertFile == "" || s.config.TLSKeyFile == "" {
-			return &staticError{"manual certificate requires both TLSCertFile and TLSKeyFile"}
-		}
-		certPEM, err := os.ReadFile(s.config.TLSCertFile)
-		if err != nil {
-			return err
-		}
-		keyPEM, err := os.ReadFile(s.config.TLSKeyFile)
-		if err != nil {
-			return err
-		}
-		entry, err := NewCertEntryFromPEM("localhost", certPEM, keyPEM, CertManual)
-		if err != nil {
-			return err
-		}
-		leaf, err := x509.ParseCertificate(entry.ChainDER[0])
-		if err != nil {
-			return err
-		}
-		if timeNow().After(leaf.NotAfter) {
-			return &staticError{"certificate expired"}
-		}
-		s.certStore.AddCert(entry)
-		return nil
-	}
-
-	certDER, privKey, err := LoadOrGenerateCert("", "")
+	chainDER, privKey, err := loadOrGenerateCertChain(s.config.TLSCertFile, s.config.TLSKeyFile)
 	if err != nil {
 		return err
 	}
-	s.certStore.AddCert(NewCertEntryFromDER("localhost", certDER, privKey, CertSelfSigned))
+	source := CertSelfSigned
+	if s.config.TLSCertFile != "" || s.config.TLSKeyFile != "" {
+		source = CertManual
+	}
+	s.certStore.AddCert(newCertEntryFromChainDER("localhost", chainDER, privKey, source))
 	return nil
 }
 

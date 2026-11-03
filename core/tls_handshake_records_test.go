@@ -471,8 +471,8 @@ func TestTLS12HandshakeRecordBoundaries(t *testing.T) {
 		t.Fatal("single plaintext handshake changed its wire bytes")
 	}
 	oversized := handshakeRecordPattern(16385)
-	if got := AppendRecord(nil, 22, oversized); len(got) != 16389 || !bytes.Equal(got[5:], oversized[:16384]) {
-		t.Fatal("exported AppendRecord truncation contract changed")
+	if got := AppendRecord(nil, 22, oversized); !bytes.Equal(got, appendTLS12HandshakeRecords(nil, oversized)) {
+		t.Fatal("exported AppendRecord does not fragment an oversized payload")
 	}
 }
 
