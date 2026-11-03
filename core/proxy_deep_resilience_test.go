@@ -310,12 +310,7 @@ func TestDeepConcurrentMixedSizes(t *testing.T) {
 
 func TestDeepConcurrentAcrossManyDomains(t *testing.T) {
 	const domains = 12
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1})
 	for i := 0; i < domains; i++ {
 		body := fmt.Sprintf("domain-%d", i)
@@ -419,12 +414,7 @@ func TestDeepPoolIsolatedPerOrigin(t *testing.T) {
 		b.Add(1)
 		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\nB")
 	})
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1})
 	srv.AddProxyDomain(DomainConfig{Domain: "a.test", Backends: []BackendConfig{{Addr: oa.addr()}}})
 	srv.AddProxyDomain(DomainConfig{Domain: "b.test", Backends: []BackendConfig{{Addr: ob.addr()}}})

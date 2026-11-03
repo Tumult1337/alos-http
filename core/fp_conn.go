@@ -115,6 +115,9 @@ func (l *beLoop) newConn(ex *Exchange) {
 }
 
 func (l *beLoop) dialBackend(c *backendConn, ip netip.Addr, port uint16) error {
+	if l.cfg.AllowAddr != nil && !l.cfg.AllowAddr(ip) {
+		return errFPDialBlocked
+	}
 	fd, err := dialNonBlocking(ip, port)
 	if err != nil {
 		return errFPDialFailed
@@ -313,6 +316,9 @@ func (l *beLoop) resumeBackendRead(c *backendConn) {
 		return
 	}
 	c.readPaused = false
+	if ex := c.cur; ex != nil && ex.readTimeoutNano > 0 {
+		ex.deadline = l.nowNano() + ex.readTimeoutNano
+	}
 	ev := unix.EpollEvent{
 		Events: unix.EPOLLIN | unix.EPOLLOUT | unix.EPOLLRDHUP | unix.EPOLLET,
 		Fd:     int32(c.fd),
@@ -347,6 +353,31 @@ func (l *beLoop) flushWrites(c *backendConn) {
 		}
 		l.closeConn(c, err)
 		return
+	}
+}
+
+func (l *beLoop) sendDirect(c *backendConn, p []byte) {
+	for len(p) > 0 && c.state != connClosed {
+		n, err := socketSend(c.fd, p)
+		if n > 0 {
+			p = p[n:]
+			if c.state == connReady && c.cur != nil {
+				c.cur.wroteRequest = true
+			}
+			continue
+		}
+		if err == unix.EINTR {
+			continue
+		}
+		if err == unix.EAGAIN {
+			c.wbuf.write(p)
+			break
+		}
+		l.closeConn(c, err)
+		return
+	}
+	if c.state != connClosed {
+		l.wakeWaitingUploads(c)
 	}
 }
 

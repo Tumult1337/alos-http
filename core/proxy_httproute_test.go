@@ -17,12 +17,7 @@ import (
 // which is how ACME HTTP-01 challenges are forwarded.
 func startRouteProxy(t *testing.T, routes []HTTPRoute) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr:          addr,
@@ -113,12 +108,7 @@ func TestHTTPRoutePoolsUpstreamConnections(t *testing.T) {
 // than being proxied.
 func TestHTTPRouteUnmatchedPathFallsThrough(t *testing.T) {
 	o := newInloopOrigin(t, echoBodyOrigin("from backend"))
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr: addr, PlainHTTP: true, HTTPAddr: "-",
@@ -197,12 +187,7 @@ func TestHTTPRouteDeadBackendFailsFast(t *testing.T) {
 // Routes added after startup must take effect.
 func TestHTTPRouteAddedAtRuntime(t *testing.T) {
 	o := newInloopOrigin(t, echoBodyOrigin("late"))
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 
 	srv := New(Config{
 		Addr: addr, PlainHTTP: true, HTTPAddr: "-",

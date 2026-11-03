@@ -32,7 +32,7 @@ func appendProxyRequest(dst []byte, req *Request, hostHeader string) []byte {
 	var nominated connectionTokens
 	upgrade := ""
 	for {
-		collecting := len(nominated.names) == 0
+		collecting := nominated.count == 0
 		for _, h := range req.Headers {
 			if isProxyFilteredHeaderFold(h[0]) || nominated.nominates(h[0]) {
 				continue
@@ -54,7 +54,7 @@ func appendProxyRequest(dst []byte, req *Request, hostHeader string) []byte {
 			dst = append(dst, h[1]...)
 			dst = append(dst, "\r\n"...)
 		}
-		if !collecting || len(nominated.names) == 0 {
+		if !collecting || nominated.count == 0 {
 			break
 		}
 		dst = dst[:headersStart]
@@ -97,6 +97,39 @@ func proxyRequestTarget(req *Request) string {
 		return "/"
 	}
 	return target
+}
+
+type fpBackendTarget struct {
+	authority string
+	ip        netip.Addr
+	port      uint16
+	literal   bool
+}
+
+func newFPBackendTarget(addr string) fpBackendTarget {
+	t := fpBackendTarget{authority: fpProxyAuthority(addr)}
+	host, port, err := splitAuthority(t.authority, "http")
+	if err != nil {
+		return t
+	}
+	if ip, ok := parseUpstreamIP(host); ok {
+		t.ip, t.port, t.literal = ip, port, true
+	}
+	return t
+}
+
+func (b *backend) fpAuthority() string {
+	if b.fp.authority != "" {
+		return b.fp.authority
+	}
+	return fpProxyAuthority(b.Addr)
+}
+
+func (b *backend) fpResolve(authority string) (netip.Addr, uint16, error) {
+	if b.fp.literal {
+		return b.fp.ip, b.fp.port, nil
+	}
+	return resolveAuthority(authority)
 }
 
 // resolveAuthority splits a backend authority into an address and port.

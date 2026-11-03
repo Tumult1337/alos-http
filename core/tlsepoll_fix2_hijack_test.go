@@ -35,7 +35,7 @@ func tlsEpollFix2CloseWithoutWritingRoutes(r *Router) {
 func TestTLSEpollFix2HandoffCloseDeliversEarlierPipelinedResponse(t *testing.T) {
 	for _, inline := range []bool{false, true} {
 		for _, useTLS := range []bool{false, true} {
-			ts := newTestServer(t, testServerOptions{TLS: useTLS, Routes: tlsEpollFix2CloseWithoutWritingRoutes, Config: func(c *Config) { c.InlineHandlers = inline }})
+			ts := newTestServer(t, testServerOptions{TLS: useTLS, Routes: tlsEpollFix2CloseWithoutWritingRoutes, Config: func(c *Config) { c.InlineHandlers, c.DisableInlineHandlers = inline, !inline }})
 			versions := []uint16{0}
 			if useTLS {
 				versions = tlsEpollFixVersions()

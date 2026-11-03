@@ -15,8 +15,11 @@ func appendTLS13Alert(dst []byte, w *TrafficAEAD, level byte, desc tlsAlert) []b
 }
 
 func appendTLS12Alert(dst []byte, w *tls12AEAD, level byte, desc tlsAlert) []byte {
-	body := [2]byte{level, byte(desc)}
-	return w.sealTo(dst, tlsRecAlert, body[:])
+	hdr := len(dst)
+	prefix := w.recordPrefixLen()
+	dst = ensureTailCap(dst, prefix+2+w.aead.Overhead())
+	dst = append(dst[:hdr+prefix], level, byte(desc))
+	return w.sealInPlace(dst, hdr, tlsRecAlert)
 }
 
 func (c *epollConn) serverWritesPlaintext() bool {
@@ -64,6 +67,25 @@ func (c *epollConn) sendCloseNotify() bool {
 	}
 	c.writeBuf, c.writeSent = rec, sent
 	return false
+}
+
+func (c *epollConn) closeNotifyIsFinalH1Record() bool {
+	return c.tls && c.closeAfter && !c.tlsAlertSent && !c.lingering && c.fd >= 0 && c.phase == tlsConnPhaseApplication &&
+		c.inFlight == 0 && !c.dispatching && c.proxyEx == nil && c.pausedBackend == nil && c.tunnelBE == nil &&
+		len(c.bodyOut) == 0 && c.h1Body == nil && c.h1Stream == nil && c.ws == nil && c.wsPending == nil &&
+		!c.takeoverPinned && !c.takeoverParked
+}
+
+func (c *epollConn) coalesceCloseNotify() {
+	if !c.closeNotifyIsFinalH1Record() {
+		return
+	}
+	if c.tls12 != nil {
+		c.writeBuf = appendTLS12Alert(c.writeBuf, c.tls12.writer, tlsAlertLevelWarning, alertCloseNotify)
+	} else {
+		c.writeBuf = appendTLS13Alert(c.writeBuf, c.appWriter, tlsAlertLevelWarning, alertCloseNotify)
+	}
+	c.tlsAlertSent = true
 }
 
 func (c *epollConn) failUnexpectedRecord(ct byte) int {

@@ -67,7 +67,7 @@ func appFix2StartHijackServer(t *testing.T, inline bool, handle func(req *Reques
 	return newTestServer(t, testServerOptions{
 		Config: func(cfg *Config) {
 			cfg.PlainHTTP = true
-			cfg.InlineHandlers = inline
+			cfg.InlineHandlers, cfg.DisableInlineHandlers = inline, !inline
 		},
 		Routes: func(r *Router) {
 			r.GET("/hijack", func(req *Request, resp *Response) { handle(req) })

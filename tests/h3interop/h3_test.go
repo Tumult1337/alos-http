@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -40,12 +39,7 @@ type h3Server struct {
 
 func startH3(t *testing.T, cfg core.Config) *h3Server {
 	t.Helper()
-	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := pc.LocalAddr().String()
-	pc.Close()
+	addr, releaseReservation := reserveH3Port(t)
 	cfg.Addr = addr
 	cfg.HTTPAddr = "-"
 	cfg.Certs = append(cfg.Certs, core.CertConfig{Domain: h3Domain, Source: core.CertSelfSigned})
@@ -90,6 +84,7 @@ func startH3(t *testing.T, cfg core.Config) *h3Server {
 		_ = s.Shutdown(ctx)
 	})
 	waitForH3(t, addr)
+	releaseReservation()
 	return hs
 }
 

@@ -38,3 +38,12 @@ func (bb *byteBuffer) compact() {
 	bb.b = bb.b[:n]
 	bb.r = 0
 }
+
+const retainedBufferKeep = 64 << 10
+
+func (bb *byteBuffer) releaseLarge() {
+	if bb.length() == 0 && cap(bb.b) > retainedBufferKeep {
+		bb.b = nil
+		bb.r = 0
+	}
+}

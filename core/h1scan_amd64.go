@@ -25,14 +25,3 @@ func h1HeaderLineSpecials(p []byte) (special, nameEnd int) {
 	}
 	return h1HeaderLineSWAR(p)
 }
-
-//go:noescape
-func h1BlockIndexAVX2(p *byte, n int, out *h1BlockIndexOut) bool
-
-func h1BlockIndex(block []byte, out *h1BlockIndexOut) bool {
-	n := len(block)
-	if !hasAVX2 || n < 2 || n > h1BlockMaxBytes || block[n-2] != '\r' || block[n-1] != '\n' {
-		return false
-	}
-	return h1BlockIndexAVX2(unsafe.SliceData(block), n, out)
-}

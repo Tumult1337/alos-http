@@ -177,7 +177,7 @@ func TestH1BufferedLargeBodyIsDeliveredIntactAndKeepsAlive(t *testing.T) {
 	for _, mode := range h1Modes {
 		for _, inline := range []bool{false, true} {
 			t.Run(mode.name+"/inline="+strconv.FormatBool(inline), func(t *testing.T) {
-				addr := startH1OutServer(t, mode.tls, nil, func(c *Config) { c.InlineHandlers = inline })
+				addr := startH1OutServer(t, mode.tls, nil, func(c *Config) { c.InlineHandlers, c.DisableInlineHandlers = inline, !inline })
 				var dials atomic.Int32
 				cl := h1Client(&dials)
 				base := h1BaseURL(mode.tls, addr)

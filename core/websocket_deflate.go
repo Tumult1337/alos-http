@@ -37,7 +37,57 @@ var (
 	wsInflateTail     = []byte{0x00, 0x00, 0xff, 0xff, 0x01, 0x00, 0x00, 0xff, 0xff}
 )
 
-var wsInflaterPool = sync.Pool{New: func() any { return flate.NewReader(bytes.NewReader(nil)) }}
+type wsInflateSource struct {
+	cur  []byte
+	off  int
+	tail []byte
+}
+
+func (s *wsInflateSource) reset(body, tail []byte) {
+	s.cur, s.off, s.tail = body, 0, tail
+}
+
+func (s *wsInflateSource) Len() int { return len(s.cur) - s.off + len(s.tail) }
+
+func (s *wsInflateSource) advance() bool {
+	if len(s.tail) == 0 {
+		return false
+	}
+	s.cur, s.off, s.tail = s.tail, 0, nil
+	return true
+}
+
+func (s *wsInflateSource) Read(p []byte) (int, error) {
+	if s.off == len(s.cur) && !s.advance() {
+		return 0, io.EOF
+	}
+	n := copy(p, s.cur[s.off:])
+	s.off += n
+	return n, nil
+}
+
+func (s *wsInflateSource) ReadByte() (byte, error) {
+	if s.off < len(s.cur) {
+		b := s.cur[s.off]
+		s.off++
+		return b, nil
+	}
+	if !s.advance() {
+		return 0, io.EOF
+	}
+	return s.ReadByte()
+}
+
+type wsInflater struct {
+	fr  io.ReadCloser
+	src wsInflateSource
+}
+
+var wsInflaterPool = sync.Pool{New: func() any {
+	d := &wsInflater{}
+	d.fr = flate.NewReader(&d.src)
+	return d
+}}
 
 func wsClientOffersDeflate(headers [][2]string) bool {
 	for i := range headers {
@@ -175,10 +225,17 @@ func wsDeflate(dst, payload []byte, level int) []byte {
 	return bytes.TrimSuffix(dst, wsSyncFlushMarker)
 }
 
+func (d *wsInflater) release() {
+	d.src.reset(nil, nil)
+	wsInflaterPool.Put(d)
+}
+
 func wsInflate(compressed []byte, limit int64) ([]byte, uint16) {
-	src := bytes.NewReader(append(compressed, wsInflateTail...))
-	fr := wsInflaterPool.Get().(io.ReadCloser)
-	defer wsInflaterPool.Put(fr)
+	d := wsInflaterPool.Get().(*wsInflater)
+	defer d.release()
+	src := &d.src
+	src.reset(compressed, wsInflateTail)
+	fr := d.fr
 	resetter := fr.(flate.Resetter)
 	if err := resetter.Reset(src, nil); err != nil {
 		return nil, wsStatusInvalidPayload

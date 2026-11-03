@@ -102,7 +102,7 @@ func tlsEpollFixVersions() []uint16 { return []uint16{tls.VersionTLS12, tls.Vers
 
 func TestTLSEpollFixHijackedTLSConnStaysEncrypted(t *testing.T) {
 	for _, inline := range []bool{false, true} {
-		ts := newTestServer(t, testServerOptions{TLS: true, Routes: tlsEpollFixHijackRoutes(nil), Config: func(c *Config) { c.InlineHandlers = inline }})
+		ts := newTestServer(t, testServerOptions{TLS: true, Routes: tlsEpollFixHijackRoutes(nil), Config: func(c *Config) { c.InlineHandlers, c.DisableInlineHandlers = inline, !inline }})
 		for _, v := range tlsEpollFixVersions() {
 			t.Run(tls.VersionName(v), func(t *testing.T) {
 				tc, tap := tlsEpollFixDialTapped(t, ts, v)
@@ -170,7 +170,7 @@ func TestTLSEpollFixHijackedTLS12RejectsInjectedPlaintext(t *testing.T) {
 func TestTLSEpollFixHijackKeepsEarlierPipelinedResponse(t *testing.T) {
 	for _, inline := range []bool{false, true} {
 		for _, useTLS := range []bool{false, true} {
-			ts := newTestServer(t, testServerOptions{TLS: useTLS, Routes: tlsEpollFixHijackRoutes(nil), Config: func(c *Config) { c.InlineHandlers = inline }})
+			ts := newTestServer(t, testServerOptions{TLS: useTLS, Routes: tlsEpollFixHijackRoutes(nil), Config: func(c *Config) { c.InlineHandlers, c.DisableInlineHandlers = inline, !inline }})
 			versions := []uint16{0}
 			if useTLS {
 				versions = tlsEpollFixVersions()

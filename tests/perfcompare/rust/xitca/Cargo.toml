@@ -1,0 +1,21 @@
+[package]
+name = "perf-xitca"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "perf-xitca"
+path = "src/main.rs"
+
+[dependencies]
+xitca-web = { version = "=0.8.3", features = ["http1", "http2", "rustls", "json", "params", "compress-gz", "compress-br", "file", "websocket", "rate-limit", "cookie", "tower-http-compat"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

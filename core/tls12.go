@@ -3,6 +3,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
@@ -23,6 +24,34 @@ import (
 )
 
 func tls12PRF(newHash func() hash.Hash, secret, label, seed []byte, length int) []byte {
+	m := acquireTLSHMAC(newHash, secret)
+	if m == nil {
+		return tls12PRFGeneric(newHash, bytes.Clone(secret), bytes.Clone(label), bytes.Clone(seed), length)
+	}
+	out := make([]byte, 0, length+len(m.sum))
+	var aBuf [sha512.Size]byte
+	m.write(label)
+	m.write(seed)
+	a := m.sumTo(aBuf[:0])
+	for {
+		m.restart()
+		m.write(a)
+		m.write(label)
+		m.write(seed)
+		out = m.sumTo(out)
+		if len(out) >= length {
+			break
+		}
+		m.restart()
+		m.write(a)
+		a = m.sumTo(aBuf[:0])
+	}
+	m.release()
+	clear(aBuf[:])
+	return out[:length]
+}
+
+func tls12PRFGeneric(newHash func() hash.Hash, secret, label, seed []byte, length int) []byte {
 	labelSeed := make([]byte, 0, len(label)+len(seed))
 	labelSeed = append(labelSeed, label...)
 	labelSeed = append(labelSeed, seed...)
@@ -206,6 +235,33 @@ func (c *tls12AEAD) putNonce(n *[tls12NonceLen]byte, seq uint64) []byte {
 	return n[:]
 }
 
+func (c *tls12AEAD) recordPrefixLen() int {
+	if c.isChaCha {
+		return tls12RecordHeaderLen
+	}
+	return tls12RecordHeaderLen + tls12ExplicitNonceLen
+}
+
+func (c *tls12AEAD) sealInPlace(dst []byte, hdr int, typ byte) []byte {
+	start := hdr + c.recordPrefixLen()
+	plaintext := dst[start:]
+	seq := c.seq
+	c.seq++
+	nonce := c.putNonce(&c.nonceBuf, seq)
+	aad := c.putAAD(&c.aadBuf, seq, typ, len(plaintext))
+	fragLen := start - hdr - tls12RecordHeaderLen + len(plaintext) + c.aead.Overhead()
+	dst[hdr] = typ
+	dst[hdr+1] = 0x03
+	dst[hdr+2] = 0x03
+	dst[hdr+3] = byte(fragLen >> 8)
+	dst[hdr+4] = byte(fragLen)
+	if !c.isChaCha {
+		binary.BigEndian.PutUint64(dst[hdr+tls12RecordHeaderLen:start], seq)
+	}
+	sealed := c.aead.Seal(plaintext[:0], nonce, plaintext, aad)
+	return dst[:start+len(sealed)]
+}
+
 func (c *tls12AEAD) seal(typ byte, plaintext []byte) []byte {
 	return c.sealTo(nil, typ, plaintext)
 }
@@ -345,12 +401,20 @@ func buildTLS12Certificate(chain [][]byte) []byte {
 	return tls12Handshake(0x0b, body)
 }
 
-func buildTLS12ServerHelloDone() []byte { return tls12Handshake(0x0e, nil) }
+var tls12ServerHelloDoneMsg = [4]byte{0x0e, 0, 0, 0}
+
+func (entry *CertEntry) tls12CertificateMsg() []byte {
+	if entry.cachedCert12Msg != nil {
+		return entry.cachedCert12Msg
+	}
+	return buildTLS12Certificate(entry.ChainDER)
+}
 
 type tls12State struct {
 	suite         *tls12Suite
 	curve         tls12Curve
 	ecdhePriv     *ecdh.PrivateKey
+	x25519        x25519Keypair
 	clientRandom  [32]byte
 	serverRandom  [32]byte
 	master        []byte
@@ -401,8 +465,37 @@ func selectTLS12Curve(groups []uint16) (tls12Curve, bool) {
 	return 0, false
 }
 
+func (st *tls12State) generateECDHE(pool *x25519KeyPool) ([]byte, error) {
+	if st.curve == curveX25519 {
+		kp, err := pool.Get()
+		if err != nil {
+			return nil, err
+		}
+		st.x25519 = kp
+		return st.x25519.pub[:], nil
+	}
+	priv, pub, err := tls12GenerateECDHE(st.curve)
+	if err != nil {
+		return nil, err
+	}
+	st.ecdhePriv = priv
+	return pub, nil
+}
+
+func (st *tls12State) ecdheShared(peer []byte) ([]byte, bool) {
+	if st.curve != curveX25519 {
+		return tls12ECDHEShared(st.curve, st.ecdhePriv, peer)
+	}
+	shared, ok := st.x25519.sharedSecret(peer)
+	st.x25519.zero()
+	if !ok {
+		return nil, false
+	}
+	return shared[:], true
+}
+
 func (st *tls12State) deriveKeys(peer []byte) bool {
-	shared, ok := tls12ECDHEShared(st.curve, st.ecdhePriv, peer)
+	shared, ok := st.ecdheShared(peer)
 	if !ok {
 		return false
 	}
@@ -448,26 +541,18 @@ func buildTLS12AppDataRecordsParts(dst []byte, w *tls12AEAD, head, body []byte) 
 	if w == nil || total == 0 {
 		return dst
 	}
-	perRecord := tls12RecordHeaderLen + w.aead.Overhead()
-	if !w.isChaCha {
-		perRecord += tls12ExplicitNonceLen
-	}
+	prefix := w.recordPrefixLen()
+	perRecord := prefix + w.aead.Overhead()
 	records := (total + MaxRecordPayload - 1) / MaxRecordPayload
 	dst = ensureTailCap(dst, total+records*perRecord)
-	if len(head) > 0 {
-		scratch := acquirePooledBuf(&tlsScratchPool)
-		if cap(scratch) < MaxRecordPayload {
-			scratch = make([]byte, 0, MaxRecordPayload)
-		}
-		record := scratch[:MaxRecordPayload]
-		for len(head) > 0 {
-			n := copy(record, head)
-			head = head[n:]
-			m := copy(record[n:], body)
-			body = body[m:]
-			dst = w.sealTo(dst, 0x17, record[:n+m])
-		}
-		releasePooledBuf(&tlsScratchPool, scratch, MaxRecordSize)
+	for len(head) > 0 {
+		hdr := len(dst)
+		n := min(len(head), MaxRecordPayload)
+		m := min(len(body), MaxRecordPayload-n)
+		dst = append(dst[:hdr+prefix], head[:n]...)
+		dst = append(dst, body[:m]...)
+		head, body = head[n:], body[m:]
+		dst = w.sealInPlace(dst, hdr, 0x17)
 	}
 	for len(body) > 0 {
 		chunk := body[:min(len(body), MaxRecordPayload)]

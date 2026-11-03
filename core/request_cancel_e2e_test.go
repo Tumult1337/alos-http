@@ -134,7 +134,7 @@ func TestCancelH1ContextFinishesWithHandler(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			captured := make(chan context.Context, 1)
 			ts := newTestServer(t, testServerOptions{
-				Config: func(cfg *Config) { cfg.InlineHandlers = inline },
+				Config: func(cfg *Config) { cfg.InlineHandlers, cfg.DisableInlineHandlers = inline, !inline },
 				Routes: func(r *Router) {
 					r.GET("/ctx", func(req *Request, resp *Response) {
 						captured <- req.Context()
@@ -219,7 +219,7 @@ func TestCancelH2RSTStream(t *testing.T) {
 	if f.typ != H2FrameHeaders {
 		t.Fatalf("stream 3 got frame type %d, want HEADERS", f.typ)
 	}
-	if status := h2RawStatusFromHeaders(t, f.payload); status != 200 {
+	if status := f.status(t); status != 200 {
 		t.Fatalf("stream 3 status %d", status)
 	}
 }

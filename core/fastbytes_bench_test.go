@@ -82,34 +82,6 @@ func TestCRLFEquiv(t *testing.T) {
 	}
 }
 
-var eqData = []byte("GET / HTTP/1.1\r\nHost: x\r\n\r\n")
-var eqSink bool
-
-func TestEqualPrefix16(t *testing.T) {
-	if !equalPrefix16(eqData, &rootPrefix16) {
-		t.Fatal("equalPrefix16 false on matching data")
-	}
-	bad := append([]byte(nil), eqData...)
-	for i := 0; i < 16; i++ {
-		bad[i] ^= 0xFF
-		if equalPrefix16(bad, &rootPrefix16) {
-			t.Fatalf("equalPrefix16 true with corrupted byte %d", i)
-		}
-		bad[i] ^= 0xFF
-	}
-}
-
-func BenchmarkEq16_Std(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		eqSink = bytes.Equal(eqData[:16], rootPrefixBytes)
-	}
-}
-func BenchmarkEq16_Fast(b *testing.B) {
-	for i := 0; i < b.N; i++ {
-		eqSink = equalPrefix16(eqData, &rootPrefix16)
-	}
-}
-
 func BenchmarkCRLF_Std_Small(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		crlfSink = indexCRLFCRLFStd(hbSmall)

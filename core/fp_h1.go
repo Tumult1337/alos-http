@@ -78,9 +78,12 @@ func colonAfterWhitespace(rest []byte) int {
 	return -1
 }
 
+const upstreamMaxInterimResponses = 5
+
 type h1Parser struct {
 	phase        int8
 	status       int
+	interim      int
 	keepAlive    bool
 	noBody       bool
 	stream       bool
@@ -109,12 +112,16 @@ func (p *h1Parser) reset() {
 	p.stream = false
 	p.remaining = 0
 	p.trailerBytes = 0
+	p.interim = 0
 	p.hdr = p.hdr[:0]
 	p.strs = p.strs[:0]
 	p.receiptDateBuf = p.receiptDateBuf[:0]
 	// The body buffer is kept and refilled. completeH1 hands ownership away
 	// only for callers that read it after the exchange finishes.
 	p.body = p.body[:0]
+	if cap(p.body) > retainedBufferKeep {
+		p.body = nil
+	}
 }
 
 func (p *h1Parser) emit(c *backendConn, data []byte) bool {
@@ -143,10 +150,14 @@ func (h *h1Proto) attach(c *backendConn) error {
 		l.serBuf = appendH1Request(l.serBuf[:0], c.cur.req)
 		out = l.serBuf
 	}
-	if err := c.transport.wrapOut(c, out); err != nil {
-		return err
+	if _, plain := c.transport.(*plainTransport); plain && c.wbuf.length() == 0 {
+		l.sendDirect(c, out)
+	} else {
+		if err := c.transport.wrapOut(c, out); err != nil {
+			return err
+		}
+		l.flushWrites(c)
 	}
-	l.flushWrites(c)
 	if ex := c.cur; ex != nil && ex.readTimeoutNano > 0 {
 		ex.deadline = l.nowNano() + ex.readTimeoutNano
 	}
@@ -247,7 +258,7 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				return false, err
 			}
 			c.rbuf.consume(idx + 4)
-			if c.cur.req.ensureResponseDate && (p.status == 101 || p.status >= 200) {
+			if c.cur.req.ensureResponseDate && p.wantsReceiptDate() {
 				p.addReceiptDate()
 			}
 			if p.status == 101 {
@@ -257,6 +268,9 @@ func (p *h1Parser) advance(c *backendConn) (bool, error) {
 				return false, nil
 			}
 			if p.status >= 100 && p.status < 200 {
+				if p.interim++; p.interim > upstreamMaxInterimResponses {
+					return false, errFPBadResponse
+				}
 				p.hdr = p.hdr[:0]
 				continue
 			}
@@ -438,7 +452,7 @@ func (p *h1Parser) parseHeaderBlock(block []byte, method string) (bool, int64, e
 		return false, -1, errFPBadResponse
 	}
 	d0, d1, d2 := statusLine[9], statusLine[10], statusLine[11]
-	if d0 < '0' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9' {
+	if d0 < '1' || d0 > '9' || d1 < '0' || d1 > '9' || d2 < '0' || d2 > '9' {
 		return false, -1, errFPBadResponse
 	}
 	p.status = int(d0-'0')*100 + int(d1-'0')*10 + int(d2-'0')

@@ -627,7 +627,6 @@ type HpackDecoder struct {
 	memoHeaders      [][2]string
 	memoMeta         hpackRequestMeta
 	memoValid        bool
-	memoRoot         bool
 
 	allowExtendedConnect bool
 	maxHeaderListSize    int
@@ -1433,45 +1432,35 @@ func (d *HpackDecoder) DecodeRequestMeta(data []byte) (hpackRequestMeta, error) 
 	return meta, nil
 }
 
-// MemoizedRootRequest reports whether data is byte-identical to the last
-// header block that decoded to a GET for the root path without touching the
-// dynamic table, so it can be answered without decoding again.
-func (d *HpackDecoder) MemoizedRootRequest(data []byte) bool {
-	return d.memoValid && d.memoRoot && bytes.Equal(data, d.memoBlock)
-}
-
-// DecodeRequest decodes one header block in a single pass, returning the
-// headers, the request metadata, and whether the block was a GET for the root
-// path. A root block that left the dynamic table untouched is memoized so the
-// next identical block skips decoding.
 const hpackMemoMaxBlock = 512
 
-func (d *HpackDecoder) DecodeRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, bool, error) {
+// DecodeRequest decodes one header block in a single pass and returns the
+// headers and the request metadata. A block that left the dynamic table
+// untouched is memoized so the next identical block skips decoding.
+func (d *HpackDecoder) DecodeRequest(headers [][2]string, data []byte) ([][2]string, hpackRequestMeta, error) {
 	if d.memoValid && bytes.Equal(data, d.memoBlock) {
 		headers = append(headers[:0], d.memoHeaders...)
-		return headers, d.memoMeta, d.memoRoot, nil
+		return headers, d.memoMeta, nil
 	}
 	gen := d.tableGen
 	refStart := d.dynRefBytes
 	headers, meta, err := d.DecodeIntoRequest(headers, data)
 	if err != nil {
-		return headers, meta, false, err
+		return headers, meta, err
 	}
 	if d.fieldListTooLarge(len(data), headers, d.dynRefBytes-refStart) {
-		return headers, meta, false, errH2HeaderListTooLarge
+		return headers, meta, errH2HeaderListTooLarge
 	}
-	isRoot := meta.method == "GET" && meta.path == "/"
 	if d.tableGen == gen && len(data) <= hpackMemoMaxBlock {
-		d.storeMemo(data, meta, isRoot, headers)
+		d.storeMemo(data, meta, headers)
 	}
-	return headers, meta, isRoot, nil
+	return headers, meta, nil
 }
 
-func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, isRoot bool, headers [][2]string) {
+func (d *HpackDecoder) storeMemo(block []byte, meta hpackRequestMeta, headers [][2]string) {
 	d.memoBlock = append(d.memoBlock[:0], block...)
 	d.memoHeaders = append(d.memoHeaders[:0], headers...)
 	d.memoMeta = meta
-	d.memoRoot = isRoot
 	d.memoValid = true
 }
 

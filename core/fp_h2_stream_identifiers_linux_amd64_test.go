@@ -179,7 +179,7 @@ func TestFPH2PendingContinuationRejectsWrongSequence(t *testing.T) {
 func TestFPH2ActiveDataBodyLimitRetained(t *testing.T) {
 	conn := streamIdentifierConn(3)
 	conn.be.cfg.MaxResponseBody = 3
-	active := &h2Stream{id: 1, body: []byte("ab")}
+	active := &h2Stream{id: 1, body: []byte("ab"), gotHeaders: true}
 	conn.h2.streams[1] = active
 	if err := conn.be.h2proto.onData(conn, h2Frame(h2FrameData, 0, 1, []byte("cd"))); err != errFPBodyTooLarge || string(active.body) != "ab" || len(conn.wbuf.unread()) != 0 {
 		t.Fatalf("body limit error=%v body=%q credit=%x", err, active.body, conn.wbuf.unread())

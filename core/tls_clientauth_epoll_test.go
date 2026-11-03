@@ -326,9 +326,6 @@ func TestMTLSRootHandlerSeesPeerCertificate(t *testing.T) {
 	for name, mutate := range configs {
 		t.Run(name, func(t *testing.T) {
 			ts := newTestServer(t, testServerOptions{TLS: true, Config: mutate, Routes: func(r *Router) { r.GET("/", whoami) }})
-			if ts.srv.plainRootFast.Load() != nil || ts.srv.h2RootFast.Load() != nil {
-				t.Fatal("root response memoized although it can depend on the client certificate")
-			}
 			for _, alpn := range []string{"http/1.1", "h2"} {
 				cfg := ts.tlsConfig(alpn)
 				cfg.ServerName = mtlsDomain
@@ -346,9 +343,5 @@ func TestMTLSRootHandlerSeesPeerCertificate(t *testing.T) {
 				}
 			}
 		})
-	}
-	ts := newTestServer(t, testServerOptions{TLS: true, Routes: func(r *Router) { r.GET("/", whoami) }})
-	if ts.srv.plainRootFast.Load() == nil {
-		t.Fatal("root response no longer memoized without client auth")
 	}
 }

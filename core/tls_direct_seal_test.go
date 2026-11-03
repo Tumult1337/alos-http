@@ -100,25 +100,44 @@ func directSealConn(t *testing.T, suite directSealSuite, method string, size int
 	return c
 }
 
+const sameDateAttempts = 3
+
+func buildWithinOneDate(build func() (got, want []byte)) (got, want []byte) {
+	for range sameDateAttempts {
+		date := currentHTTPDate()
+		got, want = build()
+		if bytes.Equal(got, want) || currentHTTPDate() == date {
+			return got, want
+		}
+	}
+	return got, want
+}
+
 func TestTLSDirectSealMatchesFrozenBuilders(t *testing.T) {
 	for _, suite := range directSealSuites(t) {
 		for _, method := range []string{"GET", "HEAD"} {
 			for _, size := range directSealSizes {
 				for _, text := range []bool{false, true} {
-					c := directSealConn(t, suite, method, size, text)
-					c.writeBuf = []byte("prefix")
-					c.h1WriteResponse(true)
-					plain := appendPlainResponseMode(&c.resp, nil, true, true)
-					if want := suite.want(t, []byte("prefix"), plain); !bytes.Equal(c.writeBuf, want) {
-						t.Fatalf("%s %s size=%d text=%v: sealed %d bytes, frozen builder %d", suite.name, method, size, text, len(c.writeBuf), len(want))
+					got, want := buildWithinOneDate(func() ([]byte, []byte) {
+						c := directSealConn(t, suite, method, size, text)
+						plain := appendPlainResponseMode(&directSealConn(t, suite, method, size, text).resp, nil, true, true)
+						c.writeBuf = []byte("prefix")
+						c.h1WriteResponse(true)
+						return c.writeBuf, suite.want(t, []byte("prefix"), plain)
+					})
+					if !bytes.Equal(got, want) {
+						t.Fatalf("%s %s size=%d text=%v: sealed %d bytes, frozen builder %d", suite.name, method, size, text, len(got), len(want))
 					}
 
-					pipelined := directSealConn(t, suite, method, size, text)
-					out := pipelined.h1AppendResponse([]byte("PENDING"), false)
-					pipelined.h1OutEnd(out)
-					plain = appendPlainResponseMode(&pipelined.resp, []byte("PENDING"), false, true)
-					if want := suite.want(t, nil, plain); !bytes.Equal(pipelined.writeBuf, want) {
-						t.Fatalf("%s %s size=%d text=%v with pending output: sealed %d bytes, frozen builder %d", suite.name, method, size, text, len(pipelined.writeBuf), len(want))
+					got, want = buildWithinOneDate(func() ([]byte, []byte) {
+						pipelined := directSealConn(t, suite, method, size, text)
+						plain := appendPlainResponseMode(&directSealConn(t, suite, method, size, text).resp, []byte("PENDING"), false, true)
+						out := pipelined.h1AppendResponse([]byte("PENDING"), false)
+						pipelined.h1OutEnd(out)
+						return pipelined.writeBuf, suite.want(t, nil, plain)
+					})
+					if !bytes.Equal(got, want) {
+						t.Fatalf("%s %s size=%d text=%v with pending output: sealed %d bytes, frozen builder %d", suite.name, method, size, text, len(got), len(want))
 					}
 				}
 			}

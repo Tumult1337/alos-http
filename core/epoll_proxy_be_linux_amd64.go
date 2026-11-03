@@ -63,6 +63,9 @@ func (w *epollWorker) backendEvent(fd int, evs uint32) {
 // resumeRelayIfDrained re-arms a backend read side that was disarmed because
 // this client could not keep up with a relayed response.
 func (w *epollWorker) resumeRelayIfDrained(c *epollConn) {
+	if c.ws != nil && c.tunnelPaused {
+		w.wsResumeIfDrained(c)
+	}
 	bc := c.pausedBackend
 	if bc == nil {
 		return
@@ -193,10 +196,13 @@ func (w *epollWorker) shouldStreamResponse(c *backendConn, contentLen int64) boo
 	// A cacheable response that the cache would accept is buffered so it can
 	// actually be stored. Without this a CDN silently stops caching everything
 	// above the buffering threshold, which is the opposite of what it wants.
-	if px.mayCache && contentLen <= px.cache.maxCacheableSize() {
+	if contentLen <= proxyBufferedResponseLimit {
 		return false
 	}
-	return contentLen > proxyBufferedResponseLimit
+	if px.mayCache && contentLen <= px.cache.maxCacheableSize() {
+		return !px.reserveResponseBuffer(contentLen)
+	}
+	return true
 }
 
 // beginStreamResponse emits the response head and switches the exchange to
@@ -260,12 +266,15 @@ func (w *epollWorker) streamResponseChunk(c *backendConn, data []byte) {
 		w.be.closeConn(c, errFPClientClosed)
 		return
 	}
-	if px.streamChunked {
+	switch {
+	case px.streamChunked && !cc.tls:
+		cc.writeBuf = appendChunkFrame(cc.writeBuf, data)
+	case px.streamChunked:
 		scratch := w.beScratch[:0]
 		scratch = appendChunkFrame(scratch, data)
 		w.beScratch = scratch[:0]
 		w.clientAppend(cc, scratch)
-	} else {
+	default:
 		w.clientAppend(cc, data)
 	}
 	w.flush(cc)

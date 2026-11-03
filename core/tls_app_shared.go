@@ -33,6 +33,9 @@ func ensureTailCap(dst []byte, need int) []byte {
 		return dst
 	}
 	want := len(dst) + need
+	if want > epollIOBufPoolMaxCap {
+		return growIOBuf(dst, need)
+	}
 	newCap := cap(dst) * 2
 	if newCap < want {
 		newCap = want
@@ -42,10 +45,23 @@ func ensureTailCap(dst []byte, need int) []byte {
 	return grown
 }
 
+func sealTLSInnerInPlace(dst []byte, writer *TrafficAEAD, hdr int) []byte {
+	start := hdr + tlsRecordHeaderLen
+	ciphertextLen := len(dst) - start + writer.Overhead()
+	dst[hdr] = 0x17
+	dst[hdr+1] = 0x03
+	dst[hdr+2] = 0x03
+	dst[hdr+3] = byte(ciphertextLen >> 8)
+	dst[hdr+4] = byte(ciphertextLen)
+	sealed := writer.Encrypt(dst[start:])
+	return dst[:start+len(sealed)]
+}
+
 func appendTLSInnerRecord(dst []byte, writer *TrafficAEAD, innerPayload []byte) []byte {
-	ciphertextLen := len(innerPayload) + writer.Overhead()
-	dst = append(dst, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
-	return writer.EncryptAppend(dst, innerPayload)
+	hdr := len(dst)
+	dst = ensureTailCap(dst, tlsRecordHeaderLen+len(innerPayload)+writer.Overhead())
+	dst = append(dst[:hdr+tlsRecordHeaderLen], innerPayload...)
+	return sealTLSInnerInPlace(dst, writer, hdr)
 }
 
 func buildTLSAppDataRecords(dst []byte, writer *TrafficAEAD, payload []byte) []byte {
@@ -67,20 +83,68 @@ func buildTLSInnerRecordsParts(dst []byte, writer *TrafficAEAD, innerType byte, 
 	}
 	records := (total + maxContent - 1) / maxContent
 	dst = ensureTailCap(dst, total+records*(tlsRecordHeaderLen+1+writer.Overhead()))
-	scratch := acquirePooledBuf(&tlsScratchPool)
-	if cap(scratch) < MaxRecordPayload {
-		scratch = make([]byte, 0, MaxRecordPayload)
-	}
-	record := scratch[:MaxRecordPayload]
+	return appendTLSCopiedRecords(dst, writer, innerType, head, body)
+}
+
+func appendTLSCopiedRecords(dst []byte, writer *TrafficAEAD, innerType byte, head, body []byte) []byte {
+	const maxContent = MaxRecordPayload - 1
 	for len(head)+len(body) > 0 {
-		n := copy(record[:maxContent], head)
-		head = head[n:]
-		m := copy(record[n:maxContent], body)
-		body = body[m:]
-		record[n+m] = innerType
-		dst = appendTLSInnerRecord(dst, writer, record[:n+m+1])
+		hdr := len(dst)
+		n := min(len(head), maxContent)
+		m := min(len(body), maxContent-n)
+		dst = append(dst[:hdr+tlsRecordHeaderLen], head[:n]...)
+		dst = append(dst, body[:m]...)
+		dst = append(dst, innerType)
+		head, body = head[n:], body[m:]
+		dst = sealTLSInnerInPlace(dst, writer, hdr)
 	}
-	releasePooledBuf(&tlsScratchPool, scratch, MaxRecordSize)
+	return dst
+}
+
+func buildTLSAppDataRecordsMutableBody(dst []byte, writer *TrafficAEAD, head, body []byte) []byte {
+	if writer == nil {
+		return dst
+	}
+	const maxContent = MaxRecordPayload - 1
+	total := len(head) + len(body)
+	if total == 0 {
+		return dst
+	}
+	records := (total + maxContent - 1) / maxContent
+	dst = ensureTailCap(dst, total+records*(tlsRecordHeaderLen+1+writer.Overhead()))
+	if len(head) > 0 {
+		lead := min(len(body), (maxContent-len(head)%maxContent)%maxContent)
+		dst = appendTLSCopiedRecords(dst, writer, tlsRecAppData, head, body[:lead])
+		body = body[lead:]
+	}
+	for len(body) > 0 {
+		n := min(len(body), maxContent)
+		dst = sealTLSRecordAround(dst, writer, nil, body, 0, n)
+		body = body[n:]
+	}
+	return dst
+}
+
+const tlsRecordAroundMaxPrefix = 16
+
+func sealTLSRecordAround(dst []byte, writer *TrafficAEAD, prefix, body []byte, off, n int) []byte {
+	dst = ensureTailCap(dst, tlsRecordHeaderLen+len(prefix)+n+1+writer.Overhead())
+	start := off - len(prefix)
+	if start < 0 || len(prefix) > tlsRecordAroundMaxPrefix || off+n >= cap(body) {
+		return appendTLSCopiedRecords(dst, writer, tlsRecAppData, prefix, body[off:off+n])
+	}
+	inner := body[start : off+n+1]
+	last := len(inner) - 1
+	var saved [tlsRecordAroundMaxPrefix]byte
+	copy(saved[:], inner[:len(prefix)])
+	savedLast := inner[last]
+	copy(inner, prefix)
+	inner[last] = 0x17
+	ciphertextLen := len(inner) + writer.Overhead()
+	dst = append(dst, 0x17, 0x03, 0x03, byte(ciphertextLen>>8), byte(ciphertextLen))
+	dst = writer.EncryptAppend(dst, inner)
+	copy(inner, saved[:len(prefix)])
+	inner[last] = savedLast
 	return dst
 }
 

@@ -14,7 +14,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
+
+	"github.com/guno1928/turbo"
 )
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -86,14 +87,30 @@ const (
 	wsOpPong         byte = 0xA
 )
 
+const wsStatusGoingAway uint16 = 1001
 const wsStatusProtocolError uint16 = 1002
+const wsStatusNoStatus uint16 = 1005
+const wsStatusPolicyViolation uint16 = 1008
+const wsStatusAbnormal uint16 = 1006
 const wsStatusInvalidPayload uint16 = 1007
 const wsStatusMessageTooBig uint16 = 1009
+const wsStatusInternalError uint16 = 1011
+const wsStatusTryAgainLater uint16 = 1013
 const wsMaxFrameHeaderLen = 10
+const wsMaxControlPayload = 125
 const wsDefaultReadTimeout = 120 * time.Second
 const wsDefaultWriteTimeout = 30 * time.Second
 const wsDefaultMaxMessageSize = 4 * 1024 * 1024
 const wsFrameReadChunk = 64 << 10
+const wsReadBufSize = 4 << 10
+const wsDeadlineSlackShift = 3
+const wsPingMinInterval = int64(100 * time.Millisecond)
+const wsPingWindow = int64(10 * time.Second)
+const wsPingWindowMax = 100
+
+var errWSEventDriven = &staticError{"websocket: operation unavailable on an event-driven connection"}
+var errWSWriteQueueFull = &staticError{"websocket: write queue full"}
+var errWSBudgetExhausted = &staticError{"websocket: message buffer budget exhausted"}
 
 // WSConn is a server-side WebSocket connection (RFC 6455). Obtain one with ServeWebSocket (or UpgradeWebSocket) inside a route handler, then exchange data with ReadMessage and WriteMessage (or WriteText / WriteBinary).
 type WSConn struct {
@@ -107,6 +124,19 @@ type WSConn struct {
 	MaxMessageSize   int
 	subprotocol      string
 	compressionLevel int
+
+	closeCode     atomic.Uint32
+	rawWrites     atomic.Bool
+	ev            *wsLoopConn
+	rbuf          []byte
+	rpos          int
+	rend          int
+	readArmedAt   atomic.Int64
+	writeArmedAt  int64
+	writeDeadline bool
+	drain         wsDrainConn
+	server        *Server
+	bodyReserved  atomic.Int64
 }
 
 type WSUpgradeOptions struct {
@@ -114,6 +144,47 @@ type WSUpgradeOptions struct {
 	Compression      bool
 	CompressionLevel int
 	MaxMessageSize   int64
+}
+
+type WSEventHandler struct {
+	OnMessage func(ws *WSConn, opcode byte, msg []byte)
+	OnClose   func(ws *WSConn, code uint16)
+}
+
+type wsDrainConn struct {
+	net.Conn
+	ws *WSConn
+}
+
+func (d *wsDrainConn) Read(p []byte) (int, error) {
+	ws := d.ws
+	if ws.rpos < ws.rend {
+		n := copy(p, ws.rbuf[ws.rpos:ws.rend])
+		ws.rpos += n
+		return n, nil
+	}
+	return d.Conn.Read(p)
+}
+
+func (d *wsDrainConn) Write(p []byte) (int, error) {
+	d.ws.rawWrites.Store(true)
+	return d.Conn.Write(p)
+}
+
+func (d *wsDrainConn) SetWriteDeadline(t time.Time) error {
+	d.ws.rawWrites.Store(true)
+	return d.Conn.SetWriteDeadline(t)
+}
+
+func (d *wsDrainConn) SetDeadline(t time.Time) error {
+	d.ws.rawWrites.Store(true)
+	d.ws.readArmedAt.Store(0)
+	return d.Conn.SetDeadline(t)
+}
+
+func (d *wsDrainConn) SetReadDeadline(t time.Time) error {
+	d.ws.readArmedAt.Store(0)
+	return d.Conn.SetReadDeadline(t)
 }
 
 func wsAcceptKey(clientKey string) string {
@@ -140,30 +211,8 @@ func UpgradeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions) *
 	if req.h2WebSocket {
 		return upgradeH2WebSocket(req, resp, opts)
 	}
-	upgradeHdr := req.Header("upgrade")
-	if !EqualFoldASCII(upgradeHdr, "websocket") {
-		resp.Status(400).String("not a websocket request")
-		return nil
-	}
-
-	wsKey := req.Header("sec-websocket-key")
-	if wsKey == "" {
-		resp.Status(400).String("missing Sec-WebSocket-Key")
-		return nil
-	}
-	decodedKey, err := base64.StdEncoding.DecodeString(wsKey)
-	if err != nil || len(decodedKey) != 16 {
-		resp.Status(400).String("invalid Sec-WebSocket-Key")
-		return nil
-	}
-
-	connHdr := req.Header("connection")
-	if !containsTokenFold(connHdr, "upgrade") {
-		resp.Status(400).String("missing Connection: Upgrade")
-		return nil
-	}
-
-	if !wsVersionAndOriginAccepted(req, resp) {
+	wsKey, ok := wsCheckH1Upgrade(req, resp)
+	if !ok {
 		return nil
 	}
 
@@ -176,19 +225,10 @@ func UpgradeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions) *
 	conn.SetReadDeadline(time.Time{})
 	conn.SetWriteDeadline(time.Time{})
 
-	acceptKey := wsAcceptKey(wsKey)
 	ws := newNegotiatedWSConn(req, opts)
 
 	var buf [256]byte
-	b := buf[:0]
-	b = append(b, "HTTP/1.1 101 Switching Protocols\r\n"...)
-	b = append(b, "Upgrade: websocket\r\n"...)
-	b = append(b, "Connection: Upgrade\r\n"...)
-	b = append(b, "Sec-WebSocket-Accept: "...)
-	b = append(b, acceptKey...)
-	b = append(b, "\r\n"...)
-	b = ws.appendNegotiatedHeaders(b)
-	b = append(b, "\r\n"...)
+	b := ws.appendSwitchingProtocols(buf[:0], wsAcceptKey(wsKey))
 
 	if err := writeFull(conn, b); err != nil {
 		conn.Close()
@@ -199,8 +239,54 @@ func UpgradeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions) *
 		resp.SetStreamer(sw)
 	}
 
-	ws.conn = conn
+	ws.attachConn(conn)
 	return ws
+}
+
+func wsCheckH1Upgrade(req *Request, resp *Response) (string, bool) {
+	upgradeHdr := req.Header("upgrade")
+	if !EqualFoldASCII(upgradeHdr, "websocket") {
+		resp.Status(400).String("not a websocket request")
+		return "", false
+	}
+
+	wsKey := req.Header("sec-websocket-key")
+	if wsKey == "" {
+		resp.Status(400).String("missing Sec-WebSocket-Key")
+		return "", false
+	}
+	decodedKey, err := base64.StdEncoding.DecodeString(wsKey)
+	if err != nil || len(decodedKey) != 16 {
+		resp.Status(400).String("invalid Sec-WebSocket-Key")
+		return "", false
+	}
+
+	connHdr := req.Header("connection")
+	if !containsTokenFold(connHdr, "upgrade") {
+		resp.Status(400).String("missing Connection: Upgrade")
+		return "", false
+	}
+
+	if !wsVersionAndOriginAccepted(req, resp) {
+		return "", false
+	}
+	return wsKey, true
+}
+
+func (ws *WSConn) appendSwitchingProtocols(b []byte, acceptKey string) []byte {
+	b = append(b, "HTTP/1.1 101 Switching Protocols\r\n"...)
+	b = append(b, "Upgrade: websocket\r\n"...)
+	b = append(b, "Connection: Upgrade\r\n"...)
+	b = append(b, "Sec-WebSocket-Accept: "...)
+	b = append(b, acceptKey...)
+	b = append(b, "\r\n"...)
+	b = ws.appendNegotiatedHeaders(b)
+	return append(b, "\r\n"...)
+}
+
+func (ws *WSConn) attachConn(conn net.Conn) {
+	ws.conn = conn
+	ws.drain = wsDrainConn{Conn: conn, ws: ws}
 }
 
 func wsVersionAndOriginAccepted(req *Request, resp *Response) bool {
@@ -241,7 +327,10 @@ func upgradeH2WebSocket(req *Request, resp *Response, opts WSUpgradeOptions) *WS
 	resp.SetStreamer(sw)
 	conn := newH2StreamConn(body, sw, req.RemoteAddr)
 	req.h2Tunnel = conn
-	ws.conn = conn
+	if stream := req.h2Stream; stream != nil {
+		stream.req.h2Tunnel = conn
+	}
+	ws.attachConn(conn)
 	return ws
 }
 
@@ -251,6 +340,7 @@ func newNegotiatedWSConn(req *Request, opts WSUpgradeOptions) *WSConn {
 		writeTimeout:   wsDefaultWriteTimeout,
 		MaxMessageSize: wsDefaultMaxMessageSize,
 		subprotocol:    wsSelectSubprotocol(req.Headers, opts.Subprotocols),
+		server:         req.server,
 	}
 	if req.server != nil {
 		ws.readTimeout = optionalDuration(req.server.config.WSReadTimeout, wsDefaultReadTimeout)
@@ -289,6 +379,7 @@ func (ws *WSConn) appendNegotiatedHeaders(b []byte) []byte {
 func (ws *WSConn) Subprotocol() string { return ws.subprotocol }
 
 // ServeWebSocket upgrades the request and runs fn on a new goroutine, returning immediately so the dispatching worker is released; the connection is closed when fn returns. It reports false if the upgrade failed (an error response has already been written). This is the safe way to host a WebSocket — see the UpgradeWebSocket note about handlers that block on the socket.
+// An HTTP/2 (RFC 8441) session counts against MaxConns and keeps its per-IP slot until fn returns; when MaxConns is reached the request gets 503.
 //
 // Example: ServeWebSocket(req, resp, func(ws *WSConn) { for { _, msg, err := ws.ReadMessage(); if err != nil { return }; ws.WriteText(string(msg)) } })
 // Example: if !ServeWebSocket(req, resp, handleWS) { return }
@@ -297,150 +388,365 @@ func ServeWebSocket(req *Request, resp *Response, fn func(*WSConn)) bool {
 }
 
 func ServeWebSocketWith(req *Request, resp *Response, opts WSUpgradeOptions, fn func(*WSConn)) bool {
+	srv := req.server
+	tracked := req.h2WebSocket && srv != nil
+	if tracked && !srv.tryTrackConn() {
+		resp.Status(503).String("Service Unavailable")
+		return false
+	}
+	handedOff := false
+	defer func() {
+		if tracked && !handedOff {
+			srv.releaseTrackedConn()
+		}
+	}()
 	ws := UpgradeWebSocketWith(req, resp, opts)
 	if ws == nil {
 		return false
 	}
-	srv := req.server
+	tunnel, _ := ws.conn.(*h2StreamConn)
+	tunnel.retainSlots()
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				srv.reportPanic(nil, r)
 			}
 			ws.Close()
+			tunnel.releaseSlots()
+			if tracked {
+				srv.releaseTrackedConn()
+			}
 		}()
 		fn(ws)
 	}()
+	handedOff = true
 	return true
 }
 
+func ServeWebSocketEvents(req *Request, resp *Response, opts WSUpgradeOptions, h WSEventHandler) bool {
+	if req.connTakenOver || req.hijacked {
+		resp.Status(500).String("connection already taken over")
+		return false
+	}
+	if c := epollWSEventTarget(req); c != nil {
+		wsKey, ok := wsCheckH1Upgrade(req, resp)
+		if !ok {
+			return false
+		}
+		ws := newNegotiatedWSConn(req, opts)
+		c.prepareWSEvents(req, ws, h, wsAcceptKey(wsKey))
+		return true
+	}
+	srv := req.server
+	return ServeWebSocketWith(req, resp, opts, func(ws *WSConn) { serveWSEventsBlocking(srv, ws, h) })
+}
+
+func wsDeliverMessage(srv *Server, ws *WSConn, h *WSEventHandler, op byte, msg []byte) {
+	defer func() {
+		if r := recover(); r != nil {
+			srv.reportPanic(nil, r)
+			ws.closeWithStatus(wsStatusInternalError)
+		}
+	}()
+	h.OnMessage(ws, op, msg)
+}
+
+func wsDeliverClose(srv *Server, ws *WSConn, h *WSEventHandler) {
+	if h.OnClose == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			srv.reportPanic(nil, r)
+		}
+	}()
+	code := uint16(ws.closeCode.Load())
+	if code == 0 {
+		code = wsStatusAbnormal
+	}
+	h.OnClose(ws, code)
+}
+
+func serveWSEventsBlocking(srv *Server, ws *WSConn, h WSEventHandler) {
+	if tracked := trackedConnOf(ws.conn); tracked != nil && tracked.retainSlots() {
+		defer tracked.releaseHold()
+	}
+	var buf []byte
+	for {
+		op, msg, err := ws.readMessageReserved(buf[:0])
+		if err != nil {
+			ws.releaseMessageBytes()
+			ws.noteCloseCode(wsStatusAbnormal)
+			ws.Close()
+			wsDeliverClose(srv, ws, &h)
+			return
+		}
+		if cap(msg) <= wsFrameReadChunk {
+			buf = msg
+		}
+		if h.OnMessage != nil {
+			wsDeliverMessage(srv, ws, &h, op, msg)
+		}
+		ws.releaseMessageBytes()
+	}
+}
+
+func (ws *WSConn) reserveMessageBytes(n int) bool {
+	if ws.server.tryReserveConnBodyBytes(&ws.bodyReserved, n) {
+		return true
+	}
+	ws.closeWithStatus(wsStatusTryAgainLater)
+	return false
+}
+
+func (ws *WSConn) releaseMessageBytes() {
+	ws.server.releaseConnBodyBytes(&ws.bodyReserved, ws.bodyReserved.Load())
+}
+
 // NetConn returns the underlying hijacked connection, e.g. to set per-write deadlines so a dead peer cannot block WriteMessage forever.
-func (ws *WSConn) NetConn() net.Conn { return ws.conn }
+func (ws *WSConn) NetConn() net.Conn {
+	if ws.conn == nil {
+		return nil
+	}
+	if ws.drain.ws == nil {
+		ws.drain = wsDrainConn{Conn: ws.conn, ws: ws}
+	}
+	return &ws.drain
+}
 
 // ReadMessage reads and reassembles the next WebSocket message, returning its opcode (0x1 text, 0x2 binary), payload, and any error. Close frames are answered and reported as io.EOF, and ping frames are answered with a pong automatically.
 func (ws *WSConn) ReadMessage() (byte, []byte, error) {
+	return ws.ReadMessageInto(nil)
+}
+
+func (ws *WSConn) ReadMessageInto(dst []byte) (byte, []byte, error) {
+	if ws.ev != nil {
+		return 0, nil, errWSEventDriven
+	}
+	op, msg, err := ws.readMessageReserved(dst)
+	ws.releaseMessageBytes()
+	return op, msg, err
+}
+
+func (ws *WSConn) readMessageReserved(dst []byte) (byte, []byte, error) {
 	var msgOpcode byte
-	var assembled []byte
+	assembled := dst[:0]
 	inMessage, msgCompressed := false, false
 
 	for {
-		if ws.readTimeout > 0 {
-			ws.conn.SetReadDeadline(time.Now().Add(ws.readTimeout))
+		ws.armReadDeadline()
+		if err := ws.fill(2); err != nil {
+			return 0, nil, err
 		}
-		var header [2]byte
-		if _, err := io.ReadFull(ws.conn, header[:]); err != nil {
+		b0, b1 := ws.rbuf[ws.rpos], ws.rbuf[ws.rpos+1]
+		ws.rpos += 2
+
+		fin := b0&0x80 != 0
+		opcode := b0 & 0x0F
+		if err := ws.vetFrameHead(b0, b1, inMessage); err != nil {
 			return 0, nil, err
 		}
 
-		fin := header[0]&0x80 != 0
-		opcode := header[0] & 0x0F
-		masked := header[1]&0x80 != 0
-
-		if rsv := header[0] & wsRSVMask; rsv != 0 &&
-			(rsv != wsRSV1 || ws.compressionLevel == 0 || opcode == wsOpContinuation || opcode >= wsOpClose) {
-			ws.Close()
-			return 0, nil, ErrWebSocketProtocol
-		}
-
-		if !masked {
-			ws.Close()
-			return 0, nil, ErrWebSocketProtocol
-		}
-
 		if opcode >= wsOpClose {
-			if !fin || header[1]&0x7F > 125 || opcode > wsOpPong {
-				ws.closeWithStatus(wsStatusProtocolError)
-				return 0, nil, ErrWebSocketProtocol
-			}
-			payload, err := ws.readFramePayload(nil, header[1], masked)
+			payload, err := ws.readFramePayload(nil, b1, false)
 			if err != nil {
 				return 0, nil, err
 			}
 			if opcode == wsOpClose {
-				if len(payload) == 1 {
-					ws.closeWithStatus(wsStatusProtocolError)
-					return 0, nil, ErrWebSocketProtocol
-				}
-				if len(payload) >= 2 {
-					code := binary.BigEndian.Uint16(payload[:2])
-					if !wsValidCloseCode(code) {
-						ws.closeWithStatus(wsStatusProtocolError)
-						return 0, nil, ErrWebSocketProtocol
-					}
-					if !utf8.Valid(payload[2:]) {
-						ws.closeWithStatus(wsStatusInvalidPayload)
-						return 0, nil, ErrWebSocketProtocol
-					}
-					ws.closeWithPayload(payload[:2])
-				} else {
-					ws.Close()
+				if err := ws.handleCloseFrame(payload); err != nil {
+					return 0, nil, err
 				}
 				return opcode, payload, io.EOF
 			}
 			if opcode == wsOpPing {
-				now := time.Now().UnixNano()
-				last := ws.lastPing.Swap(now)
-				if last != 0 && now-last < int64(100*time.Millisecond) {
-					ws.closeWithStatus(wsStatusProtocolError)
-					return 0, nil, ErrWebSocketProtocol
+				if err := ws.handlePing(payload); err != nil {
+					return 0, nil, err
 				}
-				if last == 0 || now-last > int64(10*time.Second) {
-					ws.pingCount.Store(1)
-				} else if ws.pingCount.Add(1) > 100 {
-					ws.closeWithStatus(wsStatusProtocolError)
-					return 0, nil, ErrWebSocketProtocol
-				}
-				ws.WriteMessage(wsOpPong, payload)
 			}
 			continue
 		}
 
-		if opcode > wsOpBinary {
-			ws.closeWithStatus(wsStatusProtocolError)
-			return 0, nil, ErrWebSocketProtocol
-		}
-
 		if !inMessage {
-			if opcode == wsOpContinuation {
-				ws.Close()
-				return 0, nil, ErrWebSocketProtocol
-			}
 			msgOpcode = opcode
-			msgCompressed = header[0]&wsRSV1 != 0
+			msgCompressed = b0&wsRSV1 != 0
 			inMessage = true
-		} else {
-			if opcode != wsOpContinuation {
-				ws.Close()
-				return 0, nil, ErrWebSocketProtocol
-			}
 		}
 
 		var err error
-		assembled, err = ws.readFramePayload(assembled, header[1], masked)
+		assembled, err = ws.readFramePayload(assembled, b1, true)
 		if err != nil {
 			return 0, nil, err
 		}
 
 		if fin {
-			if msgCompressed {
-				inflated, status := wsInflate(assembled, ws.maxMessageSize())
-				switch status {
-				case wsStatusMessageTooBig:
-					ws.closeWithStatus(status)
-					return 0, nil, ErrBodyTooLarge
-				case wsStatusInvalidPayload:
-					ws.closeWithStatus(status)
-					return 0, nil, ErrWebSocketProtocol
-				}
-				assembled = inflated
+			msg, err := ws.completeMessage(msgOpcode, msgCompressed, assembled)
+			if err != nil {
+				return 0, nil, err
 			}
-			if msgOpcode == wsOpText && !utf8.Valid(assembled) {
-				ws.closeWithStatus(wsStatusInvalidPayload)
-				return 0, nil, ErrWebSocketProtocol
-			}
-			return msgOpcode, assembled, nil
+			return msgOpcode, msg, nil
 		}
 	}
+}
+
+func (ws *WSConn) vetFrameHead(b0, b1 byte, inMessage bool) error {
+	opcode := b0 & 0x0F
+	if rsv := b0 & wsRSVMask; rsv != 0 &&
+		(rsv != wsRSV1 || ws.compressionLevel == 0 || opcode == wsOpContinuation || opcode >= wsOpClose) {
+		ws.failBare()
+		return ErrWebSocketProtocol
+	}
+	if b1&0x80 == 0 {
+		ws.failBare()
+		return ErrWebSocketProtocol
+	}
+	if opcode >= wsOpClose {
+		if b0&0x80 == 0 || b1&0x7F > wsMaxControlPayload || opcode > wsOpPong {
+			ws.closeWithStatus(wsStatusProtocolError)
+			return ErrWebSocketProtocol
+		}
+		return nil
+	}
+	if opcode > wsOpBinary {
+		ws.closeWithStatus(wsStatusProtocolError)
+		return ErrWebSocketProtocol
+	}
+	if inMessage != (opcode == wsOpContinuation) {
+		ws.failBare()
+		return ErrWebSocketProtocol
+	}
+	return nil
+}
+
+func (ws *WSConn) vetPayloadLength(payloadLen int64, assembled int) error {
+	if payloadLen < 0 {
+		ws.failBare()
+		return ErrBodyTooLarge
+	}
+	if payloadLen > ws.maxMessageSize()-int64(assembled) {
+		ws.closeWithStatus(wsStatusMessageTooBig)
+		return ErrBodyTooLarge
+	}
+	return nil
+}
+
+func (ws *WSConn) handleCloseFrame(payload []byte) error {
+	if len(payload) == 1 {
+		ws.closeWithStatus(wsStatusProtocolError)
+		return ErrWebSocketProtocol
+	}
+	if len(payload) >= 2 {
+		code := binary.BigEndian.Uint16(payload[:2])
+		if !wsValidCloseCode(code) {
+			ws.closeWithStatus(wsStatusProtocolError)
+			return ErrWebSocketProtocol
+		}
+		if !validUTF8(payload[2:]) {
+			ws.closeWithStatus(wsStatusInvalidPayload)
+			return ErrWebSocketProtocol
+		}
+		ws.closeWithPayload(payload[:2])
+		return nil
+	}
+	ws.Close()
+	return nil
+}
+
+func (ws *WSConn) handlePing(payload []byte) error {
+	now := turbo.UnixNano()
+	last := ws.lastPing.Swap(now)
+	if last != 0 && now-last < wsPingMinInterval {
+		ws.closeWithStatus(wsStatusProtocolError)
+		return ErrWebSocketProtocol
+	}
+	if last == 0 || now-last > wsPingWindow {
+		ws.pingCount.Store(1)
+	} else if ws.pingCount.Add(1) > wsPingWindowMax {
+		ws.closeWithStatus(wsStatusProtocolError)
+		return ErrWebSocketProtocol
+	}
+	ws.WriteMessage(wsOpPong, payload)
+	return nil
+}
+
+func (ws *WSConn) completeMessage(opcode byte, compressed bool, assembled []byte) ([]byte, error) {
+	if compressed {
+		inflated, status := wsInflate(assembled, ws.maxMessageSize())
+		switch status {
+		case wsStatusMessageTooBig:
+			ws.closeWithStatus(status)
+			return nil, ErrBodyTooLarge
+		case wsStatusInvalidPayload:
+			ws.closeWithStatus(status)
+			return nil, ErrWebSocketProtocol
+		}
+		if !ws.reserveMessageBytes(len(inflated)) {
+			return nil, errWSBudgetExhausted
+		}
+		assembled = inflated
+	}
+	if opcode == wsOpText && !validUTF8(assembled) {
+		ws.closeWithStatus(wsStatusInvalidPayload)
+		return nil, ErrWebSocketProtocol
+	}
+	return assembled, nil
+}
+
+func (ws *WSConn) armReadDeadline() {
+	if ws.readTimeout <= 0 {
+		return
+	}
+	want := turbo.UnixNano() + int64(ws.readTimeout)
+	if armed := ws.readArmedAt.Load(); armed != 0 && armed <= want && want-armed < int64(ws.readTimeout)>>wsDeadlineSlackShift {
+		return
+	}
+	ws.conn.SetReadDeadline(time.Unix(0, want))
+	ws.readArmedAt.Store(want)
+}
+
+func (ws *WSConn) fill(n int) error {
+	if ws.rend-ws.rpos >= n {
+		return nil
+	}
+	if ws.rbuf == nil {
+		ws.rbuf = make([]byte, wsReadBufSize)
+	}
+	if ws.rpos > 0 {
+		ws.rend = copy(ws.rbuf, ws.rbuf[ws.rpos:ws.rend])
+		ws.rpos = 0
+	}
+	for {
+		m, err := ws.conn.Read(ws.rbuf[ws.rend:])
+		ws.rend += m
+		if ws.rend >= n {
+			return nil
+		}
+		if err != nil {
+			if err == io.EOF && ws.rend > 0 {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+}
+
+func (ws *WSConn) readFull(p []byte) error {
+	if buffered := ws.rend - ws.rpos; buffered > 0 {
+		n := copy(p, ws.rbuf[ws.rpos:ws.rend])
+		ws.rpos += n
+		p = p[n:]
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	if len(p) >= wsReadBufSize {
+		_, err := io.ReadFull(ws.conn, p)
+		return err
+	}
+	if err := ws.fill(len(p)); err != nil {
+		return err
+	}
+	ws.rpos += copy(p, ws.rbuf[ws.rpos:ws.rend])
+	return nil
 }
 
 func wsValidCloseCode(code uint16) bool {
@@ -455,6 +761,15 @@ func wsValidCloseCode(code uint16) bool {
 	}
 }
 
+func (ws *WSConn) noteCloseCode(code uint16) {
+	ws.closeCode.CompareAndSwap(0, uint32(code))
+}
+
+func (ws *WSConn) failBare() {
+	ws.noteCloseCode(wsStatusProtocolError)
+	ws.Close()
+}
+
 func (ws *WSConn) closeWithStatus(code uint16) {
 	var payload [2]byte
 	binary.BigEndian.PutUint16(payload[:], code)
@@ -465,61 +780,61 @@ func (ws *WSConn) closeWithPayload(payload []byte) error {
 	if !ws.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	if len(payload) >= 2 {
+		ws.noteCloseCode(binary.BigEndian.Uint16(payload))
+	}
+	if ev := ws.ev; ev != nil {
+		ev.writeClose(payload)
+		return nil
+	}
 	_ = ws.WriteMessage(wsOpClose, payload)
 	return ws.conn.Close()
 }
 
-func (ws *WSConn) readFramePayload(dst []byte, secondByte byte, masked bool) ([]byte, error) {
+func (ws *WSConn) readFramePayload(dst []byte, secondByte byte, buffered bool) ([]byte, error) {
 	payloadLen := int64(secondByte & 0x7F)
 
 	switch payloadLen {
 	case 126:
-		var ext [2]byte
-		if _, err := io.ReadFull(ws.conn, ext[:]); err != nil {
+		if err := ws.fill(2); err != nil {
 			return nil, err
 		}
-		payloadLen = int64(ext[0])<<8 | int64(ext[1])
+		payloadLen = int64(binary.BigEndian.Uint16(ws.rbuf[ws.rpos:]))
+		ws.rpos += 2
 	case 127:
-		var ext [8]byte
-		if _, err := io.ReadFull(ws.conn, ext[:]); err != nil {
+		if err := ws.fill(8); err != nil {
 			return nil, err
 		}
-		payloadLen = int64(ext[0])<<56 | int64(ext[1])<<48 | int64(ext[2])<<40 | int64(ext[3])<<32 |
-			int64(ext[4])<<24 | int64(ext[5])<<16 | int64(ext[6])<<8 | int64(ext[7])
-		if payloadLen < 0 {
-			ws.Close()
-			return nil, ErrBodyTooLarge
-		}
+		payloadLen = int64(binary.BigEndian.Uint64(ws.rbuf[ws.rpos:]))
+		ws.rpos += 8
 	}
 
-	if payloadLen > ws.maxMessageSize()-int64(len(dst)) {
-		ws.closeWithStatus(wsStatusMessageTooBig)
-		return nil, ErrBodyTooLarge
+	if err := ws.vetPayloadLength(payloadLen, len(dst)); err != nil {
+		return nil, err
 	}
 
+	if err := ws.fill(4); err != nil {
+		return nil, err
+	}
 	var maskKey [4]byte
-	if masked {
-		if _, err := io.ReadFull(ws.conn, maskKey[:]); err != nil {
-			return nil, err
-		}
-	}
+	copy(maskKey[:], ws.rbuf[ws.rpos:ws.rpos+4])
+	ws.rpos += 4
 
 	start := len(dst)
 	for remaining := payloadLen; remaining > 0; {
 		step := int(min(remaining, max(wsFrameReadChunk, int64(len(dst)-start))))
+		if buffered && !ws.reserveMessageBytes(step) {
+			return nil, errWSBudgetExhausted
+		}
 		dst = slices.Grow(dst, step)
-		n, err := io.ReadFull(ws.conn, dst[len(dst):len(dst)+step])
-		dst = dst[:len(dst)+n]
-		if err != nil {
+		if err := ws.readFull(dst[len(dst) : len(dst)+step]); err != nil {
 			return nil, err
 		}
-		remaining -= int64(n)
+		dst = dst[:len(dst)+step]
+		remaining -= int64(step)
 	}
 
-	if masked {
-		maskXOR(dst[start:], maskKey)
-	}
-
+	maskXOR(dst[start:], maskKey)
 	return dst, nil
 }
 
@@ -528,7 +843,10 @@ func (ws *WSConn) readFramePayload(dst []byte, secondByte byte, masked bool) ([]
 // Example: ws.WriteMessage(0x1, []byte("hi"))
 // Example: ws.WriteMessage(0x2, payload)
 func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
-	if ws.compressionLevel != 0 && (opcode == wsOpText || opcode == wsOpBinary) && len(data) >= wsCompressMinSize {
+	if ev := ws.ev; ev != nil {
+		return ev.write(opcode, data)
+	}
+	if ws.compressesMessage(opcode, data) {
 		return ws.writeCompressed(opcode, data)
 	}
 	bp := MediumBufPool.Get().(*[]byte)
@@ -538,6 +856,25 @@ func (ws *WSConn) WriteMessage(opcode byte, data []byte) error {
 	*bp = buf[:0]
 	putBoxedBufCapped(&MediumBufPool, bp, largeBufPoolMaxCap)
 	return err
+}
+
+func (ws *WSConn) compressesMessage(opcode byte, data []byte) bool {
+	return ws.compressionLevel != 0 && (opcode == wsOpText || opcode == wsOpBinary) && len(data) >= wsCompressMinSize
+}
+
+func (ws *WSConn) appendCompressedFrame(dst []byte, opcode byte, data []byte) []byte {
+	base := len(dst)
+	dst = append(dst, make([]byte, wsMaxFrameHeaderLen)...)
+	dst = wsDeflate(dst, data, ws.compressionLevel)
+	var header [wsMaxFrameHeaderLen]byte
+	h := wsAppendFrameHeader(header[:0], 0x80|wsRSV1|opcode, len(dst)-base-wsMaxFrameHeaderLen)
+	shift := wsMaxFrameHeaderLen - len(h)
+	copy(dst[base+shift:], h)
+	if shift > 0 {
+		copy(dst[base:], dst[base+shift:])
+		dst = dst[:len(dst)-shift]
+	}
+	return dst
 }
 
 func (ws *WSConn) writeCompressed(opcode byte, data []byte) error {
@@ -557,12 +894,34 @@ func (ws *WSConn) writeCompressed(opcode byte, data []byte) error {
 func (ws *WSConn) writeFrame(frame []byte) error {
 	ws.writeMu.Lock()
 	defer ws.writeMu.Unlock()
-	if ws.writeTimeout > 0 {
-		ws.conn.SetWriteDeadline(time.Now().Add(ws.writeTimeout))
+	if ws.rawWrites.Load() {
+		if ws.writeTimeout > 0 {
+			ws.conn.SetWriteDeadline(time.Unix(0, turbo.UnixNano()+int64(ws.writeTimeout)))
+		}
+		err := writeFull(ws.conn, frame)
+		ws.conn.SetWriteDeadline(time.Time{})
+		ws.writeDeadline = false
+		return err
 	}
-	err := writeFull(ws.conn, frame)
-	ws.conn.SetWriteDeadline(time.Time{})
-	return err
+	ws.armWriteDeadline()
+	return writeFull(ws.conn, frame)
+}
+
+func (ws *WSConn) armWriteDeadline() {
+	if ws.writeTimeout <= 0 {
+		if ws.writeDeadline {
+			ws.conn.SetWriteDeadline(time.Time{})
+			ws.writeDeadline = false
+		}
+		return
+	}
+	want := turbo.UnixNano() + int64(ws.writeTimeout)
+	if armed := ws.writeArmedAt; ws.writeDeadline && armed <= want && want-armed < int64(ws.writeTimeout)>>wsDeadlineSlackShift {
+		return
+	}
+	ws.conn.SetWriteDeadline(time.Unix(0, want))
+	ws.writeArmedAt = want
+	ws.writeDeadline = true
 }
 
 func wsAppendFrameHeader(dst []byte, first byte, payloadLen int) []byte {
@@ -601,6 +960,7 @@ func (ws *WSConn) Ping() error {
 
 // Close sends a close frame and closes the underlying connection. It is safe to call multiple times.
 func (ws *WSConn) Close() error {
+	ws.noteCloseCode(wsStatusNoStatus)
 	return ws.closeWithPayload(nil)
 }
 
@@ -609,6 +969,13 @@ func (ws *WSConn) Close() error {
 // Example: ws.SetDeadline(time.Now().Add(30 * time.Second))
 // Example: ws.SetDeadline(time.Time{})
 func (ws *WSConn) SetDeadline(t time.Time) error {
+	if ws.ev != nil {
+		return errWSEventDriven
+	}
+	ws.writeMu.Lock()
+	ws.writeDeadline = false
+	ws.writeMu.Unlock()
+	ws.readArmedAt.Store(0)
 	return ws.conn.SetDeadline(t)
 }
 

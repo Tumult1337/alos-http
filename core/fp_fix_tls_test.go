@@ -171,7 +171,7 @@ func TestFPFixTLSHelloRetryRequestFailsWithClearError(t *testing.T) {
 
 var (
 	fpFixEE13   = fpFixHandshakeMsg(tlsHSEncryptedExts, []byte{0, 0})
-	fpFixCert13 = fpFixHandshakeMsg(tlsHSCertificate, []byte{0, 0, 0, 0})
+	fpFixCert13 = fpFixHandshakeMsg(tlsHSCertificate, []byte{0, 0, 0, 6, 0, 0, 1, 0x30, 0, 0})
 	fpFixCV13   = fpFixHandshakeMsg(tlsHSCertVerify, []byte{0x08, 0x04, 0, 0})
 )
 
@@ -204,7 +204,7 @@ func TestFPFixTLS13EnforcesHandshakeOrder(t *testing.T) {
 }
 
 func TestFPFixTLS12EnforcesHandshakeOrder(t *testing.T) {
-	cert12 := fpFixHandshakeMsg(tlsHSCertificate, []byte{0, 0, 0})
+	cert12 := fpFixHandshakeMsg(tlsHSCertificate, []byte{0, 0, 4, 0, 0, 1, 0x30})
 	for _, tc := range []struct {
 		name string
 		msgs []byte

@@ -3,6 +3,7 @@
 package core
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"hash"
 )
@@ -34,40 +35,39 @@ func newHKDFLabelTemplate(label string, outLen, ctxLen, digestLen int) hkdfLabel
 }
 
 func (t hkdfLabelTemplate) ExpandTo(h func() hash.Hash, secret, ctx, dst []byte) []byte {
-	var infoBuf [128]byte
-	var info []byte
-	if t.totalLen <= len(infoBuf) {
-		info = infoBuf[:t.totalLen]
-	} else {
-		info = make([]byte, t.totalLen)
-	}
-	copy(info, t.prefix)
-	copy(info[len(t.prefix):], ctx)
-
-	mac := hmac.New(h, secret)
-	mac.Write(info)
-	mac.Write(hkdfExpandOneByte[:])
-
 	if cap(dst) < t.digestLen {
 		dst = make([]byte, 0, t.digestLen)
 	} else {
 		dst = dst[:0]
 	}
-	out := mac.Sum(dst)
-	return out[:t.outLen]
+	if m := acquireTLSHMAC(h, secret); m != nil {
+		m.write(t.prefix)
+		m.write(ctx)
+		m.write(hkdfExpandOneByte[:])
+		dst = m.sumTo(dst)
+		m.release()
+		return dst[:t.outLen]
+	}
+	return hmacGenericAppend(h, secret, t.prefix, ctx, hkdfExpandOneByte[:], dst)[:t.outLen]
+}
+
+func hmacGenericAppend(h func() hash.Hash, key, a, b, c, dst []byte) []byte {
+	mac := hmac.New(h, bytes.Clone(key))
+	msg := make([]byte, 0, len(a)+len(b)+len(c))
+	msg = append(append(append(msg, a...), b...), c...)
+	mac.Write(msg)
+	return append(dst, mac.Sum(nil)...)
 }
 
 // TLSExtractTo performs the TLS 1.3 HKDF-Extract step (HMAC(salt, ikm)), appending the result to dst and returning the extended slice.
 func TLSExtractTo(h func() hash.Hash, salt, ikm, dst []byte) []byte {
-	mac := hmac.New(h, salt)
-	mac.Write(ikm)
-	size := mac.Size()
-	if cap(dst) < size {
-		dst = make([]byte, 0, size)
-	} else {
-		dst = dst[:0]
+	if m := acquireTLSHMAC(h, salt); m != nil {
+		m.write(ikm)
+		dst = m.sumTo(dst[:0])
+		m.release()
+		return dst
 	}
-	return mac.Sum(dst)
+	return hmacGenericAppend(h, salt, ikm, nil, nil, dst[:0])
 }
 
 func init() {
@@ -108,13 +108,13 @@ func (cs *CipherSuiteConfig) DeriveSecretTo(tmpl *hkdfLabelTemplate, secret, tra
 func (cs *CipherSuiteConfig) ComputeFinishedTo(baseSecret, transcriptHash, dst []byte) []byte {
 	var finishedKeyBuf [64]byte
 	finishedKey := cs.labelFinished.ExpandTo(cs.HashFn, baseSecret, nil, finishedKeyBuf[:0])
-	mac := hmac.New(cs.HashFn, finishedKey)
-	mac.Write(transcriptHash)
-	size := mac.Size()
-	if cap(dst) < size {
-		dst = make([]byte, 0, size)
+	if m := acquireTLSHMAC(cs.HashFn, finishedKey); m != nil {
+		m.write(transcriptHash)
+		dst = m.sumTo(dst[:0])
+		m.release()
 	} else {
-		dst = dst[:0]
+		dst = hmacGenericAppend(cs.HashFn, finishedKey, transcriptHash, nil, nil, dst[:0])
 	}
-	return mac.Sum(dst)
+	clear(finishedKeyBuf[:])
+	return dst
 }

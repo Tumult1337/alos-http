@@ -32,8 +32,8 @@ func appFixStreamLimiterServer(t *testing.T, seen chan<- *ConnectionLimiter) *te
 		Routes: func(r *Router) {
 			r.GET("/stream", func(req *Request, resp *Response) {
 				sw := resp.EnsureStreamWriter()
-				epollSW, ok := sw.(*epollH1StreamWriter)
-				if !ok {
+				epollSW := h1StreamWriterOf(sw)
+				if epollSW == nil {
 					seen <- nil
 					resp.String("no epoll writer")
 					return

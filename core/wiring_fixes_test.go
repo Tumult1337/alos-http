@@ -82,20 +82,6 @@ func TestServerNameInPlainResponse(t *testing.T) {
 	}
 }
 
-func TestRootFastPathUsesServerName(t *testing.T) {
-	s := New(Config{ServerName: "MyServer"})
-	s.Router.GET("/", func(req *Request, resp *Response) { resp.String("hi") })
-	s.Router.Build()
-	s.computePlainRootFastResponse(true)
-	fast := s.plainRootFast.Load()
-	if fast == nil {
-		t.Fatal("root fast response not enabled")
-	}
-	if !strings.Contains(string(fast.getKeepAlive), "Server: MyServer\r\n") {
-		t.Fatalf("root fast response missing custom Server header:\n%s", fast.getKeepAlive)
-	}
-}
-
 func TestStreamMaxWriteSizeEnforced(t *testing.T) {
 	w := &PlainH1StreamWriter{headersSent: true, maxWrite: 10}
 	if err := w.WriteChunk(make([]byte, 20)); err != ErrBodyTooLarge {

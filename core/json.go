@@ -6,6 +6,7 @@ import (
 	"sync"
 
 	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/encoder"
 )
 
 // JSON is a pooled JSON encoder backed by sonic. Acquire one with AcquireJSON,
@@ -47,10 +48,24 @@ func (j *JSON) Marshal(v any) []byte {
 	return data
 }
 
+const sonicDefaultEncodeOptions encoder.Options = 0
+
+func (j *JSON) MarshalInto(v any) ([]byte, error) {
+	j.Buf = j.Buf[:0]
+	if err := encoder.EncodeInto(&j.Buf, v, sonicDefaultEncodeOptions); err != nil {
+		j.Buf = j.Buf[:0]
+		return nil, err
+	}
+	return j.Buf, nil
+}
+
 // Release returns the encoder to the pool for reuse; do not use it after calling Release.
 //
 // Example: defer j.Release()
 func (j *JSON) Release() {
+	if cap(j.Buf) > bufferShrinkThreshold {
+		j.Buf = nil
+	}
 	j.Buf = j.Buf[:0]
 	jsonPool.Put(j)
 }

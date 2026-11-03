@@ -27,6 +27,7 @@ func newWorkerForBackendTest(t *testing.T) *epollWorker {
 		conns:      make([]*epollConn, 64),
 		events:     make([]unix.EpollEvent, epollEventBatch),
 	}
+	w.h2MaxRunning = w.server.h2MaxRunningHandlers()
 	w.initBackendLoop()
 	t.Cleanup(func() {
 		w.be.closeAll()

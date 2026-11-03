@@ -17,12 +17,7 @@ import (
 
 func fpFixStartProxy(t *testing.T, backendAddr string, tune func(*ProxyEngine)) string {
 	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", Listeners: 1, MaxConnsPerIP: -1})
 	srv.AddProxyDomain(DomainConfig{Domain: "origin.test", Backends: []BackendConfig{{Addr: backendAddr}}})
 	if tune != nil {

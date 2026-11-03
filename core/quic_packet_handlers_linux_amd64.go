@@ -86,7 +86,10 @@ func (s *Server) handleQUICLongPacketIOUring(uc uringUDPSender, remoteAddr *net.
 				Dbg("[H3-DBG] handleLongPacket: existing conn for dcid=%x", hdr.dcid)
 			}
 		}
-		if len(data) < quicMinInitialDatagram && (qc == nil || !qc.addressValidated.Load()) {
+		if len(data) < quicMinInitialDatagram {
+			if qc != nil {
+				qc.creditDiscardedDatagram(quicAddrPort(remoteAddr), len(data))
+			}
 			if pbuf != nil {
 				quicRecvBufPool.Put(pbuf)
 			}

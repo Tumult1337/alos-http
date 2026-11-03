@@ -50,6 +50,8 @@ func TestChunkedBufferedBodyUsesSmallerReadCap(t *testing.T) {
 					t.Fatal("buffered chunked upload bypassed smaller read cap")
 				}
 			} else {
+				h1ReceivedRunInline(t, w)
+				w.flushPending()
 				output := make([]byte, epollReadBufCap)
 				length, err := unix.Read(peer, output)
 				if err != nil || !bytes.Contains(output[:length], []byte("200 OK")) || !bytes.HasSuffix(output[:length], []byte("hello")) {

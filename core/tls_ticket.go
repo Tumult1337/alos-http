@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -69,17 +70,28 @@ func appendTicketPlaintext(dst []byte, t *sessionTicket) []byte {
 }
 
 func (tc *ticketCodec) seal(t *sessionTicket) []byte {
-	if len(t.secret) > maxTicketSecretLen || len(t.sni) > maxTicketFieldLen || len(t.alpn) > 0xff || len(t.clientCert) > maxTicketClientCertLen {
+	out, ok := tc.appendSealed(nil, t)
+	if !ok {
 		return nil
 	}
-	plain := appendTicketPlaintext(make([]byte, 0, 64+len(t.secret)+len(t.sni)+len(t.alpn)+len(t.clientCert)), t)
-	k := tc.ring.current()
-	out := make([]byte, ticketPrefixLen, ticketPrefixLen+len(plain)+k.cur.Overhead())
-	out[0] = k.curID
-	rand.Read(out[1:ticketPrefixLen])
-	out = k.cur.Seal(out, out[1:ticketPrefixLen], plain, out[:1])
-	clear(plain)
 	return out
+}
+
+func (tc *ticketCodec) appendSealed(dst []byte, t *sessionTicket) ([]byte, bool) {
+	if len(t.secret) > maxTicketSecretLen || len(t.sni) > maxTicketFieldLen || len(t.alpn) > 0xff || len(t.clientCert) > maxTicketClientCertLen {
+		return dst, false
+	}
+	k := tc.ring.current()
+	start := len(dst)
+	dst = ensureTailCap(dst, ticketPrefixLen+64+len(t.secret)+len(t.sni)+len(t.alpn)+len(t.clientCert)+k.cur.Overhead())
+	dst = dst[:start+ticketPrefixLen]
+	dst[start] = k.curID
+	rand.Read(dst[start+1 : start+ticketPrefixLen])
+	plainStart := len(dst)
+	dst = appendTicketPlaintext(dst, t)
+	plain := dst[plainStart:]
+	sealed := k.cur.Seal(plain[:0], dst[start+1:start+ticketPrefixLen], plain, dst[start:start+1])
+	return dst[:plainStart+len(sealed)], true
 }
 
 func (tc *ticketCodec) open(ticket []byte) (sessionTicket, bool) {
@@ -94,7 +106,7 @@ func (tc *ticketCodec) open(ticket []byte) (sessionTicket, bool) {
 	if err != nil {
 		return sessionTicket{}, false
 	}
-	t, ok := parseTicketPlaintext(plain)
+	t, ok := parseTicketFields(plain, true)
 	if !ok {
 		return sessionTicket{}, false
 	}
@@ -129,6 +141,17 @@ func (r *ticketReader) uint(n int) uint64 {
 }
 
 func parseTicketPlaintext(b []byte) (sessionTicket, bool) {
+	return parseTicketFields(b, false)
+}
+
+func ticketString(b []byte, borrow bool) string {
+	if !borrow || len(b) == 0 {
+		return string(b)
+	}
+	return unsafe.String(&b[0], len(b))
+}
+
+func parseTicketFields(b []byte, borrow bool) (sessionTicket, bool) {
 	r := ticketReader{b: b, ok: true}
 	var t sessionTicket
 	if r.uint(1) != ticketFormatVersion {
@@ -146,8 +169,8 @@ func parseTicketPlaintext(b []byte) (sessionTicket, bool) {
 	default:
 		return t, false
 	}
-	t.sni = string(r.take(int(r.uint(2))))
-	t.alpn = string(r.take(int(r.uint(1))))
+	t.sni = ticketString(r.take(int(r.uint(2))), borrow)
+	t.alpn = ticketString(r.take(int(r.uint(1))), borrow)
 	t.clientCert = r.take(int(r.uint(3)))
 	if !r.ok || len(r.b) != 0 || len(t.secret) == 0 {
 		return sessionTicket{}, false

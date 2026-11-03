@@ -36,3 +36,38 @@ loop32:
 done:
 	VZEROUPPER
 	RET
+
+TEXT ·asciiPrefixAVX2(SB), NOSPLIT, $0-24
+	MOVQ p+0(FP), SI
+	MOVQ n+8(FP), CX
+	XORQ AX, AX
+
+ascii128:
+	MOVQ CX, DX
+	SUBQ AX, DX
+	CMPQ DX, $128
+	JB   ascii32
+	VMOVDQU (SI)(AX*1), Y0
+	VPOR    32(SI)(AX*1), Y0, Y0
+	VPOR    64(SI)(AX*1), Y0, Y0
+	VPOR    96(SI)(AX*1), Y0, Y0
+	VPMOVMSKB Y0, DX
+	TESTL   DX, DX
+	JNZ     ascii32
+	ADDQ    $128, AX
+	JMP     ascii128
+
+ascii32:
+	CMPQ AX, CX
+	JAE  asciidone
+	VMOVDQU (SI)(AX*1), Y0
+	VPMOVMSKB Y0, DX
+	TESTL   DX, DX
+	JNZ     asciidone
+	ADDQ    $32, AX
+	JMP     ascii32
+
+asciidone:
+	VZEROUPPER
+	MOVQ AX, ret+16(FP)
+	RET

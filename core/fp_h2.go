@@ -2,7 +2,10 @@
 
 package core
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 const fpH2MaxWindow = 1<<31 - 1
 
@@ -49,6 +52,7 @@ type h2Stream struct {
 	ex         *Exchange
 	sendWindow int32
 	gotHeaders bool
+	interim    int
 	status     int
 	headers    [][2]string
 	body       []byte
@@ -478,18 +482,66 @@ func (h *h2Proto) completeHeaders(c *backendConn, streamID uint32, endStream boo
 		h.resetStream(c, st, H2ErrProtocol, errFPBadResponse)
 		return nil
 	}
-	for _, f := range fields {
-		if f[0] == ":status" {
-			st.status, _ = strconv.Atoi(f[1])
-		} else if len(f[0]) > 0 && f[0][0] != ':' {
-			st.headers = append(st.headers, f)
+	if st.gotHeaders {
+		if !endStream || h2HasPseudoHeader(fields) {
+			h.resetStream(c, st, H2ErrProtocol, errFPBadResponse)
+			return nil
 		}
+		h.finishStream(c, st)
+		return nil
 	}
+	status, headers, ok := h2ResponseHeaderSection(fields)
+	if !ok || status == 101 || status < 200 && endStream {
+		h.resetStream(c, st, H2ErrProtocol, errFPBadResponse)
+		return nil
+	}
+	if status < 200 {
+		if st.interim++; st.interim > upstreamMaxInterimResponses {
+			h.resetStream(c, st, H2ErrProtocol, errFPBadResponse)
+		}
+		return nil
+	}
+	st.status = status
+	st.headers = headers
 	st.gotHeaders = true
 	if endStream {
 		h.finishStream(c, st)
 	}
 	return nil
+}
+
+func h2HasPseudoHeader(fields [][2]string) bool {
+	for _, f := range fields {
+		if strings.HasPrefix(f[0], ":") {
+			return true
+		}
+	}
+	return false
+}
+
+func h2ResponseHeaderSection(fields [][2]string) (int, [][2]string, bool) {
+	if len(fields) == 0 || fields[0][0] != ":status" || h2HasPseudoHeader(fields[1:]) {
+		return 0, nil, false
+	}
+	status, ok := h2ParseStatus(fields[0][1])
+	if !ok {
+		return 0, nil, false
+	}
+	return status, fields[1:], true
+}
+
+func h2ParseStatus(v string) (int, bool) {
+	if len(v) != 3 {
+		return 0, false
+	}
+	status := 0
+	for i := range len(v) {
+		if v[i] < '0' || v[i] > '9' {
+			return 0, false
+		}
+		status = status*10 + int(v[i]-'0')
+	}
+	return status, status >= 100
 }
 
 func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, payload []byte) error {
@@ -509,6 +561,10 @@ func (h *h2Proto) onDataFrame(c *backendConn, flags byte, streamID uint32, paylo
 			return errFPBadResponse
 		}
 		payload = payload[:len(payload)-pad]
+	}
+	if st != nil && !st.gotHeaders {
+		h.resetStream(c, st, H2ErrProtocol, errFPBadResponse)
+		st = nil
 	}
 	if st != nil && len(payload) > 0 {
 		if len(st.body)+len(payload) > c.be.cfg.MaxResponseBody {

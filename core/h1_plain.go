@@ -4,31 +4,41 @@ package core
 
 import (
 	"bytes"
-	"math/bits"
+	"net/http"
 )
 
-func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
-	dst, _ = appendPlainResponseModeAt(resp, dst, keepAlive, includeBody, responseDateValue(resp.StatusCode, resp.Headers))
-	return dst
+func plainOKHead(resp *Response) []byte {
+	if preset := plainContentTypePreset(resp.ContentType); preset >= 0 && (len(resp.Headers) == 0 || !headersHaveFold(resp.Headers, "Date")) {
+		return currentHTTPDate().ok200[preset]
+	}
+	return nil
 }
 
-func appendPlainResponseModeAt(resp *Response, dst []byte, keepAlive bool, includeBody bool, date string) ([]byte, responseDateSpan) {
-	dst = appendStatusLine(dst, resp.StatusCode)
-
-	if resp.ContentType != "" {
-		switch resp.ContentType {
-		case "application/json; charset=utf-8":
-			dst = append(dst, ctPrefixJSON...)
-		case "text/plain; charset=utf-8":
-			dst = append(dst, ctPrefixTextPlain...)
-		case "text/html; charset=utf-8":
-			dst = append(dst, ctPrefixTextHTML...)
-		case "application/octet-stream":
-			dst = append(dst, ctPrefixOctet...)
-		default:
-			dst = append(dst, "Content-Type: "...)
-			dst = appendHeaderValueStripped(dst, resp.ContentType)
-			dst = append(dst, '\r', '\n')
+func appendPlainResponseMode(resp *Response, dst []byte, keepAlive bool, includeBody bool) []byte {
+	var head []byte
+	if resp.StatusCode == http.StatusOK {
+		head = plainOKHead(resp)
+	}
+	if head != nil {
+		dst = append(dst, head...)
+	} else {
+		dst = appendStatusLine(dst, resp.StatusCode)
+		dst = appendDateUnlessSet(dst, resp.StatusCode, resp.Headers)
+		if resp.ContentType != "" {
+			switch resp.ContentType {
+			case "application/json; charset=utf-8":
+				dst = append(dst, ctPrefixJSON...)
+			case "text/plain; charset=utf-8":
+				dst = append(dst, ctPrefixTextPlain...)
+			case "text/html; charset=utf-8":
+				dst = append(dst, ctPrefixTextHTML...)
+			case "application/octet-stream":
+				dst = append(dst, ctPrefixOctet...)
+			default:
+				dst = append(dst, "Content-Type: "...)
+				dst = appendHeaderValueStripped(dst, resp.ContentType)
+				dst = append(dst, '\r', '\n')
+			}
 		}
 	}
 
@@ -48,25 +58,12 @@ func appendPlainResponseModeAt(resp *Response, dst []byte, keepAlive bool, inclu
 		}
 	}
 
-	for i := range resp.Headers {
-		dst = append(dst, resp.Headers[i][0]...)
-		dst = append(dst, ':', ' ')
-		dst = append(dst, resp.Headers[i][1]...)
-		dst = append(dst, '\r', '\n')
-	}
-
-	dst, dateSpan := appendH1Date(dst, date)
-	ka, cl := serverConnHeaders(resp)
-	if keepAlive {
-		dst = append(dst, ka...)
-	} else {
-		dst = append(dst, cl...)
-	}
-	dst = append(dst, '\r', '\n')
+	dst = appendH1HeaderFields(dst, resp.Headers)
+	dst = append(dst, serverConnHeadTail(resp, keepAlive)...)
 	if includeBody && !suppressBody {
-		dst = resp.appendBody(dst)
+		dst = resp.appendBody(growIOBuf(dst, resp.BodyLen()))
 	}
-	return dst, dateSpan
+	return dst
 }
 
 func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
@@ -93,219 +90,6 @@ func growPlainReadBuffer(buf []byte, minFree, maxRead int) ([]byte, bool) {
 	return newBuf, true
 }
 
-var rootPrefix16 = [16]byte{'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/', '1', '.', '1', '\r', '\n'}
-var rootPrefixBytes = rootPrefix16[:]
-
-func (s *Server) matchPlainRootFastRequest(data []byte, tls bool) ([]byte, int, bool, bool) {
-	fast := s.plainRootFast.Load()
-	if fast == nil {
-		return nil, 0, false, false
-	}
-	if len(data) < len(rootPrefixBytes)+4 || !equalPrefix16(data, &rootPrefix16) {
-		return nil, 0, false, false
-	}
-	maxHeaderBytes := s.limits.Load().MaxHeaderSize
-	if maxHeaderBytes <= 0 {
-		maxHeaderBytes = 8192
-	}
-	consumed, keepAlive, ok, needRead := parsePlainFastRootRequest(data, len(rootPrefixBytes), maxHeaderBytes, s.config.MaxHeaderCount)
-	if needRead {
-		return nil, 0, false, false
-	}
-	if !ok {
-		return nil, 0, false, false
-	}
-	fast = s.currentPlainRootDate(fast)
-	if fast == nil {
-		return nil, 0, false, false
-	}
-	return fast.bytesFor(keepAlive, tls), consumed, !keepAlive, true
-}
-
-const rootScalarScanMaxBytes = 96
-
-func parsePlainFastRootRequest(buf []byte, lineLen int, maxHeaderBytes, maxHeaderCount int) (consumed int, keepAlive bool, ok bool, needRead bool) {
-	if maxHeaderBytes <= 0 {
-		maxHeaderBytes = 8192
-	}
-	if maxHeaderCount <= 0 {
-		maxHeaderCount = 128
-	}
-	if len(buf) <= rootScalarScanMaxBytes {
-		st := rootFastState{keepAlive: true, maxHeaderCount: maxHeaderCount}
-		if headerEnd, ok := st.scanFields(buf, lineLen); ok && st.hosts == 1 && headerEnd-2 <= maxHeaderBytes {
-			return headerEnd, st.keepAlive, true, false
-		}
-	} else if len(buf)-2 <= maxHeaderBytes && endsWithHeaderTerminator(buf, lineLen) {
-		if keepAlive, ok := rootFastHeaders(buf[lineLen:len(buf)-2], maxHeaderCount); ok {
-			return len(buf), keepAlive, true, false
-		}
-	}
-	headerEnd := findHeaderTerminatorBytes(buf, lineLen)
-	if headerEnd < 0 {
-		if len(buf) > maxHeaderBytes {
-			return 0, false, false, false
-		}
-		return 0, false, false, true
-	}
-	if headerEnd-2 > maxHeaderBytes {
-		return 0, false, false, false
-	}
-	keepAlive, ok = rootFastHeaders(buf[lineLen:headerEnd-2], maxHeaderCount)
-	if !ok {
-		return 0, false, false, false
-	}
-	return headerEnd, keepAlive, true, false
-}
-
-func endsWithHeaderTerminator(buf []byte, lineLen int) bool {
-	n := len(buf)
-	return n-2 >= lineLen && n >= 4 && string(buf[n-4:]) == "\r\n\r\n"
-}
-
-func rootFastHeaders(block []byte, maxHeaderCount int) (keepAlive, ok bool) {
-	st := rootFastState{keepAlive: true, maxHeaderCount: maxHeaderCount}
-	if !st.fields(block) || st.hosts != 1 {
-		return false, false
-	}
-	return st.keepAlive, true
-}
-
-type rootFastState struct {
-	hosts          int
-	headerCount    int
-	maxHeaderCount int
-	keepAlive      bool
-}
-
-func (st *rootFastState) scanFields(buf []byte, i int) (headerEnd int, ok bool) {
-	for i+1 < len(buf) {
-		if buf[i] == '\r' {
-			return i + 2, buf[i+1] == '\n'
-		}
-		name, value, next, hostSafe, ok := rootFieldScalar(buf, i)
-		if !ok || !st.addFields(1) || !st.field(name, value, hostSafe) {
-			return 0, false
-		}
-		i = next
-	}
-	return 0, false
-}
-
-func (st *rootFastState) fields(block []byte) bool {
-	if len(block) >= h1BlockMinBytes {
-		if ok, indexed := st.indexedFields(block); indexed {
-			return ok
-		}
-	}
-	return st.lineFields(block)
-}
-
-func (st *rootFastState) indexedFields(block []byte) (ok, indexed bool) {
-	var idx h1BlockIndexOut
-	if !h1BlockIndex(block, &idx) {
-		return false, false
-	}
-	chunks := (len(block) + 63) >> 6
-	for ci := 0; ci < chunks; ci++ {
-		if !st.addFields(bits.OnesCount64(idx.starts[ci])) {
-			return false, true
-		}
-		for c := idx.cands[ci]; c != 0; c &= c - 1 {
-			start := ci<<6 | bits.TrailingZeros64(c)
-			colon := h1NextBit(&idx.ends, start, chunks)
-			end := len(block) - 2
-			if next := h1NextBit(&idx.starts, colon, chunks); next >= 0 {
-				end = next - 2
-			}
-			if !st.field(block[start:colon], block[colon+1:end], false) {
-				return false, true
-			}
-		}
-	}
-	return true, true
-}
-
-func (st *rootFastState) lineFields(block []byte) bool {
-	for i := 0; i < len(block); {
-		var name, value []byte
-		var hostSafe, ok bool
-		if len(block)-i >= h1ScalarScanMax {
-			name, value, i, ok = rootFieldVector(block, i)
-		} else {
-			name, value, i, hostSafe, ok = rootFieldScalar(block, i)
-		}
-		if !ok || !st.addFields(1) || !st.field(name, value, hostSafe) {
-			return false
-		}
-	}
-	return true
-}
-
-func (st *rootFastState) addFields(count int) bool {
-	st.headerCount += count
-	return st.headerCount <= st.maxHeaderCount
-}
-
-func (st *rootFastState) field(name, value []byte, hostSafe bool) bool {
-	switch len(name) {
-	case len("host"):
-		if asciiEqualFoldBytes(name, "host") {
-			st.hosts++
-			return hostSafe || ValidateHost(UnsafeString(trimOWS(value)))
-		}
-	case len("connection"):
-		if asciiEqualFoldBytes(name, "connection") {
-			if value = trimOWS(value); !asciiEqualFoldBytes(value, "keep-alive") {
-				if closeRequested, _ := connectionOptionList(UnsafeString(value)); closeRequested {
-					st.keepAlive = false
-				}
-			}
-		}
-	case len("expect"), len("content-length"), len("transfer-encoding"):
-		return !asciiEqualFoldBytes(name, "expect") && !asciiEqualFoldBytes(name, "content-length") && !asciiEqualFoldBytes(name, "transfer-encoding")
-	}
-	return true
-}
-
-func rootFieldVector(fields []byte, i int) (name, value []byte, next int, ok bool) {
-	rest := fields[i:]
-	special, nameEnd := h1HeaderLineSpecials(rest)
-	end, bad := classifyFirstSpecial(rest, special)
-	if bad || end <= 0 || !validH1Colon(rest[:end], nameEnd) {
-		return nil, nil, 0, false
-	}
-	return rest[:nameEnd], trimOWS(rest[nameEnd+1 : end]), i + end + 2, true
-}
-
-func rootFieldScalar(fields []byte, i int) (name, value []byte, next int, hostSafe, ok bool) {
-	start := i
-	for i < len(fields) && h1FieldClass[fields[i]]&h1ClassToken != 0 {
-		i++
-	}
-	if i == start || i == len(fields) || fields[i] != ':' {
-		return nil, nil, 0, false, false
-	}
-	name = fields[start:i]
-	i++
-	for i < len(fields) && (fields[i] == ' ' || fields[i] == '\t') {
-		i++
-	}
-	valueStart := i
-	var seen uint8
-	common := ^uint8(0)
-	for i < len(fields) && fields[i] != '\r' {
-		class := h1FieldClass[fields[i]]
-		seen |= class
-		common &= class
-		i++
-	}
-	if i+1 >= len(fields) || seen&h1ClassSpecial != 0 || fields[i+1] != '\n' {
-		return nil, nil, 0, false, false
-	}
-	return name, fields[valueStart:i], i + 2, common&h1ClassHost != 0, true
-}
-
 func connectionOptions(value []byte) (closeRequested, keepAliveRequested bool) {
 	switch {
 	case asciiEqualFoldBytes(value, "keep-alive"):
@@ -330,17 +114,6 @@ func asciiEqualFoldBytes(line []byte, value string) bool {
 		}
 	}
 	return true
-}
-
-func findHeaderTerminatorBytes(buf []byte, start int) int {
-	if start >= len(buf) {
-		return -1
-	}
-	idx := indexCRLFCRLF(buf[start:])
-	if idx < 0 {
-		return -1
-	}
-	return start + idx + 4
 }
 
 // ParseH1RequestHead parses the HTTP/1.x request line and header block in

@@ -46,7 +46,7 @@ func h2FixRequest(method, path string) []byte {
 }
 
 func h2FixDecode(block []byte) error {
-	_, _, _, err := NewHpackDecoder().DecodeRequest(nil, block)
+	_, _, err := NewHpackDecoder().DecodeRequest(nil, block)
 	return err
 }
 
@@ -107,16 +107,16 @@ func TestH2FixHPACKRejectsSpaceAndControlsInMethodAndPath(t *testing.T) {
 func TestH2FixHPACKEnforcesHeaderListSize(t *testing.T) {
 	dec := NewHpackDecoder()
 	seed := append(h2FixRequest("GET", "/seed"), h2FixIndexedLiteral("x-a", strings.Repeat("v", 4000))...)
-	if _, _, _, err := dec.DecodeRequest(nil, seed); err != nil {
+	if _, _, err := dec.DecodeRequest(nil, seed); err != nil {
 		t.Fatalf("seed block: %v", err)
 	}
 	amplified := h2FixRequest("GET", "/amp")
 	amplified = append(amplified, bytes.Repeat([]byte{0xbe}, 120)...)
-	if _, _, _, err := dec.DecodeRequest(nil, amplified); err == nil {
+	if _, _, err := dec.DecodeRequest(nil, amplified); err == nil {
 		t.Fatalf("a %d-byte block decoding to ~%d bytes of fields was accepted (advertised MAX_HEADER_LIST_SIZE %d)", len(amplified), 120*4035, H2MaxHeaderListSize)
 	}
 	follow := append(h2FixRequest("GET", "/after"), 0xbe)
-	headers, _, _, err := dec.DecodeRequest(nil, follow)
+	headers, _, err := dec.DecodeRequest(nil, follow)
 	if err != nil {
 		t.Fatalf("block after the rejected one failed (decoder table desynchronised): %v", err)
 	}
@@ -145,7 +145,7 @@ func BenchmarkH2FixHPACKDecodeNoMemo(b *testing.B) {
 	b.ReportAllocs()
 	i := 0
 	for b.Loop() {
-		out, _, _, err := dec.DecodeRequest(headers[:0], blocks[i&1])
+		out, _, err := dec.DecodeRequest(headers[:0], blocks[i&1])
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -179,7 +179,7 @@ func BenchmarkH2FixHPACKDecodeDynamic(b *testing.B) {
 	b.ReportAllocs()
 	i := 0
 	for b.Loop() {
-		out, _, _, err := dec.DecodeRequest(headers[:0], blocks[i&1])
+		out, _, err := dec.DecodeRequest(headers[:0], blocks[i&1])
 		if err != nil {
 			b.Fatal(err)
 		}

@@ -43,17 +43,6 @@ func rawHeaderValue(req *Request, name string) string {
 	return ""
 }
 
-func reserveLocalAddr(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve port: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
-}
-
 func waitServerReady(addr string) bool {
 	for i := 0; i < 300; i++ {
 		c, err := net.Dial("tcp", addr)
@@ -81,7 +70,7 @@ func drainResponse(br *bufio.Reader) error {
 
 func TestH1HeaderAliasRetention(t *testing.T) {
 	retained := newRetainedHeaders()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	s := New(Config{
 		Addr:          addr,
 		PlainHTTP:     true,

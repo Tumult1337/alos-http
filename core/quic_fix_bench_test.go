@@ -150,7 +150,7 @@ func BenchmarkQUICFixPTOScanNoExpiry(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if frames := ls.ptoExpiredFrames(quicSpaceAppData); frames != nil {
+		if frames := ls.ptoExpiredFrames(quicSpaceAppData, 0); frames != nil {
 			b.Fatal("unexpected PTO expiry")
 		}
 	}

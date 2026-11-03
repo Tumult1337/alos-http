@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -102,14 +103,14 @@ func TestProxyFix2CacheUnrelatedPurgeKeepsInFlightFill(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	proxyFixEventually(t, "the cache miss reached the origin", func() bool { return o.received.Load() == 1 })
-	srv.PurgeProxyCache("GET", proxyFixDomain, "/unrelated")
+	srv.PurgeProxyCache("GET", proxyFixDomain, proxyFix2PathInOtherStripe(t, srv.activeProxyCache(), proxyFixDomain, "/doc"))
 	o.releaseOnce()
 	if resp, body := proxyFixReadResponse(t, bufio.NewReader(c)); resp.StatusCode != http.StatusOK || body != "ok" {
 		t.Fatalf("in-flight response: %d %q", resp.StatusCode, body)
 	}
 	stored := func() bool { entries, _, _, _ := srv.ProxyCacheStats(); return entries == 1 }
 	if !proxyFixWaitFor(stored) {
-		t.Fatalf("purging /unrelated discarded the in-flight fill of /doc")
+		t.Fatalf("purging a path in another purge stripe discarded the in-flight fill of /doc")
 	}
 }
 
@@ -120,7 +121,9 @@ func TestProxyFix2CachePurgeScopesInFlightFills(t *testing.T) {
 		purge     func(pc *ProxyCache)
 		wantStore bool
 	}{
-		{"other_url", func(pc *ProxyCache) { pc.Purge("GET", proxyFix2CacheHost, "/other") }, true},
+		{"other_url", func(pc *ProxyCache) {
+			pc.Purge("GET", proxyFix2CacheHost, proxyFix2PathInOtherStripe(t, pc, proxyFix2CacheHost, "/fill"))
+		}, true},
 		{"same_url", func(pc *ProxyCache) { pc.Purge("GET", proxyFix2CacheHost, "/fill") }, false},
 		{"same_domain", func(pc *ProxyCache) { pc.PurgeDomain(proxyFix2CacheHost) }, false},
 		{"all", func(pc *ProxyCache) { pc.PurgeAll() }, false},
@@ -141,6 +144,19 @@ func TestProxyFix2CachePurgeScopesInFlightFills(t *testing.T) {
 			}
 		})
 	}
+}
+
+func proxyFix2PathInOtherStripe(t *testing.T, pc *ProxyCache, host, path string) string {
+	t.Helper()
+	taken := pc.keyPurgeStripe(pc.buildKey("GET", host, path))
+	for i := 0; i < cachePurgeStripes*4; i++ {
+		other := "/other-" + strconv.Itoa(i)
+		if pc.keyPurgeStripe(pc.buildKey("GET", host, other)) != taken {
+			return other
+		}
+	}
+	t.Fatalf("no path outside the purge stripe of %s", path)
+	return ""
 }
 
 const proxyFix2WarmPurges = 3

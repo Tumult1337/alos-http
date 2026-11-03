@@ -30,3 +30,14 @@ core/*.exe
 core/*.test
 core/*.out
 core/*.prof
+core/.alos-cert.pem
+core/.alos-key.pem
+
+tests/**/*.pem
+tests/**/*.key
+tests/perfcompare/rust/*/target/
+tests/perfcompare/results/
+tests/perfcompare/bin/
+tests/perfcompare/certs/*
+!tests/perfcompare/certs/gen.sh
+tests/perfcompare/static/

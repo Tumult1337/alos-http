@@ -3,45 +3,99 @@
 package core
 
 import (
-	"crypto/ecdh"
 	"crypto/rand"
+	"crypto/subtle"
 	"runtime"
 	"sync"
 	"time"
+
+	"filippo.io/edwards25519"
+	"filippo.io/edwards25519/field"
 )
 
+const (
+	x25519KeyLen       = 32
+	x25519LadderA24    = 121665
+	x25519ScalarTopBit = 254
+)
+
+var x25519AllZero [x25519KeyLen]byte
+
 type x25519Keypair struct {
-	priv *ecdh.PrivateKey
-	pub  [32]byte
+	priv [x25519KeyLen]byte
+	pub  [x25519KeyLen]byte
 }
 
 func generateX25519Keypair() (x25519Keypair, error) {
-	priv, err := ecdh.X25519().GenerateKey(rand.Reader)
-	if err != nil {
+	var kp x25519Keypair
+	if _, err := rand.Read(kp.priv[:]); err != nil {
 		return x25519Keypair{}, err
 	}
-	kp := x25519Keypair{priv: priv}
-	copy(kp.pub[:], priv.PublicKey().Bytes())
+	var s edwards25519.Scalar
+	if _, err := s.SetBytesWithClamping(kp.priv[:]); err != nil {
+		return x25519Keypair{}, err
+	}
+	var p edwards25519.Point
+	copy(kp.pub[:], p.ScalarBaseMult(&s).BytesMontgomery())
+	s = edwards25519.Scalar{}
 	return kp, nil
 }
 
 func (kp *x25519Keypair) sharedSecret(peer []byte) ([32]byte, bool) {
-	var shared [32]byte
-	pub, err := ecdh.X25519().NewPublicKey(peer)
-	if err != nil {
+	var shared [x25519KeyLen]byte
+	if len(peer) != x25519KeyLen {
 		return shared, false
 	}
-	secret, err := kp.priv.ECDH(pub)
-	if err != nil {
-		return shared, false
+	x25519Ladder(&shared, &kp.priv, peer)
+	return shared, subtle.ConstantTimeCompare(shared[:], x25519AllZero[:]) == 0
+}
+
+func x25519Ladder(dst, priv *[x25519KeyLen]byte, u []byte) {
+	k := *priv
+	k[0] &= 248
+	k[31] &= 127
+	k[31] |= 64
+	var x1, x2, z2, x3, z3, a, aa, b, bb, e, c, d, da, cb field.Element
+	x1.SetBytes(u)
+	x2.One()
+	x3.Set(&x1)
+	z3.One()
+	swap := 0
+	for t := x25519ScalarTopBit; t >= 0; t-- {
+		bit := int(k[t>>3]>>(t&7)) & 1
+		swap ^= bit
+		x2.Swap(&x3, swap)
+		z2.Swap(&z3, swap)
+		swap = bit
+		a.Add(&x2, &z2)
+		aa.Square(&a)
+		b.Subtract(&x2, &z2)
+		bb.Square(&b)
+		e.Subtract(&aa, &bb)
+		c.Add(&x3, &z3)
+		d.Subtract(&x3, &z3)
+		da.Multiply(&d, &a)
+		cb.Multiply(&c, &b)
+		x3.Add(&da, &cb)
+		x3.Square(&x3)
+		z3.Subtract(&da, &cb)
+		z3.Square(&z3)
+		z3.Multiply(&x1, &z3)
+		x2.Multiply(&aa, &bb)
+		z2.Mult32(&e, x25519LadderA24)
+		z2.Add(&aa, &z2)
+		z2.Multiply(&e, &z2)
 	}
-	copy(shared[:], secret)
-	clear(secret)
-	return shared, true
+	x2.Swap(&x3, swap)
+	z2.Swap(&z3, swap)
+	z2.Invert(&z2)
+	x2.Multiply(&x2, &z2)
+	copy(dst[:], x2.Bytes())
+	clear(k[:])
 }
 
 func (kp *x25519Keypair) zero() {
-	kp.priv = nil
+	clear(kp.priv[:])
 	clear(kp.pub[:])
 }
 

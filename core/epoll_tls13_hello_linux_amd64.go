@@ -2,6 +2,8 @@
 
 package core
 
+import "bytes"
+
 var tlsCompatCCS = [1]byte{0x01}
 
 func (c *epollConn) awaitsRetryCCS() bool {
@@ -117,12 +119,24 @@ func (c *epollConn) sendSessionTicket(srv *Server) {
 		return
 	}
 	c.ticket = nil
-	msg := srv.newSessionTicketMessage(p)
-	if msg == nil {
+	hdr := len(c.writeBuf)
+	out := ensureTailCap(c.writeBuf, tlsRecordHeaderLen+tlsSessionTicketRecordHint)
+	out, ok := srv.appendSessionTicketMessage(out[:hdr+tlsRecordHeaderLen], p)
+	if !ok {
+		c.writeBuf = out[:hdr]
 		return
 	}
-	c.writeBuf = buildTLSInnerRecordsParts(c.writeBuf, c.appWriter, tlsRecHandshake, msg, nil)
+	if len(out)-hdr-tlsRecordHeaderLen >= MaxRecordPayload {
+		msg := bytes.Clone(out[hdr+tlsRecordHeaderLen:])
+		c.writeBuf = buildTLSInnerRecordsParts(out[:hdr], c.appWriter, tlsRecHandshake, msg, nil)
+		return
+	}
+	out = append(out, tlsRecHandshake)
+	out = ensureTailCap(out, c.appWriter.Overhead())
+	c.writeBuf = sealTLSInnerInPlace(out, c.appWriter, hdr)
 }
+
+const tlsSessionTicketRecordHint = 256
 
 func (c *epollConn) appendTLS12ServerFinish(srv *Server, dst []byte) []byte {
 	st := c.tls12

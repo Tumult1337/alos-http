@@ -18,6 +18,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type startupLogBarrier struct {
@@ -466,6 +468,7 @@ func TestTLSActivationConflictStopsStartup(t *testing.T) {
 	if len(workers) != 1 {
 		t.Fatalf("prepared workers=%d, want 1", len(workers))
 	}
+	startupShareReservedPorts(t, workers)
 	contender, err := net.Listen("tcp4", server.config.Addr)
 	if err != nil {
 		t.Fatalf("fixture contender could not occupy the bound-but-unlistening address: %v", err)
@@ -512,9 +515,18 @@ func TestTLSActivationConflictStopsStartup(t *testing.T) {
 	})
 }
 
+func startupShareReservedPorts(t *testing.T, workers []*epollWorker) {
+	t.Helper()
+	for _, worker := range workers {
+		if err := unix.SetsockoptInt(worker.listenerFD, unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func startupBoundWorker(t *testing.T, server *Server, addr string) *epollWorker {
 	t.Helper()
-	fd, err := epollBind(addr)
+	fd, err := epollBind(addr, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -685,6 +697,7 @@ func TestTLSActivationConflictPreservesShutdownError(t *testing.T) {
 	case <-time.After(tlsEpollFixServeReturnLimit):
 		t.Fatal("startup did not reach pre-runtime preparation")
 	}
+	startupShareReservedPorts(t, startupPreparedWorkers(server))
 	contender, err := net.Listen("tcp4", server.config.Addr)
 	if err != nil {
 		t.Fatal(err)

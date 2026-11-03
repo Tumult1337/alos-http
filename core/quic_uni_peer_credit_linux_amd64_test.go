@@ -39,9 +39,7 @@ func uniCreditConn(t *testing.T) *QUICConn {
 	conn := newQUICConn(server, nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}, []byte{1}, []byte{2})
 	conn.maxDataRemote = 1 << 20
 	conn.pktBudget = 1200
-	conn.loss.mu.Lock()
-	conn.loss.bytesInFlight = int(conn.loss.cwnd)
-	conn.loss.mu.Unlock()
+	conn.addressValidated.Store(false)
 	t.Cleanup(conn.close)
 	return conn
 }
@@ -55,8 +53,11 @@ func uniCreditApply(t *testing.T, conn *QUICConn, params []byte) {
 
 func uniCreditCongested(t *testing.T, conn *QUICConn) {
 	t.Helper()
-	if conn.loss.canSend() {
-		t.Fatal("capture fixture permits packet draining")
+	conn.writeMu.Lock()
+	ampBudget := conn.ampBudgetLocked()
+	conn.writeMu.Unlock()
+	if ampBudget != 0 || conn.loss.sendRoom() == 0 {
+		t.Fatalf("capture fixture must block draining but not queueing: amplification budget=%d send room=%d", ampBudget, conn.loss.sendRoom())
 	}
 	if conn.maxDataRemote != 1<<20 || conn.pktBudget != 1200 {
 		t.Fatalf("capture fixture changed: connection credit=%d packet budget=%d", conn.maxDataRemote, conn.pktBudget)

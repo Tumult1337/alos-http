@@ -12,6 +12,7 @@ type h2BodyIn struct {
 	declared   int64
 	tooLarge   bool
 	tunnel     bool
+	deadline   int64
 }
 
 func (w *epollWorker) streamsH2Body(stream *H2Stream) bool {
@@ -27,17 +28,27 @@ func (w *epollWorker) streamsH2Body(stream *H2Stream) bool {
 	return true
 }
 
-func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
-	in := &h2BodyIn{streamID: stream.ID, recvWindow: stream.RecvWindow, declared: stream.declaredLen, tunnel: stream.wsTunnel}
+func (c *epollConn) openH2BodyIn(w *epollWorker, stream *H2Stream) *h2BodyIn {
+	in := &h2BodyIn{streamID: stream.ID, recvWindow: stream.RecvWindow, declared: stream.declaredLen, tunnel: stream.wsTunnel, deadline: deadlineFrom(w.readTO)}
 	gen := c.generation
 	in.reader = newBodyReader(func() {
 		w.postTask(func(w *epollWorker) { c.h2BodyAcked(w, in, gen) })
 	})
 	in.reader.uploadConn, in.reader.uploadGlobal = c.connLimiter, w.server.globalLimiter
+	in.reader.chargeBudget(w.server, &c.h2.bodyReserved)
 	if c.h2BodyIn == nil {
 		c.h2BodyIn = make(map[uint32]*h2BodyIn)
 	}
 	c.h2BodyIn[stream.ID] = in
+	return in
+}
+
+func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
+	in := stream.waitBody
+	if in == nil {
+		in = c.openH2BodyIn(w, stream)
+	}
+	stream.waitBody = nil
 	stream.req.Body = nil
 	stream.req.bodyStream = in.reader
 }
@@ -45,8 +56,7 @@ func (c *epollConn) startH2BodyStream(w *epollWorker, stream *H2Stream) {
 func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed int, payload []byte) bool {
 	in.recvWindow -= int64(frameConsumed)
 	if in.recvWindow < 0 {
-		c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, in.streamID, H2ErrFlowControl)
-		c.h2EndBodyIn(in, ErrBodyStreamAborted)
+		c.h2ResetBodyIn(in, H2ErrFlowControl)
 		return false
 	}
 	if !in.tooLarge && len(payload) > 0 {
@@ -57,9 +67,10 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 		if !in.tunnel && c.worker.bodyTooLarge(in.received) {
 			in.tooLarge = true
 			in.reader.finish(ErrBodyTooLarge)
-		} else {
-			in.reader.push(payload)
+		} else if !c.h2BufferBody(in, payload) {
+			return false
 		}
+		in.deadline = deadlineFrom(c.worker.readTO)
 	}
 	if endStream {
 		if !in.tooLarge && h2LengthMismatch(in.declared, in.received) {
@@ -75,9 +86,34 @@ func (c *epollConn) h2StreamBodyData(in *h2BodyIn, endStream bool, frameConsumed
 	return false
 }
 
+func (in *h2BodyIn) waitsForPeer() bool {
+	return !in.tunnel && !in.tooLarge && in.recvWindow > 0
+}
+
 func (c *epollConn) h2EndBodyIn(in *h2BodyIn, err error) {
 	delete(c.h2BodyIn, in.streamID)
-	in.reader.finish(err)
+	if err != nil {
+		in.reader.abort(err)
+		return
+	}
+	in.reader.finish(nil)
+}
+
+func (c *epollConn) h2BufferBody(in *h2BodyIn, payload []byte) bool {
+	if in.reader.reservePush(payload) {
+		return true
+	}
+	if _, waiting := c.h2.findWaiting(in.streamID); waiting != nil {
+		c.h2ResetBodyIn(in, H2ErrRefusedStream)
+		return false
+	}
+	c.h2ResetBodyIn(in, H2ErrEnhanceYourCalm)
+	return false
+}
+
+func (c *epollConn) h2ResetBodyIn(in *h2BodyIn, errCode uint32) {
+	c.writeBuf = appendH2RSTStreamFrame(c.writeBuf, in.streamID, errCode)
+	c.abandonH2Stream(in.streamID, ErrStreamClosed)
 }
 
 func (c *epollConn) h2BodyAcked(w *epollWorker, in *h2BodyIn, gen uint32) {
@@ -88,6 +124,9 @@ func (c *epollConn) h2BodyAcked(w *epollWorker, in *h2BodyIn, gen uint32) {
 	frame := appendH2WindowUpdateFrame(w.h2FinishScratch[:0], in.streamID, uint32(n))
 	c.emitH2(frame)
 	w.h2FinishScratch = frame[:0]
+	if in.recvWindow <= 0 {
+		in.deadline = deadlineFrom(w.readTO)
+	}
 	in.recvWindow += int64(n)
 	w.markFlush(c)
 }
@@ -103,7 +142,7 @@ func (c *epollConn) h2AbortBodyIn(streamID uint32) (wasOpen bool) {
 
 func (c *epollConn) h2AbortAllBodyIn() {
 	for _, in := range c.h2BodyIn {
-		in.reader.finish(ErrBodyStreamAborted)
+		in.reader.abort(ErrBodyStreamAborted)
 	}
 	clear(c.h2BodyIn)
 }

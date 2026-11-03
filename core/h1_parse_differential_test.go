@@ -32,6 +32,15 @@ func checkParseMatchesRef(t *testing.T, raw []byte, maxBytes, maxCount int) {
 	}
 }
 
+var rootGetRequestShapes = []struct {
+	name string
+	raw  []byte
+}{
+	{"wrk", []byte("GET / HTTP/1.1\r\nHost: 127.0.0.1:18443\r\n\r\n")},
+	{"curl", []byte("GET / HTTP/1.1\r\nHost: example.com\r\nUser-Agent: curl/8.5.0\r\nAccept: */*\r\n\r\n")},
+	{"browser", []byte("GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: keep-alive\r\nCache-Control: max-age=0\r\nsec-ch-ua: \"Chromium\";v=\"128\", \"Not;A=Brand\";v=\"24\"\r\nsec-ch-ua-mobile: ?0\r\nsec-ch-ua-platform: \"Windows\"\r\nUpgrade-Insecure-Requests: 1\r\nUser-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36\r\nAccept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\nSec-Fetch-Site: none\r\nSec-Fetch-Mode: navigate\r\nAccept-Encoding: gzip, deflate, br, zstd\r\nAccept-Language: en-US,en;q=0.9\r\n\r\n")},
+}
+
 func h1ParseTemplates() []string {
 	out := []string{
 		string(benchReqTypical),
@@ -41,7 +50,7 @@ func h1ParseTemplates() []string {
 		"POST /u HTTP/1.1\r\nHost: h.example:8080\r\nTransfer-Encoding: chunked\r\nExpect: 100-continue\r\nX-Forwarded-For: 1.2.3.4\r\nX-Real-IP: 5.6.7.8\r\n\r\n",
 		"GET http://abs.example/p?q=1 HTTP/1.1\r\nHost: other\r\nOrigin: https://o\r\nUpgrade: websocket\r\nSec-WebSocket-Key: k\r\nSec-WebSocket-Version: 13\r\nAuthorization: Bearer t\r\nAccept-Encoding: gzip\r\n\r\n",
 	}
-	for _, r := range gateRootFastRequests {
+	for _, r := range rootGetRequestShapes {
 		out = append(out, string(r.raw))
 	}
 	for _, c := range h1StrictCases() {
@@ -91,7 +100,7 @@ func TestParseH1MatchesReferenceAtLimits(t *testing.T) {
 	for _, maxBytes := range []int{16, 64, 200, len(raw) - 3, len(raw) - 2, len(raw) - 1, len(raw), 8192} {
 		checkParseMatchesRef(t, raw, maxBytes, 128)
 	}
-	big := "GET / HTTP/1.1\r\nHost: a\r\nX-Big: " + strings.Repeat("v", h1BlockMaxBytes) + "\r\n\r\n"
+	big := "GET / HTTP/1.1\r\nHost: a\r\nX-Big: " + strings.Repeat("v", 1024) + "\r\n\r\n"
 	checkParseMatchesRef(t, []byte(big), 8192, 128)
 }
 

@@ -117,18 +117,6 @@ func (s *Server) hostClientAuthDiffers(handshakeEntry *CertEntry, host string) b
 	return hostPolicy.requests() && hostPolicy != s.clientAuthFor(handshakeEntry)
 }
 
-func (s *Server) clientAuthConfigured() bool {
-	if s.config.TLSClientAuth != NoClientCert {
-		return true
-	}
-	for _, o := range s.clientAuthByHost {
-		if o.mode != nil && *o.mode != NoClientCert {
-			return true
-		}
-	}
-	return false
-}
-
 func (p clientAuthPolicy) requests() bool { return p.mode != NoClientCert }
 
 func (p clientAuthPolicy) requires() bool {

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"reflect"
 	"strings"
@@ -69,11 +70,7 @@ func TestHpackGetFallbackValidRepresentations(t *testing.T) {
 							var meta hpackRequestMeta
 							var err error
 							if requestWrapper {
-								var root bool
-								headers, meta, root, err = decoder.DecodeRequest(headers, block)
-								if err == nil && root != (path == "/") {
-									t.Fatalf("root classification %v for %q", root, path)
-								}
+								headers, meta, err = decoder.DecodeRequest(headers, block)
 							} else {
 								headers, meta, err = decoder.DecodeIntoRequest(headers, block)
 							}
@@ -108,9 +105,9 @@ func TestHpackGetFallbackStateAndMemo(t *testing.T) {
 	decoder := NewHpackDecoder()
 	incremental := hpackGetCompatibilityBlock("/", false, []byte{0x41, 0x01, 'a'})
 	for insertion := 1; insertion <= 2; insertion++ {
-		headers, meta, root, err := decoder.DecodeRequest(nil, incremental)
-		if err != nil || !root {
-			t.Fatalf("incremental block %d: root=%v err=%v", insertion, root, err)
+		headers, meta, err := decoder.DecodeRequest(nil, incremental)
+		if err != nil {
+			t.Fatalf("incremental block %d: %v", insertion, err)
 		}
 		hpackGetCompatibilityCheck(t, headers, meta, "/", "a")
 		if decoder.dynLen != insertion || decoder.tableGen != uint64(insertion) || decoder.memoValid {
@@ -118,15 +115,15 @@ func TestHpackGetFallbackStateAndMemo(t *testing.T) {
 		}
 	}
 	indexed := hpackGetCompatibilityBlock("/", false, []byte{0xbe})
-	headers, meta, _, err := decoder.DecodeRequest(nil, indexed)
+	headers, meta, err := decoder.DecodeRequest(nil, indexed)
 	if err != nil {
 		t.Fatalf("follow-up dynamic reference: %v", err)
 	}
 	hpackGetCompatibilityCheck(t, headers, meta, "/", "a")
-	if !decoder.MemoizedRootRequest(indexed) {
+	if !decoder.memoValid || !bytes.Equal(decoder.memoBlock, indexed) {
 		t.Fatal("unchanged-table valid root block was not memoized")
 	}
-	headers, meta, _, err = decoder.DecodeRequest(headers[:0], indexed)
+	headers, meta, err = decoder.DecodeRequest(headers[:0], indexed)
 	if err != nil || decoder.tableGen != 2 || decoder.dynLen != 2 {
 		t.Fatalf("memoized follow-up changed table state: gen=%d entries=%d err=%v", decoder.tableGen, decoder.dynLen, err)
 	}
@@ -136,7 +133,7 @@ func TestHpackGetFallbackStateAndMemo(t *testing.T) {
 func TestHpackGetFallbackLeadingTableUpdates(t *testing.T) {
 	decoder := NewHpackDecoder()
 	block := append([]byte{0x3f, 0x61}, hpackGetCompatibilityBlock("/", false, []byte{0x41, 0x01, 'a'})...)
-	headers, meta, _, err := decoder.DecodeRequest(nil, block)
+	headers, meta, err := decoder.DecodeRequest(nil, block)
 	if err != nil {
 		t.Fatalf("leading update and incremental field: %v", err)
 	}
@@ -145,7 +142,7 @@ func TestHpackGetFallbackLeadingTableUpdates(t *testing.T) {
 		t.Fatalf("update/insertion state: max=%d gen=%d entries=%d memo=%v", decoder.maxTableSize, decoder.tableGen, decoder.dynLen, decoder.memoValid)
 	}
 	zero := append([]byte{0x20}, hpackGetCompatibilityBlock("/", false, []byte{0x01, 0x01, 'a'})...)
-	headers, meta, _, err = decoder.DecodeRequest(nil, zero)
+	headers, meta, err = decoder.DecodeRequest(nil, zero)
 	if err != nil {
 		t.Fatalf("leading zero update: %v", err)
 	}
@@ -174,7 +171,7 @@ func TestHpackGetFallbackRejectsInvalidBlocks(t *testing.T) {
 		{"late-table-update", hpackGetCompatibilityBlock("/", false, []byte{0x20}), errHpackSizeUpdateAfterField},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if _, _, _, err := NewHpackDecoder().DecodeRequest(nil, test.block); err != test.want {
+			if _, _, err := NewHpackDecoder().DecodeRequest(nil, test.block); err != test.want {
 				t.Fatalf("invalid block returned %v, want %v", err, test.want)
 			}
 		})
@@ -205,14 +202,14 @@ func FuzzHpackGetFallbackValidBlocks(f *testing.F) {
 		}
 		block := hpackGetCompatibilityBlock(path, huffman, representations[mode])
 		for range 2 {
-			headers, meta, _, err := decoder.DecodeRequest(nil, block)
+			headers, meta, err := decoder.DecodeRequest(nil, block)
 			if err != nil {
 				t.Fatalf("valid generated block rejected: %v", err)
 			}
 			hpackGetCompatibilityCheck(t, headers, meta, path, "a")
 		}
 		if mode == 2 || mode == 3 {
-			headers, meta, _, err := decoder.DecodeRequest(nil, hpackGetCompatibilityBlock(path, huffman, []byte{0xbe}))
+			headers, meta, err := decoder.DecodeRequest(nil, hpackGetCompatibilityBlock(path, huffman, []byte{0xbe}))
 			if err != nil {
 				t.Fatalf("follow-up reference rejected: %v", err)
 			}
@@ -239,10 +236,10 @@ func TestHpackGetFallbackPreservesOtherLayouts(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			decoder := NewHpackDecoder()
-			headers, meta, root, err := decoder.DecodeRequest(nil, test.block)
+			headers, meta, err := decoder.DecodeRequest(nil, test.block)
 			want := [][2]string{{":method", test.method}, {":path", "/"}, {":scheme", test.scheme}}
-			if err != nil || !reflect.DeepEqual(headers, want) || meta.method != test.method || meta.scheme != test.scheme || root != (test.method == "GET") || decoder.dynLen != test.entries || decoder.tableGen != uint64(test.entries) {
-				t.Fatalf("nonmatching layout: fields=%q meta=%+v root=%v entries=%d gen=%d err=%v", headers, meta, root, decoder.dynLen, decoder.tableGen, err)
+			if err != nil || !reflect.DeepEqual(headers, want) || meta.method != test.method || meta.scheme != test.scheme || decoder.dynLen != test.entries || decoder.tableGen != uint64(test.entries) {
+				t.Fatalf("nonmatching layout: fields=%q meta=%+v entries=%d gen=%d err=%v", headers, meta, decoder.dynLen, decoder.tableGen, err)
 			}
 		})
 	}

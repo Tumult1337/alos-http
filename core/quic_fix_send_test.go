@@ -3,6 +3,7 @@
 package core
 
 import (
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -35,15 +36,20 @@ func newQUICFixStalledPeer(t *testing.T) *quicTestPeer {
 
 func newQUICTestPeerFor(t *testing.T, srv *Server) *quicTestPeer {
 	t.Helper()
+	startReqStreamWorkers()
 	pc := &capturePacketConn{}
 	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	qc := newQUICConn(srv, pc, &quicFixLoopback, dcid, []byte{9, 10, 11, 12, 13, 14, 15, 16})
+	_, serverKeys, err := quicDeriveInitialKeys(dcid)
+	if err != nil {
+		t.Fatal(err)
+	}
 	_, keys, err := quicDeriveInitialKeys(dcid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	qc.keys[quicSpaceAppData] = keys
-	qc.sendKeys[quicSpaceAppData] = keys
+	qc.keys[quicSpaceAppData] = serverKeys
+	qc.sendKeys[quicSpaceAppData] = serverKeys
 	qc.addressValidated.Store(true)
 	qc.peerStreamWindow = 1 << 20
 	qc.peerUniStreamWindow = 1 << 20
@@ -67,6 +73,30 @@ func (p *quicTestPeer) pendingResponseBytes() (pending int, resets int) {
 	return pending, resets
 }
 
+func (p *quicTestPeer) admitTogether(send func()) {
+	softCap := p.qc.stallSoftCap.Load()
+	p.qc.stallSoftCap.Store(math.MaxInt64)
+	send()
+	p.qc.stallSoftCap.Store(softCap)
+}
+
+func (p *quicTestPeer) awaitAdmissionSettled() {
+	p.t.Helper()
+	deadline := turbo.Deadline(quicPeerWait)
+	for {
+		p.qc.admitMu.Lock()
+		running, waiting := p.qc.runningReqs, len(p.qc.waitingReqs)
+		p.qc.admitMu.Unlock()
+		if running == 0 && int(p.qc.activeReqStreams.Load()) == waiting {
+			return
+		}
+		if turbo.Until(deadline) <= 0 {
+			p.t.Fatalf("%d request handlers still running, %d waiting, %d slots", running, waiting, p.qc.activeReqStreams.Load())
+		}
+		turbo.Sleep(quicPeerPoll)
+	}
+}
+
 func (p *quicTestPeer) awaitHandlersIdle() {
 	p.t.Helper()
 	deadline := turbo.Deadline(quicPeerWait)
@@ -80,9 +110,11 @@ func (p *quicTestPeer) awaitHandlersIdle() {
 
 func TestQUICFixStalledResponsesAreBoundedPerConn(t *testing.T) {
 	p := newQUICFixStalledPeer(t)
-	for i := 0; i < quicFixStalledStreams; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < quicFixStalledStreams; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
 	pending, _ := p.pendingResponseBytes()
 	if limit := quicFixPendingWriteCap*quicFixHardCapFactor + quicFixBigResponse + 4096; pending > limit {
@@ -102,9 +134,11 @@ func TestQUICFixStalledResponsesAreBoundedPerConn(t *testing.T) {
 
 func TestQUICFixStalledStreamsResetWithoutProgress(t *testing.T) {
 	p := newQUICFixStalledPeer(t)
-	for i := 0; i < 4; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < 4; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
 	p.qc.lastActive.Store(turbo.UnixNano() + int64(quicFixStallTimeoutPlus))
 	p.qc.tick(turbo.UnixNano()+int64(quicFixStallTimeoutPlus), true)
@@ -124,9 +158,11 @@ func TestQUICFixStalledStreamsResetWithoutProgress(t *testing.T) {
 
 func TestQUICFixStalledAccountingDrainsWithCredit(t *testing.T) {
 	p := newQUICFixStalledPeer(t)
-	for i := 0; i < 2; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < 2; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
 	if pending, _ := p.pendingResponseBytes(); pending == 0 {
 		t.Fatal("responses were not held back by the 1-byte stream window")

@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -366,4 +367,28 @@ func TestQUICCloseRacesPeerStreamCreation(t *testing.T) {
 		t.Fatal("peer stream creation raced past close")
 	}
 	quicCloseBudget(t, qc, 0)
+}
+
+func TestQUICClosedRetirementGrantsNoStreamCredit(t *testing.T) {
+	for _, streamID := range []uint64{0, 2} {
+		t.Run(fmt.Sprintf("stream=%d", streamID), func(t *testing.T) {
+			conn := quicCloseConn(t)
+			conn.loss = newQuicLossState()
+			conn.pktBudget = quicCoalesceBudget
+			conn.streamWriters.Store(1)
+			stream := getPooledStream(streamID, conn)
+			stream.refCount.Store(2)
+			conn.streams[streamID] = stream
+			conn.close()
+			maxUni, maxBidi := conn.maxUniRemote, conn.maxBidiRemote
+			if stream.refCount.Load() != 1 || !conn.closed.Load() {
+				t.Fatal("fixture did not close while it retained the caller reference")
+			}
+			conn.retireStream(stream, 1)
+			if conn.uniStreamsRetired.Load() != 0 || conn.bidiStreamsRetired.Load() != 0 || conn.maxUniRemote != maxUni || conn.maxBidiRemote != maxBidi {
+				t.Fatalf("closed retirement granted credit: uni=%d bidi=%d maxUni=%d maxBidi=%d", conn.uniStreamsRetired.Load(), conn.bidiStreamsRetired.Load(), conn.maxUniRemote, conn.maxBidiRemote)
+			}
+			conn.releaseStream(stream)
+		})
+	}
 }

@@ -123,6 +123,10 @@ baseline
 
 `MaxBodySize` is a correctness limit for one request. `MaxInFlightBodyBytes` is the RAM-safety limit for all buffered requests. `MaxConns` bounds connection state. All three are required.
 
+## Accepted limitations
+
+- WebSocket permessage-deflate (`WSConn.completeMessage`): the inflated length is reserved from `MaxInFlightBodyBytes` after `wsInflate` returns, so the budget bounds how long inflated bytes are held, not their peak; `MaxMessageSize` bounds the peak of one message.
+
 ## Reproduction commands
 
 The bounded incomplete-upload tool is available at `cmd/memflood`:

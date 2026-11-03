@@ -72,8 +72,8 @@ func streamTransportHeaders(t *testing.T, fixture *streamTransportFixture, reque
 	}
 	var fields [][2]string
 	switch writer := fixture.resp.sw.(type) {
-	case *epollH1StreamWriter:
-		response, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(writer.pending)), nil)
+	case *h1StreamHandle:
+		response, err := http.ReadResponse(bufio.NewReader(bytes.NewReader(writer.sw.pending)), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -85,9 +85,9 @@ func streamTransportHeaders(t *testing.T, fixture *streamTransportFixture, reque
 				fields = append(fields, [2]string{name, value})
 			}
 		}
-	case *epollH2StreamWriter:
+	case *h2StreamHandle:
 		var err error
-		fields, err = NewHpackDecoder().Decode(writer.header)
+		fields, err = NewHpackDecoder().Decode(writer.sw.header)
 		if err != nil {
 			t.Fatal(err)
 		}

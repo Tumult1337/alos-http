@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
+	"time"
 )
 
 // StaticConfig configures the file server returned by Static.
@@ -30,11 +31,23 @@ import (
 //
 //	Example: Browse: true.
 //	Example: Browse: false.
+//
+// DisableCompression turns off the compressed copies Static otherwise serves; defaults to false. When compression is on, a cached text-like file (text/*, JavaScript, JSON, XML, SVG, WebAssembly, TTF/OTF fonts, ICO) between 256 bytes and CacheMaxFileSize is compressed once per cached file version in the background with brotli and gzip, stored in the file cache against CacheMaxBytes, and served to clients whose Accept-Encoding allows it with Vary: Accept-Encoding and a per-encoding ETag; requests that send Range always get the uncompressed file. Compression needs the file cache, so it is also off when DisableCache is set.
+//
+//	Example: DisableCompression: true.
+//	Example: DisableCompression: false.
 type StaticConfig struct {
-	Root   string
-	Index  string
-	Browse bool
+	Root               string
+	Index              string
+	Browse             bool
+	DisableCache       bool
+	CacheMaxBytes      int64
+	CacheMaxFileSize   int64
+	CacheTTL           time.Duration
+	DisableCompression bool
 }
+
+const wellKnownSegment = ".well-known"
 
 func sanitizeStaticPath(p string) (string, bool) {
 	if strings.ContainsAny(p, "\x00\\") {
@@ -43,12 +56,27 @@ func sanitizeStaticPath(p string) (string, bool) {
 	if strings.Contains(p, "..") {
 		return "", false
 	}
-	for _, seg := range strings.Split(p, "/") {
-		if len(seg) > 0 && seg[0] == '.' && seg != ".well-known" {
+	for i := 0; i < len(p); i++ {
+		if p[i] != '.' || (i > 0 && p[i-1] != '/') {
+			continue
+		}
+		seg := p[i:]
+		if end := strings.IndexByte(seg, '/'); end >= 0 {
+			seg = seg[:end]
+		}
+		if seg != wellKnownSegment {
 			return "", false
 		}
 	}
 	return p, true
+}
+
+func staticIndexIsPlainName(index string) bool {
+	if strings.Contains(index, "/") {
+		return false
+	}
+	_, ok := sanitizeStaticPath("/" + index)
+	return ok
 }
 
 // Static returns a handler that serves files from cfg.Root under urlPrefix, stripping urlPrefix from the request path and rejecting traversal outside the root. Register it on a catch-all route so every path below the prefix reaches the handler.
@@ -56,6 +84,11 @@ func sanitizeStaticPath(p string) (string, bool) {
 // Example: s.Router.GET("/static/*filepath", Static("/static", StaticConfig{Root: "./public"}))
 // Example: s.Router.GET("/files/*filepath", Static("/files", StaticConfig{Root: "/var/www", Browse: true}))
 func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
+	handler, _ := newStaticHandler(urlPrefix, cfg)
+	return handler
+}
+
+func newStaticHandler(urlPrefix string, cfg StaticConfig) (HandlerFunc, *staticFileCache) {
 	if !strings.HasPrefix(urlPrefix, "/") {
 		urlPrefix = "/" + urlPrefix
 	}
@@ -70,8 +103,14 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 		absRoot = cfg.Root
 	}
 	root := newStaticRoot(absRoot)
+	rootWithSep := absRoot
+	if !strings.HasSuffix(rootWithSep, string(os.PathSeparator)) {
+		rootWithSep += string(os.PathSeparator)
+	}
+	cache := newStaticFileCache(cfg)
+	indexFast := !cfg.Browse && staticIndexIsPlainName(cfg.Index)
 
-	return func(req *Request, resp *Response) {
+	handler := func(req *Request, resp *Response) {
 		reqPath := strings.TrimPrefix(req.Path, urlPrefix)
 		if reqPath == "" {
 			reqPath = "/"
@@ -88,6 +127,13 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 		}
 
 		cleanRel = strings.TrimPrefix(cleanRel, "/")
+		fastRel := cleanRel
+		if indexFast && (cleanRel == "" || strings.HasSuffix(cleanRel, "/")) {
+			fastRel = cleanRel + cfg.Index
+		}
+		if fastRel != "" && root.serveFast(req, resp, fastRel, cache) {
+			return
+		}
 
 		fullPath := filepath.Join(absRoot, filepath.FromSlash(cleanRel))
 
@@ -97,10 +143,6 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			return
 		}
 
-		rootWithSep := absRoot
-		if !strings.HasSuffix(rootWithSep, string(os.PathSeparator)) {
-			rootWithSep += string(os.PathSeparator)
-		}
 		if absFullPath != absRoot && !strings.HasPrefix(absFullPath, rootWithSep) {
 			resp.Status(403).String("Forbidden")
 			return
@@ -162,11 +204,15 @@ func Static(urlPrefix string, cfg StaticConfig) HandlerFunc {
 			resp.Status(404).String("Not Found")
 		}
 	}
+	return handler, cache
 }
 
 type staticRoot struct {
-	abs      string
-	resolved atomic.Pointer[staticRootDir]
+	abs       string
+	absZ      []byte
+	resolved  atomic.Pointer[staticRootDir]
+	dir       atomic.Pointer[staticDirHandle]
+	noOpenat2 atomic.Bool
 }
 
 type staticRootDir struct {
@@ -175,8 +221,11 @@ type staticRootDir struct {
 }
 
 func newStaticRoot(absRoot string) *staticRoot {
-	root := &staticRoot{abs: absRoot}
+	root := &staticRoot{abs: absRoot, absZ: append([]byte(absRoot), 0)}
 	root.resolved.Store(newStaticRootDir(evalStaticRoot(absRoot)))
+	if strings.IndexByte(absRoot, 0) >= 0 {
+		root.noOpenat2.Store(true)
+	}
 	return root
 }
 

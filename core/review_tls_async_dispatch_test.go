@@ -19,7 +19,7 @@ const tlsSlowHandlerHold = 3 * 150 * time.Millisecond
 
 func startSlowFastTLSServer(t *testing.T) string {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr:          addr,
 		HTTPAddr:      "-",
@@ -118,7 +118,7 @@ func TestTLSPipelinedRequestsAfterAsyncDispatch(t *testing.T) {
 }
 
 func TestTLSHijackStillWorksAfterAsyncDispatch(t *testing.T) {
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{
 		Addr:          addr,
 		HTTPAddr:      "-",

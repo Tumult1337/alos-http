@@ -73,6 +73,7 @@ type CertEntry struct {
 	Source   CertSource
 
 	cachedCertMsg     []byte
+	cachedCert12Msg   []byte
 	cachedEEH1        []byte
 	cachedEEH2        []byte
 	cachedEEEmpty     []byte
@@ -134,6 +135,9 @@ func (cs *CertStore) Lookup(serverName string) *CertEntry {
 func (entry *CertEntry) initCachedHandshake() {
 	if entry.cachedCertMsg == nil && len(entry.ChainDER) > 0 {
 		entry.cachedCertMsg = BuildCertificate(entry.ChainDER)
+	}
+	if entry.cachedCert12Msg == nil && len(entry.ChainDER) > 0 {
+		entry.cachedCert12Msg = buildTLS12Certificate(entry.ChainDER)
 	}
 	if entry.cachedEEH1 == nil {
 		entry.cachedEEH1 = BuildEncryptedExtensions("http/1.1")
@@ -257,18 +261,7 @@ func NewCertEntryFromPEM(domain string, certPEM, keyPEM []byte, source CertSourc
 		return nil, err
 	}
 
-	var chainDER [][]byte
-	rest := certPEM
-	for {
-		var block *pem.Block
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			break
-		}
-		if block.Type == "CERTIFICATE" {
-			chainDER = append(chainDER, block.Bytes)
-		}
-	}
+	chainDER := pemCertificateChain(certPEM)
 	if len(chainDER) == 0 {
 		return nil, &staticError{"invalid cert PEM"}
 	}
@@ -295,14 +288,21 @@ func NewCertEntryFromPEM(domain string, certPEM, keyPEM []byte, source CertSourc
 //
 // Example: entry := NewCertEntryFromDER("example.com", certDER, privKey, CertSelfSigned)
 func NewCertEntryFromDER(domain string, certDER []byte, privKey crypto.Signer, source CertSource) *CertEntry {
+	return newCertEntryFromChainDER(domain, [][]byte{certDER}, privKey, source)
+}
+
+func newCertEntryFromChainDER(domain string, chainDER [][]byte, privKey crypto.Signer, source CertSource) *CertEntry {
 	domain = normalizeCertDomain(domain)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+	var certPEM []byte
+	for _, der := range chainDER {
+		certPEM = append(certPEM, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})...)
+	}
 	keyBytes, err := x509.MarshalPKCS8PrivateKey(privKey)
 	if err != nil {
 		logger().Error("certificate private key could not be encoded", "domain", domain, "err", err)
 		return &CertEntry{
 			Domain:   domain,
-			ChainDER: [][]byte{certDER},
+			ChainDER: chainDER,
 			PrivKey:  privKey,
 			Source:   source,
 		}
@@ -315,7 +315,7 @@ func NewCertEntryFromDER(domain string, certDER []byte, privKey crypto.Signer, s
 
 	return &CertEntry{
 		Domain:   domain,
-		ChainDER: [][]byte{certDER},
+		ChainDER: chainDER,
 		PrivKey:  privKey,
 		TLSCert:  tlsCert,
 		Source:   source,

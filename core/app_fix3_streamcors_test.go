@@ -151,7 +151,7 @@ func appFix3Server(t *testing.T, useTLS, inline bool, policy *CORSConfig, handle
 	return newTestServer(t, testServerOptions{
 		TLS:    useTLS,
 		Routes: appFix3Routes(handled),
-		Config: func(c *Config) { c.InlineHandlers = inline },
+		Config: func(c *Config) { c.InlineHandlers, c.DisableInlineHandlers = inline, !inline },
 		Setup: func(s *Server) {
 			if policy != nil {
 				s.SetCORS(*policy)

@@ -124,7 +124,7 @@ func TestTLSHandshakeWithNonP256Certificates(t *testing.T) {
 
 func testHandshakeWithKey(t *testing.T, name string, key crypto.Signer, version uint16) {
 	t.Helper()
-	addr := reserveLocalAddr(t)
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{Addr: addr, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1, Listeners: 1})
 	certPEM, keyPEM := selfSignedPEM(t, key, "sig.test")
 	if err := srv.AddCert("sig.test", certPEM, keyPEM); err != nil {

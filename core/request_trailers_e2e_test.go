@@ -122,7 +122,7 @@ func h2ReadBody(t *testing.T, rc *h2RawConn, streamID uint32) (int, string) {
 		case H2FrameRSTStream:
 			t.Fatalf("stream %d reset", streamID)
 		case H2FrameHeaders:
-			status = h2RawStatusFromHeaders(t, f.payload)
+			status = f.status(t)
 		case H2FrameData:
 			body = append(body, f.payload...)
 		}

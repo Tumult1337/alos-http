@@ -45,7 +45,7 @@ func TestQUICEveryAckElicitingPacketStaysRetransmittable(t *testing.T) {
 		ls.sent[quicSpaceAppData][i].sent -= int64(10 * time.Second)
 	}
 	ls.mu.Unlock()
-	frames := ls.ptoExpiredFrames(quicSpaceAppData)
+	frames := ls.ptoExpiredFrames(quicSpaceAppData, 0)
 	if len(frames) != sent {
 		t.Fatalf("PTO recovered %d of %d ack-eliciting packets; the rest were silently untracked and can never be retransmitted", len(frames), sent)
 	}

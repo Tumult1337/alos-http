@@ -43,9 +43,7 @@ func (w *epollWorker) beginTunnel(c *backendConn, p *h1Parser) bool {
 	cc.protocol = plainConnProtoTunnel
 	cc.tunnelBE = c
 	c.tunnelClient = cc
-	// A tunnel has no request cadence, so the idle and request deadlines that
-	// would otherwise reap it no longer apply.
-	cc.deadline = 0
+	cc.deadline = deadlineFrom(w.idleTO)
 	c.idleDeadline = fpNoDeadline
 
 	w.flush(cc)
@@ -86,6 +84,9 @@ func (w *epollWorker) tunnelToClient(c *backendConn, data []byte) {
 	}
 	w.clientAppend(cc, data)
 	w.flush(cc)
+	if cc.fd >= 0 && !cc.outArmed {
+		cc.deadline = deadlineFrom(w.idleTO)
+	}
 	if cc.fd >= 0 && len(cc.writeBuf)-cc.writeSent > proxyStreamHighWater && cc.pausedBackend == nil {
 		cc.pausedBackend = c
 		w.be.pauseBackendRead(c)

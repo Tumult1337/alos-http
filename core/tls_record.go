@@ -198,18 +198,21 @@ func SendCCS(conn net.Conn) error {
 	return WriteRecord(conn, 0x14, []byte{0x01})
 }
 
-// AppendRecord appends a TLS 1.2-framed record (version 0x0303) of content type ct
-// and payload to dst and returns the extended slice, truncating payload to
-// MaxRecordPayload bytes if it is larger.
+// AppendRecord appends TLS 1.2-framed records (version 0x0303) of content type ct
+// carrying payload to dst and returns the extended slice, fragmenting payload
+// into consecutive records of at most MaxRecordPayload bytes if it is larger.
 func AppendRecord(dst []byte, ct byte, payload []byte) []byte {
-	pLen := len(payload)
-	if pLen > MaxRecordPayload {
-		pLen = MaxRecordPayload
-		payload = payload[:pLen]
+	for len(payload) > MaxRecordPayload {
+		dst = appendRecordFragment(dst, ct, payload[:MaxRecordPayload])
+		payload = payload[MaxRecordPayload:]
 	}
+	return appendRecordFragment(dst, ct, payload)
+}
+
+func appendRecordFragment(dst []byte, ct byte, payload []byte) []byte {
+	pLen := len(payload)
 	dst = append(dst, ct, 0x03, 0x03, byte(pLen>>8), byte(pLen))
-	dst = append(dst, payload...)
-	return dst
+	return append(dst, payload...)
 }
 
 // StripInnerPlaintext parses a TLS 1.3 decrypted inner plaintext (content followed
@@ -248,10 +251,8 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 	if len(data) <= 256 {
 		innerLen := len(data) + 1
 		ciphertextLen := innerLen + overhead
-		var innerBuf [257]byte
-		inner := innerBuf[:innerLen]
-		copy(inner, data)
-		inner[innerLen-1] = 0x17
+		inner := append(acquirePooledBuf(&tlsScratchPool), data...)
+		inner = append(inner, 0x17)
 
 		obp := MediumBufPool.Get().(*[]byte)
 		out := (*obp)[:5]
@@ -261,6 +262,7 @@ func WriteAppData(conn net.Conn, writer *TrafficAEAD, data []byte) error {
 		out[3] = byte(ciphertextLen >> 8)
 		out[4] = byte(ciphertextLen)
 		out = writer.EncryptAppend(out, inner)
+		releasePooledBuf(&tlsScratchPool, inner, MaxRecordSize)
 
 		if owned, ok := conn.(ownedWriteConn); ok {
 			_, err := owned.WriteOwned(out, obp, writeOwnedReleaseMediumBuf)

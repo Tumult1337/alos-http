@@ -36,60 +36,13 @@ func TestHandoffConn_ReleasesIPSlotOnClose(t *testing.T) {
 	}
 }
 
-func TestAcquireIPConn_ProxyModeRewritesRealIPNoLimit(t *testing.T) {
+func TestApplyTrustedIP_ProxyModeRewritesRealIP(t *testing.T) {
 	s := New(Config{ProxyMode: true, MaxConnsPerIP: 2})
 	defer s.perIPConnLimiter.Load().Stop()
 
 	req := xffReq("1", "203.0.113.9")
-	c1 := &epollConn{}
-	if !c1.acquireIPConn(s, req) {
-		t.Fatal("conn1 should acquire")
-	}
+	applyTrustedIP(s, req)
 	if req.RemoteAddr != "203.0.113.9" {
 		t.Fatalf("RemoteAddr=%q want rewritten real IP 203.0.113.9", req.RemoteAddr)
-	}
-	for i := 0; i < 10; i++ {
-		c := &epollConn{}
-		if !c.acquireIPConn(s, xffReq("2", "203.0.113.9")) {
-			t.Fatalf("conn %d from same real IP must acquire; the per-conn limit is not enforced behind a trusted proxy", i)
-		}
-	}
-}
-
-func TestAcquireIPConn_NonProxyDeferredToAccept(t *testing.T) {
-	s := New(Config{MaxConnsPerIP: 1})
-	defer s.perIPConnLimiter.Load().Stop()
-	c := &epollConn{}
-	if !c.acquireIPConn(s, &Request{RemoteAddr: "10.0.0.1:1"}) {
-		t.Fatal("non-proxy acquireIPConn must return true (enforced at accept, not here)")
-	}
-	if c.ipHeld {
-		t.Fatal("non-proxy acquireIPConn must not set ipHeld")
-	}
-}
-
-func TestAcquireIPConn_ProxyModeNoLimitAcrossConns(t *testing.T) {
-	s := New(Config{ProxyMode: true, MaxConnsPerIP: 1})
-	defer s.perIPConnLimiter.Load().Stop()
-	c := &epollConn{}
-	if !c.acquireIPConn(s, xffReq("1", "203.0.113.1")) {
-		t.Fatal("first acquire should succeed")
-	}
-	if !c.acquireIPConn(s, xffReq("1", "203.0.113.1")) {
-		t.Fatal("second call on same conn should return true")
-	}
-	c2 := &epollConn{}
-	if !c2.acquireIPConn(s, xffReq("2", "203.0.113.1")) {
-		t.Fatal("a new conn from the same real IP must also acquire (no per-conn limit behind a trusted proxy)")
-	}
-}
-
-func TestAcquireIPConn_DisabledIsNoop(t *testing.T) {
-	s := New(Config{ProxyMode: true, MaxConnsPerIP: -1})
-	c := &epollConn{}
-	for i := 0; i < 100; i++ {
-		if !c.acquireIPConn(s, xffReq("1", "203.0.113.1")) {
-			t.Fatal("disabled limiter must always allow")
-		}
 	}
 }

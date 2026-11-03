@@ -535,12 +535,7 @@ func TestDeepHTTP10ClientGetsResponse(t *testing.T) {
 
 func TestDeepUnknownHostIsNotProxied(t *testing.T) {
 	o := newInloopOrigin(t, dpFixed("backend"))
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
+	addr := freeLoopbackAddr(t)
 	srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1})
 	srv.Router.GET("/x", func(req *Request, resp *Response) {
 		resp.Status(200).String("local")

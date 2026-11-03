@@ -24,13 +24,11 @@ var (
 func startH2FuzzServer(tb testing.TB) string {
 	tb.Helper()
 	h2FuzzOnce.Do(func() {
-		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		addr, _, err := reserveLoopbackPort()
 		if err != nil {
 			h2FuzzErr = err
 			return
 		}
-		addr := ln.Addr().String()
-		_ = ln.Close()
 		srv := New(Config{Addr: addr, PlainHTTP: true, HTTPAddr: "-", LogRequests: false, MaxConnsPerIP: -1})
 		srv.Router.GET("/", func(req *Request, resp *Response) { resp.String("root") })
 		srv.Router.POST("/echo", func(req *Request, resp *Response) { resp.Bytes(req.Body) })

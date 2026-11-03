@@ -3,6 +3,7 @@
 package core
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -61,20 +62,25 @@ func quicFix5DataBytes(t *testing.T, stream []byte) int {
 func newQUICFix5FreshStallPeer(t *testing.T) (*quicTestPeer, int64) {
 	t.Helper()
 	p := newQUICFixStalledPeer(t)
-	for i := 0; i < quicFix5OldStalledStreams; i++ {
-		quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
-	}
+	p.admitTogether(func() {
+		for i := 0; i < quicFix5OldStalledStreams; i++ {
+			quicFixSendRequest(p, uint64(i*4), h3AppendHeadersFrame(nil, quicFixGET("/big")))
+		}
+	})
 	p.awaitHandlersIdle()
-	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap {
-		t.Fatalf("precondition: %d stalled bytes, soft cap %d", held, p.qc.stallSoftCap)
+	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap.Load() {
+		t.Fatalf("precondition: %d stalled bytes, soft cap %d", held, p.qc.stallSoftCap.Load())
 	}
 	now := turbo.UnixNano()
 	for i := 0; i < quicFix5OldStalledStreams; i++ {
 		p.backdateStall(uint64(i*4), quicFixStallTimeoutPlus)
 	}
 	p.qc.lastSendProgress.Store(now - int64(quicFixStallTimeoutPlus))
+	softCap := p.qc.stallSoftCap.Load()
+	p.qc.stallSoftCap.Store(math.MaxInt64)
 	quicFixSendRequest(p, quicFix5FreshStream, h3AppendHeadersFrame(nil, quicFixGET("/big")))
 	p.awaitHandlersIdle()
+	p.qc.stallSoftCap.Store(softCap)
 	p.tickAt(now)
 	reset := p.excessiveLoadResets()
 	for i := 0; i < quicFix5OldStalledStreams; i++ {
@@ -93,8 +99,8 @@ func TestQUICFix5SendStallSparesFreshlyStalledStream(t *testing.T) {
 	if !p.hasStream(quicFix5FreshStream) {
 		t.Fatalf("freshly stalled stream %d was retired", quicFix5FreshStream)
 	}
-	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap {
-		t.Fatalf("precondition: fresh stream holds %d stalled bytes, want more than the %d soft cap", held, p.qc.stallSoftCap)
+	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap.Load() {
+		t.Fatalf("precondition: fresh stream holds %d stalled bytes, want more than the %d soft cap", held, p.qc.stallSoftCap.Load())
 	}
 	if p.qc.sendStalledTooLong(now) {
 		t.Fatal("the stall timer still fires right after the reset pass; it would rescan every idle check")
@@ -108,8 +114,8 @@ func TestQUICFix5StallTimerRearmsWhenNoStreamQualifies(t *testing.T) {
 	p := newQUICFixStalledPeer(t)
 	quicFixSendRequest(p, quicFix5FreshStream, h3AppendHeadersFrame(nil, quicFixGET("/big")))
 	p.awaitHandlersIdle()
-	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap {
-		t.Fatalf("precondition: %d stalled bytes, soft cap %d", held, p.qc.stallSoftCap)
+	if held := p.qc.stalledSendBytes.Load(); held <= p.qc.stallSoftCap.Load() {
+		t.Fatalf("precondition: %d stalled bytes, soft cap %d", held, p.qc.stallSoftCap.Load())
 	}
 	now := turbo.UnixNano()
 	p.qc.lastSendProgress.Store(now - int64(quicFixStallTimeoutPlus))

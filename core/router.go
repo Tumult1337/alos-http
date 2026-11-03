@@ -9,6 +9,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"unsafe"
+
+	"github.com/guno1928/alosmap"
 )
 
 // HandlerFunc is the signature for request handlers. Every route handler and
@@ -49,6 +51,7 @@ type node struct {
 	catchName         string
 	middleware        []MiddlewareFunc
 	backtrackable     bool
+	inline            bool
 }
 
 const (
@@ -134,6 +137,9 @@ type Router struct {
 	built                   atomic.Bool
 	buildOnce               sync.Once
 	server                  *Server
+	inlineHandlers          *alosmap.TypedMap[uintptr, bool]
+	inlineDemoted           atomic.Pointer[alosmap.TypedMap[uintptr, *inlineRoute]]
+	inlineDemotedLive       atomic.Int32
 }
 
 // NewRouter creates a new Router with default 404 and 405 handlers. Register
@@ -287,6 +293,7 @@ func (r *Router) addRoute(root *node, path string, handler HandlerFunc) *node {
 						paramName:  child.paramName,
 						catchName:  child.catchName,
 						middleware: child.middleware,
+						inline:     child.inline,
 					}
 
 					child.path = child.path[:commonLen]
@@ -298,6 +305,7 @@ func (r *Router) addRoute(root *node, path string, handler HandlerFunc) *node {
 					child.paramName = ""
 					child.catchName = ""
 					child.middleware = nil
+					child.inline = false
 				}
 
 				remaining = remaining[commonLen:]
@@ -533,6 +541,9 @@ func collectStaticRoutes(n *node, prefix string, out *[]staticEntry) {
 func (r *Router) buildNode(n *node, inheritedCatchAll *node) {
 	if n.handler != nil {
 		n.wrappedHandler = r.applyMiddleware(n.handler)
+		if n.inline {
+			n.wrappedHandler = r.registerInline(n.wrappedHandler)
+		}
 	}
 	if inheritedCatchAll != nil {
 		n.inheritedCatchAll = inheritedCatchAll

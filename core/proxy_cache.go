@@ -50,7 +50,8 @@ type CacheRule struct {
 }
 
 // ProxyCacheConfig controls how the reverse proxy caches backend responses. The zero
-// value is valid; NewProxyCache and UpdateConfig apply defaults to zero-valued fields.
+// value is valid; NewProxyCache applies defaults to zero-valued fields. UpdateConfig stores
+// MaxEntrySize, MaxTotalBytes, and MaxEntries as given and applies defaults to the other fields.
 //
 // Rules lists path-specific caching rules, consulted in order; the first rule whose
 // PathPrefix, Methods, and StatusOnly all match supplies the TTL. Only GET/HEAD
@@ -77,7 +78,8 @@ type CacheRule struct {
 //
 //	Example: MaxTotalBytes: 512 << 20.
 //
-// MaxEntries caps the number of stored entries; 0 disables the cap (DefaultProxyCacheConfig sets 10000).
+// MaxEntries caps the number of stored entries; 0 defaults to 10000 in NewProxyCache
+// and a negative value disables the cap. UpdateConfig preserves 0 as disabled.
 //
 //	Example: MaxEntries: 50000.
 //
@@ -92,7 +94,7 @@ type CacheRule struct {
 //
 //	Example: PreCompress: true.
 //
-// CompressLevel is the gzip level used when PreCompress is set; values outside 1-9 default to 6.
+// CompressLevel is the gzip level used when PreCompress is set; values outside 1-9 default to 2.
 //
 //	Example: CompressLevel: 9.
 //
@@ -112,17 +114,19 @@ type ProxyCacheConfig struct {
 	CompressMinLen int
 }
 
+const defaultProxyCacheMaxEntries = 10000
+
 // DefaultProxyCacheConfig returns a ProxyCacheConfig with sensible defaults:
 // 4 MB max entry, 5 minute TTL, 256 MB total, 10k entries, gzip compression
-// at level 6 for responses >= 512 bytes.
+// at level 2 for responses >= 512 bytes.
 func DefaultProxyCacheConfig() ProxyCacheConfig {
 	return ProxyCacheConfig{
 		MaxEntrySize:   4 << 20,
 		DefaultMaxAge:  5 * time.Minute,
 		MaxTotalBytes:  256 << 20,
-		MaxEntries:     10000,
+		MaxEntries:     defaultProxyCacheMaxEntries,
 		PreCompress:    true,
-		CompressLevel:  6,
+		CompressLevel:  defaultCompressLevel,
 		CompressMinLen: 512,
 	}
 }
@@ -135,6 +139,8 @@ type cacheEntry struct {
 	gzipBody    []byte
 	createdAt   int64
 	expiresAt   int64
+	initialAge  time.Duration
+	noStale     bool
 	manual      bool
 	hits        atomic.Uint64
 	maxHits     uint64
@@ -209,15 +215,16 @@ type ProxyCache struct {
 	purges       atomic.Uint64
 	widePurgedAt atomic.Uint64
 	keyPurgedAt  [cachePurgeStripes]atomic.Uint64
-	gzipPool     sync.Pool
+	gzipLevel    int
 }
 
 // NewProxyCache creates a ProxyCache configured with cfg, normalizing zero-valued
-// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, and MaxTotalBytes to
-// their defaults, and starts a background goroutine that periodically evicts expired entries.
+// CompressLevel, CompressMinLen, DefaultMaxAge, MaxEntrySize, MaxTotalBytes, and
+// MaxEntries to their defaults, and starts a background goroutine that periodically
+// evicts expired entries.
 func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
-		cfg.CompressLevel = 6
+		cfg.CompressLevel = defaultCompressLevel
 	}
 	if cfg.CompressMinLen <= 0 {
 		cfg.CompressMinLen = 512
@@ -231,17 +238,14 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 	if cfg.MaxTotalBytes <= 0 {
 		cfg.MaxTotalBytes = 256 << 20
 	}
+	if cfg.MaxEntries == 0 {
+		cfg.MaxEntries = defaultProxyCacheMaxEntries
+	}
 
 	pc := &ProxyCache{
-		entries: alosmap.NewTypedSized[string, *cacheEntry](10000, 0).Prealloc(256),
-		stopCh:  make(chan struct{}),
-	}
-	level := cfg.CompressLevel
-	pc.gzipPool = sync.Pool{
-		New: func() any {
-			w, _ := gzip.NewWriterLevel(io.Discard, level)
-			return w
-		},
+		entries:   alosmap.NewTypedSized[string, *cacheEntry](10000, 0).Prealloc(256),
+		stopCh:    make(chan struct{}),
+		gzipLevel: cfg.CompressLevel,
 	}
 	pc.config.Store(&cfg)
 	go pc.evictLoop()
@@ -250,11 +254,11 @@ func NewProxyCache(cfg ProxyCacheConfig) *ProxyCache {
 
 // UpdateConfig atomically replaces the cache's active configuration with cfg,
 // normalizing zero-valued CompressLevel, CompressMinLen, and DefaultMaxAge to their
-// defaults. Unlike NewProxyCache, MaxEntrySize and MaxTotalBytes are stored as given.
+// defaults. Unlike NewProxyCache, MaxEntrySize, MaxTotalBytes, and MaxEntries are stored as given.
 // Existing entries are left as-is.
 func (pc *ProxyCache) UpdateConfig(cfg ProxyCacheConfig) {
 	if cfg.CompressLevel < 1 || cfg.CompressLevel > 9 {
-		cfg.CompressLevel = 6
+		cfg.CompressLevel = defaultCompressLevel
 	}
 	if cfg.CompressMinLen <= 0 {
 		cfg.CompressMinLen = 512
@@ -506,7 +510,7 @@ func (pc *ProxyCache) lookupEntry(method, host, path string, reqAllows bool) (*c
 	now := CoarseNanotime()
 	if now > entry.expiresAt {
 		cfg := pc.config.Load()
-		if cfg.StaleWhileRev > 0 && now < entry.expiresAt+int64(cfg.StaleWhileRev) {
+		if !entry.noStale && cfg.StaleWhileRev > 0 && now < entry.expiresAt+int64(cfg.StaleWhileRev) {
 			entry.hits.Add(1)
 			pc.totalHits.Add(1)
 			return entry, true
@@ -536,6 +540,8 @@ func (pc *ProxyCache) Put(method, host, path string, statusCode int, headers [][
 type cachePutOptions struct {
 	generation uint64
 	offload    bool
+	age        time.Duration
+	noStale    bool
 }
 
 func (pc *ProxyCache) purgeGeneration() uint64 {
@@ -573,6 +579,11 @@ func (pc *ProxyCache) put(method, host, path string, statusCode int, headers [][
 	if !ok {
 		return
 	}
+	fresh := parseCacheFreshness(headers, time.Unix(0, CoarseNanotime()))
+	if ttl, ok = fresh.storeTTL(ttl); !ok {
+		return
+	}
+	opts.age, opts.noStale = fresh.age, fresh.noStale
 	pc.putEntry(cfg, method, host, path, statusCode, headers, contentType, body, ttl, 0, cfg.PreCompress, -1, false, opts)
 }
 
@@ -585,6 +596,8 @@ func (pc *ProxyCache) PutManual(method, host, path string, statusCode int, heade
 }
 
 func (pc *ProxyCache) putManual(method, host, path string, statusCode int, headers [][2]string, contentType string, body []byte, ttl time.Duration, maxHits uint64, preCompress bool, compressMinLen int, opts cachePutOptions) {
+	fresh := parseCacheFreshness(headers, time.Unix(0, CoarseNanotime()))
+	opts.age, opts.noStale = fresh.age, fresh.noStale
 	pc.putEntry(pc.config.Load(), method, host, path, statusCode, headers, contentType, body, ttl, maxHits, preCompress, compressMinLen, true, opts)
 }
 
@@ -658,6 +671,8 @@ func (pc *ProxyCache) putEntry(cfg *ProxyCacheConfig, method, host, path string,
 		body:        bodyCopy,
 		createdAt:   now,
 		expiresAt:   now + int64(ttl),
+		initialAge:  opts.age,
+		noStale:     opts.noStale,
 		manual:      manual,
 		maxHits:     maxHits,
 		bodyLen:     int32(len(bodyCopy)),
@@ -804,34 +819,31 @@ func (pc *ProxyCache) ServeCached(entry *cacheEntry, req *Request, resp *Respons
 	for i := range entry.headers {
 		resp.SetHeader(entry.headers[i][0], entry.headers[i][1])
 	}
-	resp.SetHeaderUnsafe("x-cache", "HIT")
 	var hitBuf [20]byte
+	resp.SetHeaderUnsafe("age", string(appendUint(hitBuf[:0], int64(entry.currentAge(CoarseNanotime())/time.Second))))
+	resp.SetHeaderUnsafe("x-cache", "HIT")
 	resp.SetHeaderUnsafe("x-cache-hits", string(appendUint(hitBuf[:0], int64(entry.hits.Load()))))
 
 	if entry.gzipLen == 0 {
-		resp.SetBody(entry.body)
+		resp.referenceBody(entry.body)
 		return
 	}
 	if negotiateEncoding(req.Header("accept-encoding"), offerGzip) == encodingGzip {
 		resp.SetHeaderUnsafe("content-encoding", contentEncodingNames[encodingGzip])
-		resp.SetBody(entry.gzipBody)
+		resp.referenceBody(entry.gzipBody)
 	} else {
-		resp.SetBody(entry.body)
+		resp.referenceBody(entry.body)
 	}
 	addVaryAcceptEncoding(resp)
 }
 
+func (e *cacheEntry) currentAge(now int64) time.Duration {
+	return e.initialAge + time.Duration(max(0, now-e.createdAt))
+}
+
 func (pc *ProxyCache) compressGzip(data []byte) []byte {
 	bp := LargeBufPool.Get().(*[]byte)
-	buf := (*bp)[:0]
-	w := newBytesWriter(&buf)
-	gw := pc.gzipPool.Get().(*gzip.Writer)
-	gw.Reset(w)
-	gw.Write(data)
-	gw.Close()
-	pc.gzipPool.Put(gw)
-	w.buf = nil
-	bytesWriterPool.Put(w)
+	buf := appendCompressed((*bp)[:0], data, encodingGzip, pc.gzipLevel)
 	result := make([]byte, len(buf))
 	copy(result, buf)
 	*bp = buf
@@ -1015,7 +1027,8 @@ func stripCacheUnsafeHeaders(headers [][2]string) [][2]string {
 	for i := range headers {
 		k := headers[i][0]
 		if EqualFoldASCII(k, "content-length") || EqualFoldASCII(k, "content-type") || EqualFoldASCII(k, "transfer-encoding") ||
-			EqualFoldASCII(k, "set-cookie") || EqualFoldASCII(k, "www-authenticate") || EqualFoldASCII(k, "proxy-authenticate") {
+			EqualFoldASCII(k, "set-cookie") || EqualFoldASCII(k, "www-authenticate") || EqualFoldASCII(k, "proxy-authenticate") ||
+			EqualFoldASCII(k, "age") {
 			continue
 		}
 		headers[n] = headers[i]

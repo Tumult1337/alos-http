@@ -190,13 +190,7 @@ func TestHealthCheckerHonoursFailThreshold(t *testing.T) {
 
 // A backend that comes back must be returned to service.
 func TestHealthCheckerRestoresRecoveredBackend(t *testing.T) {
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	addr := ln.Addr().String()
-	_ = ln.Close() // start out refusing connections
-
+	addr := freeLoopbackAddr(t)
 	b := &backend{Addr: addr}
 	b.Healthy.Store(true)
 
@@ -218,10 +212,11 @@ func TestHealthCheckerRestoresRecoveredBackend(t *testing.T) {
 	}
 
 	// Bring the same port back up.
-	revived, err := net.Listen("tcp4", addr)
+	revivedSet, err := createListeners(addr, 1)
 	if err != nil {
-		t.Skipf("could not rebind %s to simulate recovery: %v", addr, err)
+		t.Fatalf("rebind reserved %s to simulate recovery: %v", addr, err)
 	}
+	revived := revivedSet[0]
 	defer revived.Close()
 	go func() {
 		for {
